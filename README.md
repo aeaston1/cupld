@@ -1,102 +1,70 @@
 # cupld
 
-`cupld` is a local graph database CLI and REPL with first-class support for markdown-backed memory workflows.
+Your markdown notes are a graph. `cupld` lets you query them like one.
 
-It gives you an interactive shell, one-shot query commands, integrity checks, a scene viewer, and a bundled skill for wiring markdown notes into a local memory database.
-
-## Highlights
-
-- Local-first graph database with file-backed `.cupld` stores
-- REPL for interactive exploration and updates
-- Scriptable `query`, `schema`, and `check` commands
-- Markdown sync and bundled `cupld-md-memory` skill bootstrap
-- Visual graph viewer for inspecting a database
+A local-first graph database with a Cypher-like query language, a REPL, and a markdown sync layer that turns your vault into queryable nodes and edges — no server, no cloud, one portable file.
 
 ## Install
 
-From source:
+From source (requires Rust 1.85+):
 
 ```bash
 cargo install --path .
 ```
 
-After GitHub releases are published:
-
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/aeaston1/cupld/releases/latest/download/cupld-installer.sh | sh
-```
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/aeaston1/cupld/releases/latest/download/cupld-installer.ps1 | iex"
-```
-
-After the corresponding channel publish:
-
-```bash
-brew install aeaston1/tap/cupld
-cargo install cupld
-```
-
-```powershell
-winget install aeaston1.cupld
-```
-
 ## Quickstart
 
-Start an in-memory REPL:
-
 ```bash
+# In-memory REPL — kick the tyres
 cupld
-```
 
-Open or create a file-backed database:
-
-```bash
+# Open or create a file-backed database
 cupld state/dev.cupld
-```
 
-Run a one-shot query:
-
-```bash
+# One-shot query
 cupld query --db state/dev.cupld 'MATCH (n) RETURN n LIMIT 10'
-```
 
-Inspect and validate a database:
-
-```bash
+# Inspect schema, validate integrity
 cupld schema --db state/dev.cupld
 cupld check --db state/dev.cupld
-```
 
-Open the viewer:
-
-```bash
+# Visual graph viewer
 cupld --visualise state/dev.cupld
 ```
 
 ## Markdown Memory
 
-Bootstrap the bundled `cupld-md-memory` skill and a local `.cupld` memory DB:
+Point `cupld` at a folder of markdown files and they become graph nodes — frontmatter, tags, headings, wikilinks and all. Links between notes become edges. Query everything without touching the files.
 
 ```bash
+# Bootstrap skill + local DB (interactive)
 cupld install
+
+# Wire into your agent (Claude, Codex, OpenCode)
+cupld install --target claude --scope cwd --db .cupld/default.cupld --root notes
+cupld install --target codex --scope home --db .cupld/default.cupld
+cupld install --target opencode --scope home --db .cupld/default.cupld
 ```
 
-Install into a provider-specific skills directory or a custom path:
+Three commands cover the core workflow:
 
 ```bash
-cupld install --target codex --scope home --db .cupld/default.cupld
-cupld install --target claude --scope cwd --db .cupld/default.cupld --root notes
-cupld install --target opencode --scope home --db .cupld/default.cupld
-cupld install --path /custom/skills --db .cupld/default.cupld --yes
+# Overlay markdown into a query session (transient — nothing persisted)
+cupld query --db .cupld/default.cupld --with-markdown \
+  "MATCH (d:MarkdownDocument) RETURN d.\`src.path\`, d.\`md.title\` ORDER BY d.\`src.path\`"
+
+# Persist markdown into the graph
+cupld sync markdown --db .cupld/default.cupld
+
+# Pull a top-k summary for agent context windows
+cupld context --db .cupld/default.cupld --top-k 20 --output json
 ```
 
-The interactive installer asks for a skill location, DB path, and markdown root. Interactive REPL launches can also offer the same bootstrap flow once.
+Every markdown document is a `:MarkdownDocument` node. Every link is a `:MD_LINKS_TO` edge. Backlinks, tag queries, cross-note traversals — standard graph queries, nothing magic.
 
-## Documentation
+## Docs
 
-- Docs index: [`docs/README.md`](./docs/README.md)
-- Agent guide: [`docs/agents/README.md`](./docs/agents/README.md)
-- Viewer notes: [`docs/agents/visualise.md`](./docs/agents/visualise.md)
-- Security policy: [`SECURITY.md`](./SECURITY.md)
-- Code of conduct: [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
+- [Full docs index](./docs/README.md)
+- [Agent guide](./docs/agents/README.md)
+- [Visualiser](./docs/agents/visualise.md)
+- [Security policy](./SECURITY.md)
