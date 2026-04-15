@@ -1,0 +1,606 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use super::state::{ConstraintState, IndexState, SchemaState};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TargetKind {
+    Label,
+    EdgeType,
+}
+
+impl TargetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::EdgeType => "edge_type",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SchemaTarget {
+    kind: TargetKind,
+    name: String,
+}
+
+impl SchemaTarget {
+    pub fn label<S>(name: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Self {
+            kind: TargetKind::Label,
+            name: name.into(),
+        }
+    }
+
+    pub fn edge_type<S>(name: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Self {
+            kind: TargetKind::EdgeType,
+            name: name.into(),
+        }
+    }
+
+    pub fn kind(&self) -> TargetKind {
+        self.kind
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn display_target(&self) -> String {
+        match self.kind {
+            TargetKind::Label => format!(":{}", self.name),
+            TargetKind::EdgeType => format!("[:{}]", self.name),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PropertyType {
+    String,
+    Int,
+    Float,
+    Bool,
+    Bytes,
+    Datetime,
+    List,
+    Map,
+    Null,
+}
+
+impl PropertyType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::Bool => "bool",
+            Self::Bytes => "bytes",
+            Self::Datetime => "datetime",
+            Self::List => "list",
+            Self::Map => "map",
+            Self::Null => "null",
+        }
+    }
+}
+
+impl fmt::Display for PropertyType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstraintType {
+    Unique,
+    Required,
+    Type(PropertyType),
+}
+
+impl ConstraintType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unique => "UNIQUE",
+            Self::Required => "REQUIRED",
+            Self::Type(_) => "TYPE",
+        }
+    }
+
+    pub(crate) fn generated_suffix(&self) -> String {
+        match self {
+            Self::Unique => "unique".to_owned(),
+            Self::Required => "required".to_owned(),
+            Self::Type(property_type) => format!("type_{}", property_type.as_str()),
+        }
+    }
+
+    pub(crate) fn detail_string(&self) -> String {
+        match self {
+            Self::Unique => "unique".to_owned(),
+            Self::Required => "required".to_owned(),
+            Self::Type(property_type) => format!("type={}", property_type.as_str()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexStatus {
+    Ready,
+    Building,
+    Invalid,
+}
+
+impl IndexStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Building => "building",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexDefinition {
+    name: String,
+    target: SchemaTarget,
+    property: String,
+    unique: bool,
+    status: IndexStatus,
+    owned_by_constraint: Option<String>,
+}
+
+impl IndexDefinition {
+    pub fn new(
+        name: String,
+        target: SchemaTarget,
+        property: String,
+        unique: bool,
+        status: IndexStatus,
+        owned_by_constraint: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            target,
+            property,
+            unique,
+            status,
+            owned_by_constraint,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn target(&self) -> &SchemaTarget {
+        &self.target
+    }
+
+    pub fn property(&self) -> &str {
+        &self.property
+    }
+
+    pub fn unique(&self) -> bool {
+        self.unique
+    }
+
+    pub fn status(&self) -> IndexStatus {
+        self.status
+    }
+
+    pub fn owned_by_constraint(&self) -> Option<&str> {
+        self.owned_by_constraint.as_deref()
+    }
+
+    pub fn canonical_ddl(&self) -> String {
+        format!(
+            "CREATE INDEX {} ON {}({})",
+            self.name,
+            self.target.display_target(),
+            self.property
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstraintDefinition {
+    name: String,
+    target: SchemaTarget,
+    property: String,
+    constraint_type: ConstraintType,
+}
+
+impl ConstraintDefinition {
+    pub fn new(
+        name: String,
+        target: SchemaTarget,
+        property: String,
+        constraint_type: ConstraintType,
+    ) -> Self {
+        Self {
+            name,
+            target,
+            property,
+            constraint_type,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn target(&self) -> &SchemaTarget {
+        &self.target
+    }
+
+    pub fn property(&self) -> &str {
+        &self.property
+    }
+
+    pub fn constraint_type(&self) -> &ConstraintType {
+        &self.constraint_type
+    }
+
+    pub fn canonical_ddl(&self) -> String {
+        match &self.constraint_type {
+            ConstraintType::Unique => format!(
+                "CREATE CONSTRAINT {} ON {} REQUIRE {} UNIQUE",
+                self.name,
+                self.target.display_target(),
+                self.property
+            ),
+            ConstraintType::Required => format!(
+                "CREATE CONSTRAINT {} ON {} REQUIRE {} REQUIRED",
+                self.name,
+                self.target.display_target(),
+                self.property
+            ),
+            ConstraintType::Type(property_type) => format!(
+                "CREATE CONSTRAINT {} ON {} REQUIRE {} TYPE {}",
+                self.name,
+                self.target.display_target(),
+                self.property,
+                property_type
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SchemaCatalog {
+    labels: BTreeSet<String>,
+    edge_types: BTreeSet<String>,
+    indexes: BTreeMap<String, IndexDefinition>,
+    constraints: BTreeMap<String, ConstraintDefinition>,
+}
+
+impl SchemaCatalog {
+    pub fn labels(&self) -> impl Iterator<Item = &str> {
+        self.labels.iter().map(String::as_str)
+    }
+
+    pub fn edge_types(&self) -> impl Iterator<Item = &str> {
+        self.edge_types.iter().map(String::as_str)
+    }
+
+    pub fn indexes(&self) -> impl Iterator<Item = &IndexDefinition> {
+        self.indexes.values()
+    }
+
+    pub fn constraints(&self) -> impl Iterator<Item = &ConstraintDefinition> {
+        self.constraints.values()
+    }
+
+    pub fn ensure_label<S>(&mut self, name: S)
+    where
+        S: Into<String>,
+    {
+        self.labels.insert(name.into());
+    }
+
+    pub fn ensure_edge_type<S>(&mut self, name: S)
+    where
+        S: Into<String>,
+    {
+        self.edge_types.insert(name.into());
+    }
+
+    pub fn create_label<S>(&mut self, name: S) -> String
+    where
+        S: Into<String>,
+    {
+        insert_name(&mut self.labels, name.into())
+    }
+
+    pub fn create_edge_type<S>(&mut self, name: S) -> String
+    where
+        S: Into<String>,
+    {
+        insert_name(&mut self.edge_types, name.into())
+    }
+
+    pub fn remove_label(&mut self, name: &str) -> bool {
+        self.labels.remove(name)
+    }
+
+    pub fn remove_edge_type(&mut self, name: &str) -> bool {
+        self.edge_types.remove(name)
+    }
+
+    pub fn has_label(&self, name: &str) -> bool {
+        self.labels.contains(name)
+    }
+
+    pub fn has_edge_type(&self, name: &str) -> bool {
+        self.edge_types.contains(name)
+    }
+
+    pub fn create_index(
+        &mut self,
+        name: Option<String>,
+        target: SchemaTarget,
+        property: String,
+        unique: bool,
+        owned_by_constraint: Option<String>,
+    ) -> String {
+        let name = name.unwrap_or_else(|| {
+            generated_name("idx", target.kind(), target.name(), &property, Some("eq"))
+        });
+        let definition = IndexDefinition::new(
+            name.clone(),
+            target,
+            property,
+            unique,
+            IndexStatus::Ready,
+            owned_by_constraint,
+        );
+        self.indexes.insert(name.clone(), definition);
+        name
+    }
+
+    pub fn create_constraint(
+        &mut self,
+        name: Option<String>,
+        target: SchemaTarget,
+        property: String,
+        constraint_type: ConstraintType,
+    ) -> String {
+        let generated = name.unwrap_or_else(|| {
+            generated_name(
+                "constraint",
+                target.kind(),
+                target.name(),
+                &property,
+                Some(&constraint_type.generated_suffix()),
+            )
+        });
+        let definition =
+            ConstraintDefinition::new(generated.clone(), target, property, constraint_type);
+        self.constraints.insert(generated.clone(), definition);
+        generated
+    }
+
+    pub fn drop_index(&mut self, name: &str) -> Option<IndexDefinition> {
+        self.indexes.remove(name)
+    }
+
+    pub fn drop_constraint(&mut self, name: &str) -> Option<ConstraintDefinition> {
+        self.constraints.remove(name)
+    }
+
+    pub fn index(&self, name: &str) -> Option<&IndexDefinition> {
+        self.indexes.get(name)
+    }
+
+    pub fn constraint(&self, name: &str) -> Option<&ConstraintDefinition> {
+        self.constraints.get(name)
+    }
+
+    pub fn object_exists(&self, name: &str) -> bool {
+        self.indexes.contains_key(name) || self.constraints.contains_key(name)
+    }
+
+    pub fn depends_on_target(&self, target: &SchemaTarget) -> bool {
+        self.indexes.values().any(|index| index.target == *target)
+            || self
+                .constraints
+                .values()
+                .any(|constraint| constraint.target == *target)
+    }
+
+    pub fn show_schema_rows(&self) -> Vec<SchemaRow> {
+        let mut rows = Vec::new();
+        for label in &self.labels {
+            rows.push(SchemaRow {
+                kind: "label".to_owned(),
+                name: label.clone(),
+                ddl: format!("CREATE LABEL {}", label),
+            });
+        }
+        for edge_type in &self.edge_types {
+            rows.push(SchemaRow {
+                kind: "edge_type".to_owned(),
+                name: edge_type.clone(),
+                ddl: format!("CREATE EDGE TYPE {}", edge_type),
+            });
+        }
+        for index in self.indexes.values() {
+            rows.push(SchemaRow {
+                kind: "index".to_owned(),
+                name: index.name.clone(),
+                ddl: index.canonical_ddl(),
+            });
+        }
+        for constraint in self.constraints.values() {
+            rows.push(SchemaRow {
+                kind: "constraint".to_owned(),
+                name: constraint.name.clone(),
+                ddl: constraint.canonical_ddl(),
+            });
+        }
+        rows
+    }
+
+    pub fn show_index_rows(&self) -> Vec<IndexRow> {
+        self.indexes
+            .values()
+            .map(|index| IndexRow {
+                name: index.name.clone(),
+                target_kind: index.target.kind.as_str().to_owned(),
+                target_name: index.target.name.clone(),
+                property: index.property.clone(),
+                unique: index.unique,
+                status: index.status.as_str().to_owned(),
+            })
+            .collect()
+    }
+
+    pub fn show_constraint_rows(&self) -> Vec<ConstraintRow> {
+        self.constraints
+            .values()
+            .map(|constraint| ConstraintRow {
+                name: constraint.name.clone(),
+                target_kind: constraint.target.kind.as_str().to_owned(),
+                target_name: constraint.target.name.clone(),
+                property: constraint.property.clone(),
+                constraint_type: constraint.constraint_type.as_str().to_owned(),
+                details: constraint.constraint_type.detail_string(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn to_state(&self) -> SchemaState {
+        SchemaState {
+            labels: self.labels.iter().cloned().collect(),
+            edge_types: self.edge_types.iter().cloned().collect(),
+            indexes: self
+                .indexes
+                .values()
+                .map(|index| IndexState {
+                    name: index.name.clone(),
+                    target: index.target.clone(),
+                    property: index.property.clone(),
+                    unique: index.unique,
+                    status: index.status,
+                    owned_by_constraint: index.owned_by_constraint.clone(),
+                })
+                .collect(),
+            constraints: self
+                .constraints
+                .values()
+                .map(|constraint| ConstraintState {
+                    name: constraint.name.clone(),
+                    target: constraint.target.clone(),
+                    property: constraint.property.clone(),
+                    constraint_type: constraint.constraint_type.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn from_state(state: SchemaState) -> Self {
+        Self {
+            labels: state.labels.into_iter().collect(),
+            edge_types: state.edge_types.into_iter().collect(),
+            indexes: state
+                .indexes
+                .into_iter()
+                .map(|index| {
+                    (
+                        index.name.clone(),
+                        IndexDefinition::new(
+                            index.name,
+                            index.target,
+                            index.property,
+                            index.unique,
+                            index.status,
+                            index.owned_by_constraint,
+                        ),
+                    )
+                })
+                .collect(),
+            constraints: state
+                .constraints
+                .into_iter()
+                .map(|constraint| {
+                    (
+                        constraint.name.clone(),
+                        ConstraintDefinition::new(
+                            constraint.name,
+                            constraint.target,
+                            constraint.property,
+                            constraint.constraint_type,
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaRow {
+    pub kind: String,
+    pub name: String,
+    pub ddl: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexRow {
+    pub name: String,
+    pub target_kind: String,
+    pub target_name: String,
+    pub property: String,
+    pub unique: bool,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstraintRow {
+    pub name: String,
+    pub target_kind: String,
+    pub target_name: String,
+    pub property: String,
+    pub constraint_type: String,
+    pub details: String,
+}
+
+pub(crate) fn generated_name(
+    prefix: &str,
+    target_kind: TargetKind,
+    target_name: &str,
+    property: &str,
+    suffix: Option<&str>,
+) -> String {
+    let mut name = format!(
+        "{}_{}_{}_{}",
+        prefix,
+        target_kind.as_str(),
+        sanitize(target_name),
+        sanitize(property)
+    );
+    if let Some(suffix) = suffix {
+        name.push('_');
+        name.push_str(&sanitize(suffix));
+    }
+    name
+}
+
+fn insert_name(set: &mut BTreeSet<String>, name: String) -> String {
+    set.insert(name.clone());
+    name
+}
+
+fn sanitize(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}

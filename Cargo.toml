@@ -1,0 +1,31 @@
+[package]
+name = "cupld"
+version = "0.1.0"
+edition = "2024"
+description = "Local graph database CLI and REPL."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/aeaston1/cupld"
+homepage = "https://github.com/aeaston1/cupld"
+documentation = "https://github.com/aeaston1/cupld/tree/main/docs"
+keywords = ["graph", "database", "cli", "repl", "markdown"]
+categories = ["command-line-utilities", "database-implementations"]
+authors = ["aeaston1 <9115196+aeaston1@users.noreply.github.com>"]
+
+[package.metadata.wix]
+upgrade-guid = "35FEA96C-A775-4788-ACF3-0209407845F1"
+path-guid = "06021FEE-3CCD-4B0B-BE35-5055978B6145"
+license = false
+eula = false
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[lib]
+name = "cupld"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cupld"
+path = "src/main.rs"

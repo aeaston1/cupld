@@ -1,0 +1,2073 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use crate::engine::{
+    ConstraintRow, ConstraintType, CupldEngine, Edge, EdgeId, GraphError, GraphStats, IndexRow,
+    Node, NodeId, PropertyMap, SchemaRow, Value,
+};
+use crate::query::{
+    BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, OrderItem, Pattern, PatternSegment,
+    PropertyTarget, Query, QueryError, ShowKind, Statement, UnaryOp, parse_script,
+};
+use crate::storage;
+
+const DEFAULT_ROW_LIMIT: usize = 1_000;
+const INTERMEDIATE_ROW_LIMIT: usize = 100_000;
+
+#[derive(Clone, Debug)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<RuntimeValue>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransactionInfo {
+    pub active: bool,
+    pub failed: bool,
+    pub savepoints: usize,
+    pub last_tx_id: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Session {
+    engine: CupldEngine,
+    transaction_base: Option<(CupldEngine, bool)>,
+    savepoints: Vec<(String, CupldEngine, bool)>,
+    failed_transaction: bool,
+    path: Option<PathBuf>,
+    db_uuid: Option<[u8; 16]>,
+    dirty: bool,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new_in_memory()
+    }
+}
+
+impl Session {
+    pub fn new_in_memory() -> Self {
+        Self {
+            engine: CupldEngine::default(),
+            transaction_base: None,
+            savepoints: Vec::new(),
+            failed_transaction: false,
+            path: None,
+            db_uuid: None,
+            dirty: false,
+        }
+    }
+
+    pub fn from_engine(engine: CupldEngine) -> Self {
+        Self {
+            engine,
+            transaction_base: None,
+            savepoints: Vec::new(),
+            failed_transaction: false,
+            path: None,
+            db_uuid: None,
+            dirty: false,
+        }
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecutionError> {
+        let path = path.as_ref().to_path_buf();
+        let (engine, report) = storage::load(&path).map_err(ExecutionError::from)?;
+        Ok(Self {
+            engine,
+            transaction_base: None,
+            savepoints: Vec::new(),
+            failed_transaction: false,
+            path: Some(path),
+            db_uuid: Some(report.db_uuid),
+            dirty: false,
+        })
+    }
+
+    pub fn engine(&self) -> &CupldEngine {
+        &self.engine
+    }
+
+    pub fn replace_engine(&mut self, engine: CupldEngine) -> Result<(), ExecutionError> {
+        if self.transaction_base.is_some() {
+            return Err(ExecutionError::new(
+                "transaction_active",
+                "cannot replace the engine while a transaction is active",
+            ));
+        }
+        self.engine = engine;
+        self.savepoints.clear();
+        self.failed_transaction = false;
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<(), ExecutionError> {
+        let path = path.as_ref().to_path_buf();
+        let db_uuid = storage::save_compacted(&path, &self.engine).map_err(ExecutionError::from)?;
+        self.path = Some(path);
+        self.db_uuid = Some(db_uuid);
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn save(&mut self) -> Result<(), ExecutionError> {
+        let Some(path) = self.path.clone() else {
+            return Err(ExecutionError::new(
+                "save_requires_path",
+                "unnamed in-memory databases require SAVE AS",
+            ));
+        };
+        let db_uuid = self
+            .db_uuid
+            .ok_or_else(|| ExecutionError::new("db_uuid_missing", "database UUID is missing"))?;
+        storage::compact(&path, &self.engine, db_uuid).map_err(ExecutionError::from)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn compact(&mut self) -> Result<(), ExecutionError> {
+        self.save()
+    }
+
+    pub fn check(path: impl AsRef<Path>) -> Result<storage::IntegrityReport, ExecutionError> {
+        storage::check(path.as_ref()).map_err(ExecutionError::from)
+    }
+
+    pub fn transaction_info(&self) -> TransactionInfo {
+        TransactionInfo {
+            active: self.transaction_base.is_some(),
+            failed: self.failed_transaction,
+            savepoints: self.savepoints.len(),
+            last_tx_id: self.engine.snapshot().tx_id().get(),
+        }
+    }
+
+    pub fn execute_script(
+        &mut self,
+        input: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<QueryResult>, ExecutionError> {
+        let statements = parse_script(input).map_err(ExecutionError::from)?;
+        if statements.len() > 1 && !statements.iter().any(Statement::is_transaction_control) {
+            return Err(ExecutionError::new(
+                "multi_statement_requires_transaction",
+                "multi-statement batches require an explicit BEGIN/COMMIT",
+            ));
+        }
+
+        let mut results = Vec::new();
+        for statement in statements {
+            let result = self.execute_statement(&statement, params)?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    pub fn execute_statement(
+        &mut self,
+        statement: &Statement,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<QueryResult, ExecutionError> {
+        if self.failed_transaction && !statement.allowed_in_failed_transaction() {
+            return Err(ExecutionError::new(
+                "transaction_failed",
+                "transaction is in failed state; rollback or release to recover",
+            ));
+        }
+
+        match statement {
+            Statement::Begin => self.begin(),
+            Statement::Commit => self.commit(),
+            Statement::Rollback => self.rollback(),
+            Statement::Savepoint(name) => self.savepoint(name),
+            Statement::RollbackToSavepoint(name) => self.rollback_to_savepoint(name),
+            Statement::ReleaseSavepoint(name) => self.release_savepoint(name),
+            Statement::Explain(inner) => self.explain(inner),
+            Statement::Show(kind) => self.show(kind),
+            _ => {
+                let snapshot = self.engine.clone();
+                let result = self.execute_data_statement(statement, params);
+                match (self.transaction_base.is_some(), result) {
+                    (_, Ok(result)) if statement.is_mutating() => {
+                        if self.transaction_base.is_some() {
+                            self.dirty = true;
+                            Ok(result)
+                        } else {
+                            self.engine.commit().map_err(ExecutionError::from)?;
+                            self.persist_after_commit()?;
+                            Ok(result)
+                        }
+                    }
+                    (_, Ok(result)) => Ok(result),
+                    (true, Err(error)) => {
+                        self.engine = snapshot;
+                        self.failed_transaction = true;
+                        Err(error)
+                    }
+                    (false, Err(error)) => {
+                        self.engine = snapshot;
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn begin(&mut self) -> Result<QueryResult, ExecutionError> {
+        if self.transaction_base.is_some() {
+            return Err(ExecutionError::new(
+                "transaction_active",
+                "a transaction is already active",
+            ));
+        }
+        self.transaction_base = Some((self.engine.clone(), self.dirty));
+        self.savepoints.clear();
+        self.failed_transaction = false;
+        Ok(empty_result())
+    }
+
+    fn commit(&mut self) -> Result<QueryResult, ExecutionError> {
+        if self.failed_transaction {
+            return Err(ExecutionError::new(
+                "transaction_failed_commit",
+                "cannot commit a failed transaction",
+            ));
+        }
+        if self.transaction_base.is_none() {
+            return Err(ExecutionError::new(
+                "transaction_not_active",
+                "no active transaction",
+            ));
+        }
+        self.engine.commit().map_err(ExecutionError::from)?;
+        self.persist_after_commit()?;
+        self.transaction_base = None;
+        self.savepoints.clear();
+        self.failed_transaction = false;
+        Ok(empty_result())
+    }
+
+    fn rollback(&mut self) -> Result<QueryResult, ExecutionError> {
+        let Some((base, dirty)) = self.transaction_base.take() else {
+            return Err(ExecutionError::new(
+                "transaction_not_active",
+                "no active transaction",
+            ));
+        };
+        self.engine = base;
+        self.dirty = dirty;
+        self.savepoints.clear();
+        self.failed_transaction = false;
+        Ok(empty_result())
+    }
+
+    fn savepoint(&mut self, name: &str) -> Result<QueryResult, ExecutionError> {
+        self.require_active_transaction("savepoints require an active transaction")?;
+        if self
+            .savepoints
+            .iter()
+            .any(|(existing, _, _)| existing == name)
+        {
+            return Err(ExecutionError::new(
+                "savepoint_exists",
+                "savepoint already exists",
+            ));
+        }
+        self.savepoints
+            .push((name.to_owned(), self.engine.clone(), self.dirty));
+        Ok(empty_result())
+    }
+
+    fn rollback_to_savepoint(&mut self, name: &str) -> Result<QueryResult, ExecutionError> {
+        self.require_active_transaction("savepoints require an active transaction")?;
+        let index = self.find_savepoint_index(name)?;
+        self.engine = self.savepoints[index].1.clone();
+        self.dirty = self.savepoints[index].2;
+        self.savepoints.truncate(index + 1);
+        self.failed_transaction = false;
+        Ok(empty_result())
+    }
+
+    fn release_savepoint(&mut self, name: &str) -> Result<QueryResult, ExecutionError> {
+        self.require_active_transaction("savepoints require an active transaction")?;
+        let index = self.find_savepoint_index(name)?;
+        self.savepoints.truncate(index);
+        Ok(empty_result())
+    }
+
+    fn show(&self, kind: &ShowKind) -> Result<QueryResult, ExecutionError> {
+        match kind {
+            ShowKind::Schema => Ok(show_schema_result(self.engine.show_schema())),
+            ShowKind::Indexes => Ok(show_indexes_result(self.engine.show_indexes())),
+            ShowKind::Constraints => Ok(show_constraints_result(self.engine.show_constraints())),
+            ShowKind::Stats => Ok(show_stats_result(self.engine.stats())),
+            ShowKind::Transactions => Ok(show_transactions_result(self.transaction_info())),
+        }
+    }
+
+    fn explain(&self, statement: &Statement) -> Result<QueryResult, ExecutionError> {
+        let mut rows = Vec::new();
+        let mut next_id = 1i64;
+        build_explain_rows(statement, None, &mut next_id, &mut rows);
+        Ok(QueryResult {
+            columns: vec![
+                "id".to_owned(),
+                "parent_id".to_owned(),
+                "operator".to_owned(),
+                "detail".to_owned(),
+            ],
+            rows,
+        })
+    }
+
+    fn execute_data_statement(
+        &mut self,
+        statement: &Statement,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<QueryResult, ExecutionError> {
+        match statement {
+            Statement::CreateLabel {
+                name,
+                if_not_exists,
+            } => {
+                self.engine
+                    .create_label(name, *if_not_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::DropLabel { name, if_exists } => {
+                self.engine
+                    .drop_label(name, *if_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::CreateEdgeType {
+                name,
+                if_not_exists,
+            } => {
+                self.engine
+                    .create_edge_type(name, *if_not_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::DropEdgeType { name, if_exists } => {
+                self.engine
+                    .drop_edge_type(name, *if_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::CreateIndex {
+                name,
+                target,
+                property,
+                if_not_exists,
+            } => {
+                self.engine
+                    .create_index(name.as_deref(), target.clone(), property, *if_not_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::DropIndex { name, if_exists } => {
+                self.engine
+                    .drop_index(name, *if_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::CreateConstraint {
+                name,
+                target,
+                property,
+                constraint,
+                if_not_exists,
+            } => {
+                self.engine
+                    .create_constraint(
+                        name.as_deref(),
+                        target.clone(),
+                        property,
+                        match constraint {
+                            ConstraintSpec::Unique => ConstraintType::Unique,
+                            ConstraintSpec::Required => ConstraintType::Required,
+                            ConstraintSpec::Type(kind) => ConstraintType::Type(*kind),
+                        },
+                        *if_not_exists,
+                    )
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::DropConstraint { name, if_exists } => {
+                self.engine
+                    .drop_constraint(name, *if_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::Query(query) => self.execute_query(query, params),
+            Statement::Show(_) | Statement::Explain(_) => unreachable!(),
+            Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::Savepoint(_)
+            | Statement::RollbackToSavepoint(_)
+            | Statement::ReleaseSavepoint(_) => unreachable!(),
+        }
+    }
+
+    fn execute_query(
+        &mut self,
+        query: &Query,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<QueryResult, ExecutionError> {
+        let mut rows = if let Some(pattern) = &query.match_clause {
+            self.match_pattern(pattern, params)?
+        } else {
+            vec![Row::default()]
+        };
+
+        if let Some(predicate) = &query.where_clause {
+            rows = rows
+                .into_iter()
+                .filter_map(|row| match self.eval_expr(predicate, &row, params) {
+                    Ok(RuntimeValue::Bool(true)) => Some(Ok(row)),
+                    Ok(RuntimeValue::Bool(false) | RuntimeValue::Null) => None,
+                    Ok(_) => Some(Err(ExecutionError::new(
+                        "where_type_error",
+                        "WHERE expressions must evaluate to bool or null",
+                    ))),
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+
+        if let Some(pattern) = &query.create_clause {
+            rows = self.create_pattern_rows(rows, pattern, params)?;
+        }
+        if !query.set_clause.is_empty() {
+            self.apply_set_clause(&rows, &query.set_clause, params)?;
+        }
+        if !query.remove_clause.is_empty() {
+            self.apply_remove_clause(&rows, &query.remove_clause)?;
+        }
+        if !query.delete_clause.is_empty() {
+            self.apply_delete_clause(&rows, &query.delete_clause)?;
+        }
+
+        if !query.order_by.is_empty() {
+            rows.sort_by(|left, right| self.compare_rows(left, right, &query.order_by, params));
+        }
+        let limit = query
+            .limit
+            .unwrap_or(DEFAULT_ROW_LIMIT)
+            .min(DEFAULT_ROW_LIMIT);
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+
+        if query.return_clause.is_empty() {
+            return Ok(empty_result());
+        }
+
+        let columns = query
+            .return_clause
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| format!("col_{}", index + 1))
+            })
+            .collect::<Vec<_>>();
+        let output_rows = rows
+            .iter()
+            .map(|row| {
+                query
+                    .return_clause
+                    .iter()
+                    .map(|item| self.eval_expr(&item.expr, row, params))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(QueryResult {
+            columns,
+            rows: output_rows,
+        })
+    }
+
+    fn match_pattern(
+        &self,
+        pattern: &Pattern,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Row>, ExecutionError> {
+        let mut rows = Vec::new();
+        for node in self.engine.nodes() {
+            let row = Row::default();
+            if let Some(row) = self.bind_node_pattern(&row, node, &pattern.start, params)? {
+                self.match_segments(&row, node.id(), &pattern.segments, params, &mut rows)?;
+            }
+        }
+        if rows.len() > INTERMEDIATE_ROW_LIMIT {
+            return Err(ExecutionError::new(
+                "row_limit_exceeded",
+                "intermediate result row cap exceeded",
+            ));
+        }
+        Ok(rows)
+    }
+
+    fn match_segments(
+        &self,
+        row: &Row,
+        current_node: NodeId,
+        segments: &[PatternSegment],
+        params: &BTreeMap<String, Value>,
+        output: &mut Vec<Row>,
+    ) -> Result<(), ExecutionError> {
+        let Some((segment, remaining_segments)) = segments.split_first() else {
+            output.push(row.clone());
+            return Ok(());
+        };
+        if segment.edge.hops.is_some() {
+            self.match_variable_hops(
+                row,
+                current_node,
+                segment,
+                remaining_segments,
+                params,
+                output,
+            )?;
+            return Ok(());
+        }
+
+        for edge_id in self.edge_ids_for_direction(current_node, segment.direction) {
+            let edge = self.engine.edge(edge_id).expect("edge exists");
+            let next_node = match segment.direction {
+                Direction::Outgoing => edge.to(),
+                Direction::Incoming => edge.from(),
+                Direction::Undirected => {
+                    if edge.from() == current_node {
+                        edge.to()
+                    } else {
+                        edge.from()
+                    }
+                }
+            };
+            let Some(row) = self.bind_edge_pattern(row, edge, &segment.edge, params)? else {
+                continue;
+            };
+            let node = self.engine.node(next_node).expect("node exists");
+            let Some(row) = self.bind_node_pattern(&row, node, &segment.node, params)? else {
+                continue;
+            };
+            self.match_segments(&row, next_node, remaining_segments, params, output)?;
+        }
+        Ok(())
+    }
+
+    fn match_variable_hops(
+        &self,
+        row: &Row,
+        current_node: NodeId,
+        segment: &PatternSegment,
+        remaining_segments: &[PatternSegment],
+        params: &BTreeMap<String, Value>,
+        output: &mut Vec<Row>,
+    ) -> Result<(), ExecutionError> {
+        if segment.edge.variable.is_some() {
+            return Err(ExecutionError::new(
+                "variable_hop_edge_binding",
+                "variable-length traversals cannot bind edge variables in v1",
+            ));
+        }
+        let hops = segment.edge.hops.expect("checked");
+        let mut queue = VecDeque::from([(current_node, 0u8)]);
+        let mut seen = BTreeSet::from([(current_node, 0u8)]);
+
+        while let Some((node_id, depth)) = queue.pop_front() {
+            if depth >= hops.max {
+                continue;
+            }
+            for edge_id in self.edge_ids_for_direction(node_id, segment.direction) {
+                let edge = self.engine.edge(edge_id).expect("edge exists");
+                let next_node = match segment.direction {
+                    Direction::Outgoing => edge.to(),
+                    Direction::Incoming => edge.from(),
+                    Direction::Undirected => {
+                        if edge.from() == node_id {
+                            edge.to()
+                        } else {
+                            edge.from()
+                        }
+                    }
+                };
+                if !self.edge_matches_filters(edge, &segment.edge, row, params)? {
+                    continue;
+                }
+                let next_depth = depth + 1;
+                if seen.insert((next_node, next_depth)) {
+                    queue.push_back((next_node, next_depth));
+                }
+                if next_depth < hops.min {
+                    continue;
+                }
+                let node = self.engine.node(next_node).expect("node exists");
+                let Some(bound_row) = self.bind_node_pattern(row, node, &segment.node, params)?
+                else {
+                    continue;
+                };
+                self.match_segments(&bound_row, next_node, remaining_segments, params, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_pattern_rows(
+        &mut self,
+        rows: Vec<Row>,
+        pattern: &Pattern,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Row>, ExecutionError> {
+        let mut created_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (row, current_node) = self.realize_node_pattern(row, &pattern.start, params)?;
+            let mut row = row;
+            let mut current_node = current_node;
+            for segment in &pattern.segments {
+                if segment.edge.hops.is_some() {
+                    return Err(ExecutionError::new(
+                        "create_variable_hops",
+                        "CREATE does not support variable-length edges",
+                    ));
+                }
+                let (next_row, next_node) =
+                    self.realize_node_pattern(row.clone(), &segment.node, params)?;
+                let edge_type = segment.edge.edge_type.clone().ok_or_else(|| {
+                    ExecutionError::new("create_edge_type", "CREATE edges require a type")
+                })?;
+                let properties =
+                    eval_property_map(self, &next_row, &segment.edge.properties, params)?;
+                let edge_id = match segment.direction {
+                    Direction::Incoming => self
+                        .engine
+                        .create_edge(next_node, current_node, edge_type, properties)
+                        .map_err(ExecutionError::from)?,
+                    _ => self
+                        .engine
+                        .create_edge(current_node, next_node, edge_type, properties)
+                        .map_err(ExecutionError::from)?,
+                };
+                row = next_row;
+                if let Some(variable) = &segment.edge.variable {
+                    row.insert(variable.clone(), RuntimeValue::Edge(edge_id));
+                }
+                current_node = next_node;
+            }
+            created_rows.push(row);
+        }
+        Ok(created_rows)
+    }
+
+    fn realize_node_pattern(
+        &mut self,
+        mut row: Row,
+        pattern: &crate::query::NodePattern,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<(Row, NodeId), ExecutionError> {
+        if let Some(variable) = &pattern.variable
+            && let Some(node_id) = match row.get(variable) {
+                Some(RuntimeValue::Node(node_id)) => Some(*node_id),
+                _ => None,
+            }
+        {
+            return Ok((row, node_id));
+        }
+        let properties = eval_property_map(self, &row, &pattern.properties, params)?;
+        let node_id = self
+            .engine
+            .create_node(pattern.labels.iter().cloned(), properties)
+            .map_err(ExecutionError::from)?;
+        if let Some(variable) = &pattern.variable {
+            row.insert(variable.clone(), RuntimeValue::Node(node_id));
+        }
+        Ok((row, node_id))
+    }
+
+    fn apply_set_clause(
+        &mut self,
+        rows: &[Row],
+        assignments: &[crate::query::SetAssignment],
+        params: &BTreeMap<String, Value>,
+    ) -> Result<(), ExecutionError> {
+        for row in rows {
+            for assignment in assignments {
+                let value = self.eval_expr(&assignment.value, row, params)?;
+                let graph_value = value.to_graph_value()?;
+                match row.get(&assignment.target.variable) {
+                    Some(RuntimeValue::Node(node_id)) => {
+                        self.engine
+                            .set_node_property(
+                                *node_id,
+                                assignment.target.property.clone(),
+                                graph_value,
+                            )
+                            .map_err(ExecutionError::from)?;
+                    }
+                    Some(RuntimeValue::Edge(edge_id)) => {
+                        self.engine
+                            .set_edge_property(
+                                *edge_id,
+                                assignment.target.property.clone(),
+                                graph_value,
+                            )
+                            .map_err(ExecutionError::from)?;
+                    }
+                    _ => {
+                        return Err(ExecutionError::new(
+                            "set_target",
+                            "SET targets must resolve to a node or edge variable",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_remove_clause(
+        &mut self,
+        rows: &[Row],
+        targets: &[PropertyTarget],
+    ) -> Result<(), ExecutionError> {
+        for row in rows {
+            for target in targets {
+                match row.get(&target.variable) {
+                    Some(RuntimeValue::Node(node_id)) => {
+                        self.engine
+                            .remove_node_property(*node_id, &target.property)
+                            .map_err(ExecutionError::from)?;
+                    }
+                    Some(RuntimeValue::Edge(edge_id)) => {
+                        self.engine
+                            .remove_edge_property(*edge_id, &target.property)
+                            .map_err(ExecutionError::from)?;
+                    }
+                    _ => {
+                        return Err(ExecutionError::new(
+                            "remove_target",
+                            "REMOVE targets must resolve to a node or edge variable",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_delete_clause(
+        &mut self,
+        rows: &[Row],
+        variables: &[String],
+    ) -> Result<(), ExecutionError> {
+        let mut edges = BTreeSet::new();
+        let mut nodes = BTreeSet::new();
+        for row in rows {
+            for variable in variables {
+                match row.get(variable) {
+                    Some(RuntimeValue::Node(node_id)) => {
+                        nodes.insert(*node_id);
+                    }
+                    Some(RuntimeValue::Edge(edge_id)) => {
+                        edges.insert(*edge_id);
+                    }
+                    _ => {
+                        return Err(ExecutionError::new(
+                            "delete_target",
+                            "DELETE targets must resolve to a node or edge variable",
+                        ));
+                    }
+                }
+            }
+        }
+        for edge_id in edges {
+            if self.engine.edge(edge_id).is_some() {
+                self.engine
+                    .delete_edge(edge_id)
+                    .map_err(ExecutionError::from)?;
+            }
+        }
+        for node_id in nodes {
+            if self.engine.node(node_id).is_some() {
+                self.engine
+                    .delete_node(node_id)
+                    .map_err(ExecutionError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compare_rows(
+        &self,
+        left: &Row,
+        right: &Row,
+        order_by: &[OrderItem],
+        params: &BTreeMap<String, Value>,
+    ) -> Ordering {
+        for item in order_by {
+            let left_value = self.eval_expr(&item.expr, left, params);
+            let right_value = self.eval_expr(&item.expr, right, params);
+            let ordering = match (left_value, right_value) {
+                (Ok(left), Ok(right)) => compare_runtime_values(&left, &right),
+                _ => Ordering::Equal,
+            };
+            if ordering != Ordering::Equal {
+                return if item.descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+            }
+        }
+        Ordering::Equal
+    }
+
+    fn persist_after_commit(&mut self) -> Result<(), ExecutionError> {
+        if let Some(path) = self.path.clone() {
+            let db_uuid = storage::append_commit(&path, &self.engine, self.db_uuid)
+                .map_err(ExecutionError::from)?;
+            self.db_uuid = Some(db_uuid);
+            self.dirty = false;
+        } else {
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    fn bind_node_pattern(
+        &self,
+        row: &Row,
+        node: &Node,
+        pattern: &crate::query::NodePattern,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Option<Row>, ExecutionError> {
+        if !pattern
+            .labels
+            .iter()
+            .all(|label| node.labels().contains(label))
+        {
+            return Ok(None);
+        }
+        for (key, expr) in &pattern.properties {
+            let expected = self.eval_expr(expr, row, params)?;
+            let Some(actual) = node.property(key) else {
+                return Ok(None);
+            };
+            if runtime_from_value(actual) != expected {
+                return Ok(None);
+            }
+        }
+        let mut next = row.clone();
+        if let Some(variable) = &pattern.variable {
+            match next.get(variable) {
+                Some(RuntimeValue::Node(existing)) if *existing == node.id() => {}
+                Some(_) => return Ok(None),
+                None => {
+                    next.insert(variable.clone(), RuntimeValue::Node(node.id()));
+                }
+            }
+        }
+        Ok(Some(next))
+    }
+
+    fn bind_edge_pattern(
+        &self,
+        row: &Row,
+        edge: &Edge,
+        pattern: &EdgePattern,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Option<Row>, ExecutionError> {
+        if !self.edge_matches_filters(edge, pattern, row, params)? {
+            return Ok(None);
+        }
+        let mut next = row.clone();
+        if let Some(variable) = &pattern.variable {
+            match next.get(variable) {
+                Some(RuntimeValue::Edge(existing)) if *existing == edge.id() => {}
+                Some(_) => return Ok(None),
+                None => {
+                    next.insert(variable.clone(), RuntimeValue::Edge(edge.id()));
+                }
+            }
+        }
+        Ok(Some(next))
+    }
+
+    fn edge_matches_filters(
+        &self,
+        edge: &Edge,
+        pattern: &EdgePattern,
+        row: &Row,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<bool, ExecutionError> {
+        if let Some(edge_type) = &pattern.edge_type
+            && edge.edge_type() != edge_type
+        {
+            return Ok(false);
+        }
+        for (key, expr) in &pattern.properties {
+            let expected = self.eval_expr(expr, row, params)?;
+            let Some(actual) = edge.property(key) else {
+                return Ok(false);
+            };
+            if runtime_from_value(actual) != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn edge_ids_for_direction(&self, node_id: NodeId, direction: Direction) -> Vec<EdgeId> {
+        match direction {
+            Direction::Outgoing => self.engine.outgoing_edge_ids(node_id),
+            Direction::Incoming => self.engine.incoming_edge_ids(node_id),
+            Direction::Undirected => {
+                let mut ids = self.engine.outgoing_edge_ids(node_id);
+                ids.extend(self.engine.incoming_edge_ids(node_id));
+                ids.sort();
+                ids.dedup();
+                ids
+            }
+        }
+    }
+
+    fn eval_expr(
+        &self,
+        expr: &Expr,
+        row: &Row,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        match expr {
+            Expr::Null => Ok(RuntimeValue::Null),
+            Expr::Bool(value) => Ok(RuntimeValue::Bool(*value)),
+            Expr::Int(value) => Ok(RuntimeValue::Int(*value)),
+            Expr::Float(value) => Ok(RuntimeValue::Float(*value)),
+            Expr::String(value) => Ok(RuntimeValue::String(value.clone())),
+            Expr::Parameter(name) => Ok(params
+                .get(name)
+                .map(runtime_from_value)
+                .unwrap_or(RuntimeValue::Null)),
+            Expr::Variable(name) => row.get(name).cloned().ok_or_else(|| {
+                ExecutionError::new("unknown_variable", format!("unknown variable {name}"))
+            }),
+            Expr::Property(base, property) => {
+                let value = self.eval_expr(base, row, params)?;
+                self.lookup_property(&value, property)
+            }
+            Expr::List(values) => values
+                .iter()
+                .map(|value| self.eval_expr(value, row, params))
+                .collect::<Result<Vec<_>, _>>()
+                .map(RuntimeValue::List),
+            Expr::Map(entries) => entries
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), self.eval_expr(value, row, params)?)))
+                .collect::<Result<Vec<_>, ExecutionError>>()
+                .map(RuntimeValue::Map),
+            Expr::Unary { op, expr } => {
+                let value = self.eval_expr(expr, row, params)?;
+                match (op, value) {
+                    (UnaryOp::Not, RuntimeValue::Bool(value)) => Ok(RuntimeValue::Bool(!value)),
+                    (UnaryOp::Not, RuntimeValue::Null) => Ok(RuntimeValue::Null),
+                    (UnaryOp::Negate, RuntimeValue::Int(value)) => Ok(RuntimeValue::Int(-value)),
+                    (UnaryOp::Negate, RuntimeValue::Float(value)) => {
+                        Ok(RuntimeValue::Float(-value))
+                    }
+                    _ => Err(ExecutionError::new(
+                        "unary_type_error",
+                        "invalid operand for unary operator",
+                    )),
+                }
+            }
+            Expr::Binary { left, op, right } => {
+                let left = self.eval_expr(left, row, params)?;
+                if *op == BinaryOp::Or {
+                    return short_circuit_or(|| self.eval_expr(right, row, params), left);
+                }
+                if *op == BinaryOp::And {
+                    return short_circuit_and(|| self.eval_expr(right, row, params), left);
+                }
+                let right = self.eval_expr(right, row, params)?;
+                self.eval_binary(op, left, right)
+            }
+            Expr::IsNull { expr, negated } => {
+                let value = self.eval_expr(expr, row, params)?;
+                Ok(RuntimeValue::Bool(if *negated {
+                    value != RuntimeValue::Null
+                } else {
+                    value == RuntimeValue::Null
+                }))
+            }
+            Expr::FunctionCall { name, args } => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.eval_expr(arg, row, params))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.eval_function(name, args)
+            }
+        }
+    }
+
+    fn lookup_property(
+        &self,
+        value: &RuntimeValue,
+        property: &str,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        match value {
+            RuntimeValue::Node(node_id) => Ok(self
+                .engine
+                .node(*node_id)
+                .and_then(|node| node.property(property))
+                .map(runtime_from_value)
+                .unwrap_or(RuntimeValue::Null)),
+            RuntimeValue::Edge(edge_id) => Ok(self
+                .engine
+                .edge(*edge_id)
+                .and_then(|edge| edge.property(property))
+                .map(runtime_from_value)
+                .unwrap_or(RuntimeValue::Null)),
+            RuntimeValue::Map(entries) => Ok(entries
+                .iter()
+                .find(|(key, _)| key == property)
+                .map(|(_, value)| value.clone())
+                .unwrap_or(RuntimeValue::Null)),
+            RuntimeValue::Null => Ok(RuntimeValue::Null),
+            _ => Err(ExecutionError::new(
+                "property_access_type_error",
+                "property access requires a node, edge, or map value",
+            )),
+        }
+    }
+
+    fn eval_binary(
+        &self,
+        op: &BinaryOp,
+        left: RuntimeValue,
+        right: RuntimeValue,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        use BinaryOp as Op;
+        if matches!(left, RuntimeValue::Null) || matches!(right, RuntimeValue::Null) {
+            return Ok(RuntimeValue::Null);
+        }
+
+        match op {
+            Op::Eq => Ok(RuntimeValue::Bool(left == right)),
+            Op::NotEq => Ok(RuntimeValue::Bool(left != right)),
+            Op::Lt | Op::Lte | Op::Gt | Op::Gte => {
+                let ordering = compare_runtime_values(&left, &right);
+                if ordering == Ordering::Equal && !same_runtime_type(&left, &right) {
+                    return Err(ExecutionError::new(
+                        "comparison_type_error",
+                        "cross-type comparisons are not supported",
+                    ));
+                }
+                let result = match op {
+                    Op::Lt => ordering == Ordering::Less,
+                    Op::Lte => matches!(ordering, Ordering::Less | Ordering::Equal),
+                    Op::Gt => ordering == Ordering::Greater,
+                    Op::Gte => matches!(ordering, Ordering::Greater | Ordering::Equal),
+                    _ => unreachable!(),
+                };
+                Ok(RuntimeValue::Bool(result))
+            }
+            Op::Add => match (left, right) {
+                (RuntimeValue::Int(left), RuntimeValue::Int(right)) => {
+                    Ok(RuntimeValue::Int(left + right))
+                }
+                (RuntimeValue::Float(left), RuntimeValue::Float(right)) => {
+                    Ok(RuntimeValue::Float(left + right))
+                }
+                _ => Err(ExecutionError::new(
+                    "arithmetic_type_error",
+                    "addition requires matching numeric types",
+                )),
+            },
+            Op::Subtract => match (left, right) {
+                (RuntimeValue::Int(left), RuntimeValue::Int(right)) => {
+                    Ok(RuntimeValue::Int(left - right))
+                }
+                (RuntimeValue::Float(left), RuntimeValue::Float(right)) => {
+                    Ok(RuntimeValue::Float(left - right))
+                }
+                _ => Err(ExecutionError::new(
+                    "arithmetic_type_error",
+                    "subtraction requires matching numeric types",
+                )),
+            },
+            Op::Multiply => match (left, right) {
+                (RuntimeValue::Int(left), RuntimeValue::Int(right)) => {
+                    Ok(RuntimeValue::Int(left * right))
+                }
+                (RuntimeValue::Float(left), RuntimeValue::Float(right)) => {
+                    Ok(RuntimeValue::Float(left * right))
+                }
+                _ => Err(ExecutionError::new(
+                    "arithmetic_type_error",
+                    "multiplication requires matching numeric types",
+                )),
+            },
+            Op::Divide => match (left, right) {
+                (RuntimeValue::Int(_), RuntimeValue::Int(0))
+                | (RuntimeValue::Float(_), RuntimeValue::Float(0.0)) => {
+                    Err(ExecutionError::new("division_by_zero", "division by zero"))
+                }
+                (RuntimeValue::Int(left), RuntimeValue::Int(right)) => {
+                    Ok(RuntimeValue::Int(left / right))
+                }
+                (RuntimeValue::Float(left), RuntimeValue::Float(right)) => {
+                    Ok(RuntimeValue::Float(left / right))
+                }
+                _ => Err(ExecutionError::new(
+                    "arithmetic_type_error",
+                    "division requires matching numeric types",
+                )),
+            },
+            Op::In => match right {
+                RuntimeValue::List(values) => Ok(RuntimeValue::Bool(values.contains(&left))),
+                _ => Err(ExecutionError::new(
+                    "in_type_error",
+                    "IN requires a list on the right-hand side",
+                )),
+            },
+            Op::Contains => match (left, right) {
+                (RuntimeValue::String(left), RuntimeValue::String(right)) => {
+                    Ok(RuntimeValue::Bool(left.contains(&right)))
+                }
+                _ => Err(ExecutionError::new(
+                    "contains_type_error",
+                    "CONTAINS requires string operands",
+                )),
+            },
+            Op::StartsWith => match (left, right) {
+                (RuntimeValue::String(left), RuntimeValue::String(right)) => {
+                    Ok(RuntimeValue::Bool(left.starts_with(&right)))
+                }
+                _ => Err(ExecutionError::new(
+                    "starts_with_type_error",
+                    "STARTS WITH requires string operands",
+                )),
+            },
+            Op::Or | Op::And => unreachable!(),
+        }
+    }
+
+    fn eval_function(
+        &self,
+        name: &str,
+        args: Vec<RuntimeValue>,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        match (name, args.as_slice()) {
+            ("append", [RuntimeValue::Null, value]) => Ok(RuntimeValue::List(vec![value.clone()])),
+            ("append", [RuntimeValue::List(values), value]) => {
+                let mut values = values.clone();
+                values.push(value.clone());
+                Ok(RuntimeValue::List(values))
+            }
+            ("remove", [RuntimeValue::Null, _]) => Ok(RuntimeValue::Null),
+            ("remove", [RuntimeValue::List(values), value]) => Ok(RuntimeValue::List(
+                values
+                    .iter()
+                    .filter(|entry| *entry != value)
+                    .cloned()
+                    .collect(),
+            )),
+            ("merge", [RuntimeValue::Null, RuntimeValue::Map(entries)]) => {
+                Ok(RuntimeValue::Map(entries.clone()))
+            }
+            ("merge", [RuntimeValue::Map(left), RuntimeValue::Map(right)]) => {
+                let mut merged = left.clone();
+                for (key, value) in right {
+                    if let Some(slot) = merged.iter_mut().find(|(existing, _)| existing == key) {
+                        slot.1 = value.clone();
+                    } else {
+                        merged.push((key.clone(), value.clone()));
+                    }
+                }
+                Ok(RuntimeValue::Map(merged))
+            }
+            ("size", [RuntimeValue::Null]) => Ok(RuntimeValue::Null),
+            ("size", [RuntimeValue::String(value)]) => Ok(RuntimeValue::Int(value.len() as i64)),
+            ("size", [RuntimeValue::List(values)]) => Ok(RuntimeValue::Int(values.len() as i64)),
+            ("size", [RuntimeValue::Map(entries)]) => Ok(RuntimeValue::Int(entries.len() as i64)),
+            ("type", [value]) => Ok(RuntimeValue::String(runtime_type_name(value).to_owned())),
+            ("id", [RuntimeValue::Node(node_id)]) => Ok(RuntimeValue::Int(node_id.get() as i64)),
+            ("id", [RuntimeValue::Edge(edge_id)]) => Ok(RuntimeValue::Int(edge_id.get() as i64)),
+            ("labels", [RuntimeValue::Node(node_id)]) => Ok(RuntimeValue::List(
+                self.engine
+                    .node(*node_id)
+                    .map(|node| {
+                        node.labels()
+                            .iter()
+                            .cloned()
+                            .map(RuntimeValue::String)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )),
+            ("has_prop", [value, RuntimeValue::String(key)]) => {
+                Ok(RuntimeValue::Bool(match value {
+                    RuntimeValue::Node(node_id) => self
+                        .engine
+                        .node(*node_id)
+                        .map(|node| node.properties().contains_key(key))
+                        .unwrap_or(false),
+                    RuntimeValue::Edge(edge_id) => self
+                        .engine
+                        .edge(*edge_id)
+                        .map(|edge| edge.properties().contains_key(key))
+                        .unwrap_or(false),
+                    RuntimeValue::Map(entries) => {
+                        entries.iter().any(|(existing, _)| existing == key)
+                    }
+                    RuntimeValue::Null => false,
+                    _ => false,
+                }))
+            }
+            ("keys", [RuntimeValue::Null]) => Ok(RuntimeValue::Null),
+            ("keys", [RuntimeValue::Map(entries)]) => Ok(RuntimeValue::List(
+                entries
+                    .iter()
+                    .map(|(key, _)| RuntimeValue::String(key.clone()))
+                    .collect(),
+            )),
+            ("values", [RuntimeValue::Null]) => Ok(RuntimeValue::Null),
+            ("values", [RuntimeValue::Map(entries)]) => Ok(RuntimeValue::List(
+                entries.iter().map(|(_, value)| value.clone()).collect(),
+            )),
+            ("contains", [RuntimeValue::Null, _]) => Ok(RuntimeValue::Null),
+            ("contains", [RuntimeValue::List(values), value]) => {
+                Ok(RuntimeValue::Bool(values.contains(value)))
+            }
+            _ => Err(ExecutionError::new(
+                "function_error",
+                format!("unsupported function call {name}"),
+            )),
+        }
+    }
+}
+
+impl Statement {
+    fn is_transaction_control(&self) -> bool {
+        matches!(
+            self,
+            Self::Begin
+                | Self::Commit
+                | Self::Rollback
+                | Self::Savepoint(_)
+                | Self::RollbackToSavepoint(_)
+                | Self::ReleaseSavepoint(_)
+        )
+    }
+
+    fn allowed_in_failed_transaction(&self) -> bool {
+        matches!(
+            self,
+            Self::Rollback
+                | Self::RollbackToSavepoint(_)
+                | Self::ReleaseSavepoint(_)
+                | Self::Show(_)
+        )
+    }
+
+    fn is_mutating(&self) -> bool {
+        match self {
+            Self::CreateLabel { .. }
+            | Self::DropLabel { .. }
+            | Self::CreateEdgeType { .. }
+            | Self::DropEdgeType { .. }
+            | Self::CreateIndex { .. }
+            | Self::DropIndex { .. }
+            | Self::CreateConstraint { .. }
+            | Self::DropConstraint { .. } => true,
+            Self::Query(query) => {
+                query.create_clause.is_some()
+                    || !query.set_clause.is_empty()
+                    || !query.remove_clause.is_empty()
+                    || !query.delete_clause.is_empty()
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExecutionErrorCode {
+    ArithmeticTypeError,
+    BooleanTypeError,
+    ComparisonTypeError,
+    ContainsTypeError,
+    CreateEdgeType,
+    CreateVariableHops,
+    DbUuidMissing,
+    DeleteTarget,
+    DivisionByZero,
+    FunctionError,
+    GraphValueConversion,
+    InTypeError,
+    MultiStatementRequiresTransaction,
+    PropertyAccessTypeError,
+    RemoveTarget,
+    RowLimitExceeded,
+    SaveRequiresPath,
+    SavepointExists,
+    SavepointNotFound,
+    SetTarget,
+    StartsWithTypeError,
+    TransactionActive,
+    TransactionFailed,
+    TransactionFailedCommit,
+    TransactionNotActive,
+    UnaryTypeError,
+    UnknownVariable,
+    VariableHopEdgeBinding,
+    WhereTypeError,
+}
+
+impl ExecutionErrorCode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::ArithmeticTypeError => "arithmetic_type_error",
+            Self::BooleanTypeError => "boolean_type_error",
+            Self::ComparisonTypeError => "comparison_type_error",
+            Self::ContainsTypeError => "contains_type_error",
+            Self::CreateEdgeType => "create_edge_type",
+            Self::CreateVariableHops => "create_variable_hops",
+            Self::DbUuidMissing => "db_uuid_missing",
+            Self::DeleteTarget => "delete_target",
+            Self::DivisionByZero => "division_by_zero",
+            Self::FunctionError => "function_error",
+            Self::GraphValueConversion => "graph_value_conversion",
+            Self::InTypeError => "in_type_error",
+            Self::MultiStatementRequiresTransaction => "multi_statement_requires_transaction",
+            Self::PropertyAccessTypeError => "property_access_type_error",
+            Self::RemoveTarget => "remove_target",
+            Self::RowLimitExceeded => "row_limit_exceeded",
+            Self::SaveRequiresPath => "save_requires_path",
+            Self::SavepointExists => "savepoint_exists",
+            Self::SavepointNotFound => "savepoint_not_found",
+            Self::SetTarget => "set_target",
+            Self::StartsWithTypeError => "starts_with_type_error",
+            Self::TransactionActive => "transaction_active",
+            Self::TransactionFailed => "transaction_failed",
+            Self::TransactionFailedCommit => "transaction_failed_commit",
+            Self::TransactionNotActive => "transaction_not_active",
+            Self::UnaryTypeError => "unary_type_error",
+            Self::UnknownVariable => "unknown_variable",
+            Self::VariableHopEdgeBinding => "variable_hop_edge_binding",
+            Self::WhereTypeError => "where_type_error",
+        }
+    }
+}
+
+impl From<&'static str> for ExecutionErrorCode {
+    fn from(value: &'static str) -> Self {
+        match value {
+            "arithmetic_type_error" => Self::ArithmeticTypeError,
+            "boolean_type_error" => Self::BooleanTypeError,
+            "comparison_type_error" => Self::ComparisonTypeError,
+            "contains_type_error" => Self::ContainsTypeError,
+            "create_edge_type" => Self::CreateEdgeType,
+            "create_variable_hops" => Self::CreateVariableHops,
+            "db_uuid_missing" => Self::DbUuidMissing,
+            "delete_target" => Self::DeleteTarget,
+            "division_by_zero" => Self::DivisionByZero,
+            "function_error" => Self::FunctionError,
+            "graph_value_conversion" => Self::GraphValueConversion,
+            "in_type_error" => Self::InTypeError,
+            "multi_statement_requires_transaction" => Self::MultiStatementRequiresTransaction,
+            "property_access_type_error" => Self::PropertyAccessTypeError,
+            "remove_target" => Self::RemoveTarget,
+            "row_limit_exceeded" => Self::RowLimitExceeded,
+            "save_requires_path" => Self::SaveRequiresPath,
+            "savepoint_exists" => Self::SavepointExists,
+            "savepoint_not_found" => Self::SavepointNotFound,
+            "set_target" => Self::SetTarget,
+            "starts_with_type_error" => Self::StartsWithTypeError,
+            "transaction_active" => Self::TransactionActive,
+            "transaction_failed" => Self::TransactionFailed,
+            "transaction_failed_commit" => Self::TransactionFailedCommit,
+            "transaction_not_active" => Self::TransactionNotActive,
+            "unary_type_error" => Self::UnaryTypeError,
+            "unknown_variable" => Self::UnknownVariable,
+            "variable_hop_edge_binding" => Self::VariableHopEdgeBinding,
+            "where_type_error" => Self::WhereTypeError,
+            _ => panic!("unknown execution error code: {value}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExecutionErrorKind {
+    Runtime(ExecutionErrorCode),
+    Query(QueryError),
+    Graph(GraphError),
+    Storage(storage::StorageError),
+}
+
+impl ExecutionErrorKind {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Runtime(code) => code.as_str(),
+            Self::Query(error) => error.code(),
+            Self::Graph(error) => error.code(),
+            Self::Storage(error) => error.code(),
+        }
+    }
+}
+
+impl From<&'static str> for ExecutionErrorKind {
+    fn from(value: &'static str) -> Self {
+        Self::Runtime(value.into())
+    }
+}
+
+impl From<QueryError> for ExecutionErrorKind {
+    fn from(value: QueryError) -> Self {
+        Self::Query(value)
+    }
+}
+
+impl From<GraphError> for ExecutionErrorKind {
+    fn from(value: GraphError) -> Self {
+        Self::Graph(value)
+    }
+}
+
+impl From<storage::StorageError> for ExecutionErrorKind {
+    fn from(value: storage::StorageError) -> Self {
+        Self::Storage(value)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecutionError {
+    kind: ExecutionErrorKind,
+    message: String,
+}
+
+impl ExecutionError {
+    fn new(kind: impl Into<ExecutionErrorKind>, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.kind.code()
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code(), self.message)
+    }
+}
+
+impl std::error::Error for ExecutionError {}
+
+impl From<QueryError> for ExecutionError {
+    fn from(value: QueryError) -> Self {
+        let message = value.to_string();
+        Self::new(value, message)
+    }
+}
+
+impl From<GraphError> for ExecutionError {
+    fn from(value: GraphError) -> Self {
+        let message = value.to_string();
+        Self::new(value, message)
+    }
+}
+
+impl From<storage::StorageError> for ExecutionError {
+    fn from(value: storage::StorageError) -> Self {
+        let message = value.to_string();
+        Self::new(value, message)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum RuntimeValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Datetime(SystemTime),
+    List(Vec<RuntimeValue>),
+    Map(Vec<(String, RuntimeValue)>),
+    Node(NodeId),
+    Edge(EdgeId),
+}
+
+impl PartialEq for RuntimeValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            (Self::Int(left), Self::Int(right)) => left == right,
+            (Self::Float(left), Self::Float(right)) => left.to_bits() == right.to_bits(),
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::Bytes(left), Self::Bytes(right)) => left == right,
+            (Self::Datetime(left), Self::Datetime(right)) => left == right,
+            (Self::List(left), Self::List(right)) => left == right,
+            (Self::Map(left), Self::Map(right)) => left == right,
+            (Self::Node(left), Self::Node(right)) => left == right,
+            (Self::Edge(left), Self::Edge(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl RuntimeValue {
+    fn to_graph_value(&self) -> Result<Value, ExecutionError> {
+        match self {
+            Self::Null => Ok(Value::Null),
+            Self::Bool(value) => Ok(Value::Bool(*value)),
+            Self::Int(value) => Ok(Value::Int(*value)),
+            Self::Float(value) => Ok(Value::Float(*value)),
+            Self::String(value) => Ok(Value::String(value.clone())),
+            Self::Bytes(value) => Ok(Value::Bytes(value.clone())),
+            Self::Datetime(value) => Ok(Value::Datetime(*value)),
+            Self::List(values) => values
+                .iter()
+                .map(RuntimeValue::to_graph_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            Self::Map(entries) => {
+                let mut properties = PropertyMap::new();
+                for (key, value) in entries {
+                    properties.insert(key.clone(), value.to_graph_value()?);
+                }
+                Ok(Value::from(properties))
+            }
+            Self::Node(_) | Self::Edge(_) => Err(ExecutionError::new(
+                "graph_value_conversion",
+                "node and edge values cannot be stored as properties",
+            )),
+        }
+    }
+}
+
+type Row = BTreeMap<String, RuntimeValue>;
+
+fn empty_result() -> QueryResult {
+    query_result(&[], Vec::<Vec<RuntimeValue>>::new())
+}
+
+fn query_result(columns: &[&str], rows: Vec<Vec<RuntimeValue>>) -> QueryResult {
+    QueryResult {
+        columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+        rows,
+    }
+}
+
+fn single_row_result(columns: &[&str], row: Vec<RuntimeValue>) -> QueryResult {
+    query_result(columns, vec![row])
+}
+
+impl Session {
+    fn require_active_transaction(&self, message: &'static str) -> Result<(), ExecutionError> {
+        if self.transaction_base.is_some() {
+            Ok(())
+        } else {
+            Err(ExecutionError::new("transaction_not_active", message))
+        }
+    }
+
+    fn find_savepoint_index(&self, name: &str) -> Result<usize, ExecutionError> {
+        self.savepoints
+            .iter()
+            .position(|(existing, _, _)| existing == name)
+            .ok_or_else(|| ExecutionError::new("savepoint_not_found", "savepoint does not exist"))
+    }
+}
+
+fn eval_property_map(
+    session: &Session,
+    row: &Row,
+    properties: &[(String, Expr)],
+    params: &BTreeMap<String, Value>,
+) -> Result<PropertyMap, ExecutionError> {
+    let mut map = PropertyMap::new();
+    for (key, expr) in properties {
+        let value = session.eval_expr(expr, row, params)?;
+        map.insert(key.clone(), value.to_graph_value()?);
+    }
+    Ok(map)
+}
+
+fn runtime_from_value(value: &Value) -> RuntimeValue {
+    match value {
+        Value::Null => RuntimeValue::Null,
+        Value::Bool(value) => RuntimeValue::Bool(*value),
+        Value::Int(value) => RuntimeValue::Int(*value),
+        Value::Float(value) => RuntimeValue::Float(*value),
+        Value::String(value) => RuntimeValue::String(value.clone()),
+        Value::Bytes(value) => RuntimeValue::Bytes(value.clone()),
+        Value::Datetime(value) => RuntimeValue::Datetime(*value),
+        Value::List(values) => RuntimeValue::List(values.iter().map(runtime_from_value).collect()),
+        Value::Map(map) => RuntimeValue::Map(
+            map.iter()
+                .map(|(key, value)| (key.to_owned(), runtime_from_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn short_circuit_or<F>(rhs: F, left: RuntimeValue) -> Result<RuntimeValue, ExecutionError>
+where
+    F: FnOnce() -> Result<RuntimeValue, ExecutionError>,
+{
+    match left {
+        RuntimeValue::Bool(true) => Ok(RuntimeValue::Bool(true)),
+        RuntimeValue::Bool(false) => rhs().and_then(|right| match right {
+            RuntimeValue::Bool(value) => Ok(RuntimeValue::Bool(value)),
+            RuntimeValue::Null => Ok(RuntimeValue::Null),
+            _ => Err(ExecutionError::new(
+                "boolean_type_error",
+                "OR requires bool operands",
+            )),
+        }),
+        RuntimeValue::Null => rhs().and_then(|right| match right {
+            RuntimeValue::Bool(true) => Ok(RuntimeValue::Bool(true)),
+            RuntimeValue::Bool(false) | RuntimeValue::Null => Ok(RuntimeValue::Null),
+            _ => Err(ExecutionError::new(
+                "boolean_type_error",
+                "OR requires bool operands",
+            )),
+        }),
+        _ => Err(ExecutionError::new(
+            "boolean_type_error",
+            "OR requires bool operands",
+        )),
+    }
+}
+
+fn short_circuit_and<F>(rhs: F, left: RuntimeValue) -> Result<RuntimeValue, ExecutionError>
+where
+    F: FnOnce() -> Result<RuntimeValue, ExecutionError>,
+{
+    match left {
+        RuntimeValue::Bool(false) => Ok(RuntimeValue::Bool(false)),
+        RuntimeValue::Bool(true) => rhs().and_then(|right| match right {
+            RuntimeValue::Bool(value) => Ok(RuntimeValue::Bool(value)),
+            RuntimeValue::Null => Ok(RuntimeValue::Null),
+            _ => Err(ExecutionError::new(
+                "boolean_type_error",
+                "AND requires bool operands",
+            )),
+        }),
+        RuntimeValue::Null => rhs().and_then(|right| match right {
+            RuntimeValue::Bool(false) => Ok(RuntimeValue::Bool(false)),
+            RuntimeValue::Bool(true) | RuntimeValue::Null => Ok(RuntimeValue::Null),
+            _ => Err(ExecutionError::new(
+                "boolean_type_error",
+                "AND requires bool operands",
+            )),
+        }),
+        _ => Err(ExecutionError::new(
+            "boolean_type_error",
+            "AND requires bool operands",
+        )),
+    }
+}
+
+fn compare_runtime_values(left: &RuntimeValue, right: &RuntimeValue) -> Ordering {
+    match (left, right) {
+        (RuntimeValue::Null, RuntimeValue::Null) => Ordering::Equal,
+        (RuntimeValue::Null, _) => Ordering::Greater,
+        (_, RuntimeValue::Null) => Ordering::Less,
+        (RuntimeValue::Bool(left), RuntimeValue::Bool(right)) => left.cmp(right),
+        (RuntimeValue::Int(left), RuntimeValue::Int(right)) => left.cmp(right),
+        (RuntimeValue::Float(left), RuntimeValue::Float(right)) => {
+            left.partial_cmp(right).unwrap_or(Ordering::Equal)
+        }
+        (RuntimeValue::String(left), RuntimeValue::String(right)) => left.cmp(right),
+        (RuntimeValue::Bytes(left), RuntimeValue::Bytes(right)) => left.cmp(right),
+        (RuntimeValue::Datetime(left), RuntimeValue::Datetime(right)) => left.cmp(right),
+        (RuntimeValue::List(left), RuntimeValue::List(right)) => left.len().cmp(&right.len()),
+        (RuntimeValue::Map(left), RuntimeValue::Map(right)) => left.len().cmp(&right.len()),
+        (RuntimeValue::Node(left), RuntimeValue::Node(right)) => left.get().cmp(&right.get()),
+        (RuntimeValue::Edge(left), RuntimeValue::Edge(right)) => left.get().cmp(&right.get()),
+        _ => Ordering::Equal,
+    }
+}
+
+fn same_runtime_type(left: &RuntimeValue, right: &RuntimeValue) -> bool {
+    std::mem::discriminant(left) == std::mem::discriminant(right)
+}
+
+fn runtime_type_name(value: &RuntimeValue) -> &'static str {
+    match value {
+        RuntimeValue::Null => "null",
+        RuntimeValue::Bool(_) => "bool",
+        RuntimeValue::Int(_) => "int",
+        RuntimeValue::Float(_) => "float",
+        RuntimeValue::String(_) => "string",
+        RuntimeValue::Bytes(_) => "bytes",
+        RuntimeValue::Datetime(_) => "datetime",
+        RuntimeValue::List(_) => "list",
+        RuntimeValue::Map(_) => "map",
+        RuntimeValue::Node(_) => "node",
+        RuntimeValue::Edge(_) => "edge",
+    }
+}
+
+fn show_schema_result(rows: Vec<SchemaRow>) -> QueryResult {
+    query_result(
+        &["kind", "name", "ddl"],
+        rows.into_iter()
+            .map(|row| {
+                vec![
+                    RuntimeValue::String(row.kind),
+                    RuntimeValue::String(row.name),
+                    RuntimeValue::String(row.ddl),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn show_indexes_result(rows: Vec<IndexRow>) -> QueryResult {
+    query_result(
+        &[
+            "name",
+            "target_kind",
+            "target_name",
+            "property",
+            "unique",
+            "status",
+        ],
+        rows.into_iter()
+            .map(|row| {
+                vec![
+                    RuntimeValue::String(row.name),
+                    RuntimeValue::String(row.target_kind),
+                    RuntimeValue::String(row.target_name),
+                    RuntimeValue::String(row.property),
+                    RuntimeValue::Bool(row.unique),
+                    RuntimeValue::String(row.status),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn show_constraints_result(rows: Vec<ConstraintRow>) -> QueryResult {
+    query_result(
+        &[
+            "name",
+            "target_kind",
+            "target_name",
+            "property",
+            "constraint_type",
+            "details",
+        ],
+        rows.into_iter()
+            .map(|row| {
+                vec![
+                    RuntimeValue::String(row.name),
+                    RuntimeValue::String(row.target_kind),
+                    RuntimeValue::String(row.target_name),
+                    RuntimeValue::String(row.property),
+                    RuntimeValue::String(row.constraint_type),
+                    RuntimeValue::String(row.details),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn show_stats_result(stats: GraphStats) -> QueryResult {
+    single_row_result(
+        &[
+            "node_count",
+            "edge_count",
+            "label_count",
+            "edge_type_count",
+            "index_count",
+            "constraint_count",
+            "last_tx_id",
+            "wal_bytes",
+        ],
+        vec![
+            RuntimeValue::Int(stats.node_count as i64),
+            RuntimeValue::Int(stats.edge_count as i64),
+            RuntimeValue::Int(stats.label_count as i64),
+            RuntimeValue::Int(stats.edge_type_count as i64),
+            RuntimeValue::Int(stats.index_count as i64),
+            RuntimeValue::Int(stats.constraint_count as i64),
+            RuntimeValue::Int(stats.last_tx_id as i64),
+            RuntimeValue::Int(stats.wal_bytes as i64),
+        ],
+    )
+}
+
+fn show_transactions_result(info: TransactionInfo) -> QueryResult {
+    single_row_result(
+        &["active", "failed", "savepoints", "last_tx_id"],
+        vec![
+            RuntimeValue::Bool(info.active),
+            RuntimeValue::Bool(info.failed),
+            RuntimeValue::Int(info.savepoints as i64),
+            RuntimeValue::Int(info.last_tx_id as i64),
+        ],
+    )
+}
+
+fn build_explain_rows(
+    statement: &Statement,
+    parent_id: Option<i64>,
+    next_id: &mut i64,
+    rows: &mut Vec<Vec<RuntimeValue>>,
+) {
+    let id = *next_id;
+    *next_id += 1;
+    let (operator, detail) = match statement {
+        Statement::Show(kind) => ("Show", format!("{kind:?}")),
+        Statement::Explain(_) => ("Explain", String::new()),
+        Statement::CreateLabel { name, .. } => ("CreateLabel", name.clone()),
+        Statement::DropLabel { name, .. } => ("DropLabel", name.clone()),
+        Statement::CreateEdgeType { name, .. } => ("CreateEdgeType", name.clone()),
+        Statement::DropEdgeType { name, .. } => ("DropEdgeType", name.clone()),
+        Statement::CreateIndex { property, .. } => ("CreateIndex", property.clone()),
+        Statement::DropIndex { name, .. } => ("DropIndex", name.clone()),
+        Statement::CreateConstraint { property, .. } => ("CreateConstraint", property.clone()),
+        Statement::DropConstraint { name, .. } => ("DropConstraint", name.clone()),
+        Statement::Begin => ("Begin", String::new()),
+        Statement::Commit => ("Commit", String::new()),
+        Statement::Rollback => ("Rollback", String::new()),
+        Statement::Savepoint(name) => ("Savepoint", name.clone()),
+        Statement::RollbackToSavepoint(name) => ("RollbackToSavepoint", name.clone()),
+        Statement::ReleaseSavepoint(name) => ("ReleaseSavepoint", name.clone()),
+        Statement::Query(query) => {
+            rows.push(vec![
+                RuntimeValue::Int(id),
+                parent_id
+                    .map(RuntimeValue::Int)
+                    .unwrap_or(RuntimeValue::Null),
+                RuntimeValue::String("Query".to_owned()),
+                RuntimeValue::String(String::new()),
+            ]);
+            if query.match_clause.is_some() {
+                add_explain_child(next_id, rows, id, "Match", "pattern");
+            }
+            if query.where_clause.is_some() {
+                add_explain_child(next_id, rows, id, "Filter", "WHERE");
+            }
+            if query.create_clause.is_some() {
+                add_explain_child(next_id, rows, id, "Create", "pattern");
+            }
+            if !query.set_clause.is_empty() {
+                add_explain_child(next_id, rows, id, "Set", "properties");
+            }
+            if !query.remove_clause.is_empty() {
+                add_explain_child(next_id, rows, id, "Remove", "properties");
+            }
+            if !query.delete_clause.is_empty() {
+                add_explain_child(next_id, rows, id, "Delete", "variables");
+            }
+            if !query.return_clause.is_empty() {
+                add_explain_child(next_id, rows, id, "Project", "RETURN");
+            }
+            if !query.order_by.is_empty() {
+                add_explain_child(next_id, rows, id, "Order", "ORDER BY");
+            }
+            if query.limit.is_some() {
+                add_explain_child(next_id, rows, id, "Limit", "LIMIT");
+            }
+            return;
+        }
+    };
+
+    rows.push(vec![
+        RuntimeValue::Int(id),
+        parent_id
+            .map(RuntimeValue::Int)
+            .unwrap_or(RuntimeValue::Null),
+        RuntimeValue::String(operator.to_owned()),
+        RuntimeValue::String(detail),
+    ]);
+}
+
+fn add_explain_child(
+    next_id: &mut i64,
+    rows: &mut Vec<Vec<RuntimeValue>>,
+    parent_id: i64,
+    operator: &str,
+    detail: &str,
+) {
+    let id = *next_id;
+    *next_id += 1;
+    rows.push(vec![
+        RuntimeValue::Int(id),
+        RuntimeValue::Int(parent_id),
+        RuntimeValue::String(operator.to_owned()),
+        RuntimeValue::String(detail.to_owned()),
+    ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::{RuntimeValue, Session};
+    use crate::engine::Value;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{}_{}.cupld", name, std::process::id()))
+    }
+
+    #[test]
+    fn executes_match_where_return_queries() {
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script(
+                "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Grace'})",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        let results = session
+            .execute_script(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS source, b.name AS target",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(results[0].columns, vec!["source", "target"]);
+        assert_eq!(
+            results[0].rows,
+            vec![vec![
+                RuntimeValue::String("Ada".to_owned()),
+                RuntimeValue::String("Grace".to_owned())
+            ]]
+        );
+    }
+
+    #[test]
+    fn supports_transactions_and_savepoints() {
+        let mut session = Session::new_in_memory();
+        session.execute_script("BEGIN", &BTreeMap::new()).unwrap();
+        session
+            .execute_script("CREATE (n:Person {name: 'Ada'})", &BTreeMap::new())
+            .unwrap();
+        session
+            .execute_script("SAVEPOINT before_name", &BTreeMap::new())
+            .unwrap();
+        session
+            .execute_script(
+                "MATCH (n:Person) SET n.name = 'Grace' RETURN n.name",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        session
+            .execute_script("ROLLBACK TO SAVEPOINT before_name", &BTreeMap::new())
+            .unwrap();
+        let results = session
+            .execute_script("MATCH (n:Person) RETURN n.name", &BTreeMap::new())
+            .unwrap();
+
+        assert_eq!(
+            results[0].rows,
+            vec![vec![RuntimeValue::String("Ada".to_owned())]]
+        );
+    }
+
+    #[test]
+    fn exposes_show_and_explain_results() {
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script("CREATE LABEL Person", &BTreeMap::new())
+            .unwrap();
+
+        let show = session
+            .execute_script("SHOW SCHEMA", &BTreeMap::new())
+            .unwrap();
+        let explain = session
+            .execute_script(
+                "EXPLAIN MATCH (n:Person) RETURN n.name ORDER BY n.name DESC LIMIT 2",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(show[0].columns, vec!["kind", "name", "ddl"]);
+        assert_eq!(
+            explain[0].columns,
+            vec!["id", "parent_id", "operator", "detail"]
+        );
+        assert!(explain[0].rows.len() >= 3);
+    }
+
+    #[test]
+    fn uses_named_parameters() {
+        let mut session = Session::new_in_memory();
+        let mut params = BTreeMap::new();
+        params.insert("name".to_owned(), Value::from("Ada"));
+
+        session
+            .execute_script("CREATE (n:Person {name: $name})", &params)
+            .unwrap();
+        let result = session
+            .execute_script("MATCH (n:Person {name: $name}) RETURN n.name", &params)
+            .unwrap();
+
+        assert_eq!(
+            result[0].rows,
+            vec![vec![RuntimeValue::String("Ada".to_owned())]]
+        );
+    }
+
+    #[test]
+    fn save_as_and_open_round_trip() {
+        let path = temp_path("cupld_runtime_round_trip");
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script("CREATE (n:Person {name: 'Ada'})", &BTreeMap::new())
+            .unwrap();
+        assert!(session.is_dirty());
+
+        session.save_as(&path).unwrap();
+        assert!(!session.is_dirty());
+
+        let mut reopened = Session::open(&path).unwrap();
+        let result = reopened
+            .execute_script("MATCH (n:Person) RETURN n.name", &BTreeMap::new())
+            .unwrap();
+
+        assert_eq!(
+            result[0].rows,
+            vec![vec![RuntimeValue::String("Ada".to_owned())]]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+}
