@@ -166,11 +166,6 @@ fn run() -> Result<(), String> {
             output,
             top_k,
         } => run_context(db_path, output, top_k),
-        CliCommand::Mcp {
-            db_path,
-            tool,
-            query_args,
-        } => run_mcp(db_path, &tool, &query_args),
         CliCommand::Schema { db_path } => run_schema(&db_path),
         CliCommand::Compact { db_path } => run_compact(db_path),
         CliCommand::Check { db_path } => run_check(db_path),
@@ -207,11 +202,6 @@ enum CliCommand {
         output: OutputFormat,
         top_k: usize,
     },
-    Mcp {
-        db_path: PathBuf,
-        tool: String,
-        query_args: Vec<String>,
-    },
     Schema {
         db_path: PathBuf,
     },
@@ -247,7 +237,6 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         }
         Some("query") => parse_query_command(&args[1..]),
         Some("context") => parse_context_command(&args[1..]),
-        Some("mcp") => parse_mcp_command(&args[1..]),
         Some("schema") => {
             ensure_subcommand_has_no_option(&args[1..], "schema", "--visualise")?;
             ensure_subcommand_has_no_option(&args[1..], "schema", "--query")?;
@@ -451,50 +440,6 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
         db_path,
         output,
         top_k,
-    })
-}
-
-fn parse_mcp_command(args: &[String]) -> Result<CliCommand, String> {
-    let mut db_path = None;
-    let mut query_args = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--db" => {
-                let Some(path) = args.get(index + 1) else {
-                    return Err("expected --db <path.cupld> for `mcp` command".to_owned());
-                };
-                db_path = Some(PathBuf::from(path));
-                index += 2;
-            }
-            value if value.starts_with('-') => {
-                return Err(format!(
-                    "error: unknown option `{value}`\n\n{}",
-                    cli_usage_text()
-                ));
-            }
-            _ => {
-                query_args.extend(args[index..].iter().cloned());
-                break;
-            }
-        }
-    }
-    let Some(db_path) = db_path else {
-        return Err("expected --db <path.cupld> for `mcp` command".to_owned());
-    };
-    let tool = query_args
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "schema".to_owned());
-    let tool_args = if query_args.is_empty() {
-        Vec::new()
-    } else {
-        query_args[1..].to_vec()
-    };
-    Ok(CliCommand::Mcp {
-        db_path,
-        tool,
-        query_args: tool_args,
     })
 }
 
@@ -834,7 +779,6 @@ Usage:
   cupld --visualise --db <path.cupld> --query 'MATCH (n) RETURN n LIMIT 10'
   cupld query --db <path.cupld> [--with-markdown] [--root <path>] [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
   cupld context --db <path.cupld> [--top-k <n>] [--output <table|json|ndjson>]
-  cupld mcp --db <path.cupld> [schema|check|query ...]
   cupld schema --db <path.cupld>
   cupld compact --db <path.cupld>
   cupld check --db <path.cupld>
@@ -853,7 +797,6 @@ Commands:
   --query                 Seed the scene with one read-only RETURN query.
   query                   Run a query against --db using inline text or stdin.
   context                 Build compact context rows (top-k nodes) for agent prompts.
-  mcp                     Read-only MCP-style adapter (schema/check/query).
   --with-markdown         Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
   --output                Select output mode for query/context: table, json, ndjson.
@@ -870,20 +813,19 @@ Commands:
 
 Examples:
   cupld
-  cupld state/dev.cupld
-  cupld --db state/dev.cupld
-  cupld --visualise state/dev.cupld
-  cupld --visualise --db state/dev.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
-  cupld --db state/dev.cupld --visualise
-  cupld query --db state/dev.cupld --output json 'MATCH (n) RETURN n'
-  cupld query --db state/dev.cupld --params-json '{\"name\":\"Ada\"}' 'MATCH (n:Person {name: $name}) RETURN n'
-  cupld query --db state/dev.cupld --with-markdown --root notes 'MATCH (n) RETURN n'
-  cupld context --db state/dev.cupld --top-k 25
-  cupld mcp --db state/dev.cupld schema
-  echo 'MATCH (n) RETURN n' | cupld query --db state/dev.cupld
-  cupld schema --db state/dev.cupld
-  cupld sync markdown --db state/dev.cupld
-  cupld source set-root --db state/dev.cupld notes
+  cupld .cupld/default.cupld
+  cupld --db .cupld/default.cupld
+  cupld --visualise .cupld/default.cupld
+  cupld --visualise --db .cupld/default.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
+  cupld --db .cupld/default.cupld --visualise
+  cupld query --db .cupld/default.cupld --output json 'MATCH (n) RETURN n'
+  cupld query --db .cupld/default.cupld --params-json '{\"name\":\"Ada\"}' 'MATCH (n:Person {name: $name}) RETURN n'
+  cupld query --db .cupld/default.cupld --with-markdown --root notes 'MATCH (n) RETURN n'
+  cupld context --db .cupld/default.cupld --top-k 25
+  echo 'MATCH (n) RETURN n' | cupld query --db .cupld/default.cupld
+  cupld schema --db .cupld/default.cupld
+  cupld sync markdown --db .cupld/default.cupld
+  cupld source set-root --db .cupld/default.cupld notes
   cupld install
   cupld install --target codex --scope home --db .cupld/default.cupld
   cupld install --target claude --scope cwd --db .cupld/default.cupld --root notes
@@ -940,42 +882,6 @@ fn run_context(db_path: PathBuf, output: OutputFormat, top_k: usize) -> Result<(
         .map_err(|error| format_error_json(error.code(), error.message()))?;
     print_results(&results, output);
     Ok(())
-}
-
-fn run_mcp(db_path: PathBuf, tool: &str, query_args: &[String]) -> Result<(), String> {
-    match tool {
-        "schema" => run_schema(&db_path),
-        "check" => run_check(db_path),
-        "query" => {
-            let mut args = vec!["--db".to_owned(), db_path.display().to_string()];
-            args.extend(query_args.iter().cloned());
-            let command = parse_query_command(&args)?;
-            let CliCommand::Query {
-                db_path,
-                with_markdown,
-                root_override,
-                output,
-                params_json,
-                params_file,
-                max_rows,
-                query_args,
-            } = command
-            else {
-                return Err("invalid mcp query invocation".to_owned());
-            };
-            run_query(QueryRunConfig {
-                db_path,
-                with_markdown,
-                root_override,
-                output,
-                params_json: params_json.as_deref(),
-                params_file: params_file.as_deref(),
-                max_rows,
-                query_args: &query_args,
-            })
-        }
-        _ => Err("mcp tool must be one of: schema, check, query".to_owned()),
-    }
 }
 
 fn cap_results(results: &[QueryResult], max_rows: usize) -> Vec<QueryResult> {
@@ -1660,7 +1566,6 @@ fn is_registered_command(input: &str) -> bool {
         input,
         "query"
             | "context"
-            | "mcp"
             | "schema"
             | "compact"
             | "check"
@@ -2003,33 +1908,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_mcp_command_with_default_and_query_tool() {
-        assert_eq!(
-            parse_cli_command(&["mcp".to_owned(), "--db".to_owned(), "db.cupld".to_owned()]),
-            Ok(CliCommand::Mcp {
-                db_path: PathBuf::from("db.cupld"),
-                tool: "schema".to_owned(),
-                query_args: vec![],
-            })
-        );
-
-        assert_eq!(
-            parse_cli_command(&[
-                "mcp".to_owned(),
-                "--db".to_owned(),
-                "db.cupld".to_owned(),
-                "query".to_owned(),
-                "MATCH (n) RETURN n".to_owned(),
-            ]),
-            Ok(CliCommand::Mcp {
-                db_path: PathBuf::from("db.cupld"),
-                tool: "query".to_owned(),
-                query_args: vec!["MATCH (n) RETURN n".to_owned()],
-            })
-        );
-    }
-
-    #[test]
     fn parses_params_json_into_runtime_values() {
         let params = parse_params_json(
             "{\"name\":\"Ada\",\"age\":36,\"active\":true,\"tags\":[\"a\",\"b\"],\"meta\":{\"team\":\"graph\"}}",
@@ -2308,7 +2186,7 @@ mod tests {
         ));
         assert!(help.contains("Seed the scene with one read-only RETURN query."));
         assert!(help.contains("Run a query against --db using inline text or stdin."));
-        assert!(help.contains("echo 'MATCH (n) RETURN n' | cupld query --db state/dev.cupld"));
+        assert!(help.contains("echo 'MATCH (n) RETURN n' | cupld query --db .cupld/default.cupld"));
         assert!(help.contains("Run .help inside the REPL for interactive commands."));
     }
 

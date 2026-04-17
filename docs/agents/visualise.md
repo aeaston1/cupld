@@ -12,9 +12,9 @@
 ## Examples
 
 ```bash
-cupld --visualise state/dev.cupld
-cupld --db state/dev.cupld --visualise
-cupld --visualise --db state/dev.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
+cupld --visualise .cupld/default.cupld
+cupld --db .cupld/default.cupld --visualise
+cupld --visualise --db .cupld/default.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
 ```
 
 ## Notes

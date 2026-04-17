@@ -2,13 +2,13 @@
 
 `cupld` is a local graph database CLI and REPL with first-class support for markdown-backed memory workflows.
 
-It gives you an interactive shell, one-shot query commands, integrity checks, a scene viewer, and a bundled skill for wiring markdown notes into a local memory database.
+It provides interactive exploration, one-shot queries, compact context output for agents, markdown sync, and a visual graph viewer over file-backed `.cupld` stores. It is built in Rust as a single binary with no external runtime dependencies.
 
 ## Highlights
 
 - Local-first graph database with file-backed `.cupld` stores
-- REPL for interactive exploration and updates
-- Scriptable `query`, `schema`, and `check` commands
+- Pure Rust binary with no external runtime dependencies
+- Interactive REPL plus scriptable `query`, `context`, `schema`, and `check` commands
 - Markdown sync and bundled `cupld-md-memory` skill bootstrap
 - Visual graph viewer for inspecting a database
 
@@ -37,10 +37,6 @@ brew install aeaston1/tap/cupld
 cargo install cupld
 ```
 
-```powershell
-winget install aeaston1.cupld
-```
-
 ## Quickstart
 
 Start an in-memory REPL:
@@ -52,26 +48,33 @@ cupld
 Open or create a file-backed database:
 
 ```bash
-cupld state/dev.cupld
+cupld .cupld/default.cupld
 ```
 
 Run a one-shot query:
 
 ```bash
-cupld query --db state/dev.cupld 'MATCH (n) RETURN n LIMIT 10'
+cupld query --db .cupld/default.cupld 'MATCH (n) RETURN n LIMIT 10'
 ```
 
-Inspect and validate a database:
+Build compact context rows for agent prompts:
 
 ```bash
-cupld schema --db state/dev.cupld
-cupld check --db state/dev.cupld
+cupld context --db .cupld/default.cupld --top-k 25
+```
+
+Inspect, validate, and compact a database:
+
+```bash
+cupld schema --db .cupld/default.cupld
+cupld check --db .cupld/default.cupld
+cupld compact --db .cupld/default.cupld
 ```
 
 Open the viewer:
 
 ```bash
-cupld --visualise state/dev.cupld
+cupld --visualise .cupld/default.cupld
 ```
 
 ## Markdown Memory
@@ -80,6 +83,15 @@ Bootstrap the bundled `cupld-md-memory` skill and a local `.cupld` memory DB:
 
 ```bash
 cupld install
+```
+
+By default, `install` uses `.cupld/default.cupld` for the database file and `.cupld/data` for the markdown root.
+
+Sync markdown into a database and override the root:
+
+```bash
+cupld sync markdown --db .cupld/default.cupld --root notes
+cupld source set-root --db .cupld/default.cupld notes
 ```
 
 Install into a provider-specific skills directory or a custom path:

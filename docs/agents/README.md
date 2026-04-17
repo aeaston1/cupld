@@ -8,7 +8,7 @@ This is the canonical agent guide for operating `cupld`. Use the [`docs` index](
 
 - Use `cupld` to start an in-memory REPL.
 - Use `cupld <path.cupld>` or `cupld --db <path.cupld>` to open or create a file-backed REPL.
-- Use `cupld install` to install the bundled `cupld-md-memory` skill and bootstrap a local `.cupld` memory DB/root.
+- Use `cupld install` to install the bundled `cupld-md-memory` skill and bootstrap local memory. The default DB path is `.cupld/default.cupld` and the default markdown root is `.cupld/data`.
 - Use `cupld query --db <path.cupld> ...` for one-shot automation.
 - Use `cupld schema --db <path.cupld>` and `cupld check --db <path.cupld>` before making assumptions about a DB.
 - Use `cupld --visualise <path.cupld>` to open the scene viewer.
@@ -24,10 +24,11 @@ cupld --db <path.cupld> --visualise
 cupld --visualise --db <path.cupld> --query 'MATCH (n) RETURN n LIMIT 10'
 cupld query --db <path.cupld> [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
 cupld context --db <path.cupld> [--top-k <n>] [--output <table|json|ndjson>]
-cupld mcp --db <path.cupld> [schema|check|query ...]
 cupld schema --db <path.cupld>
 cupld compact --db <path.cupld>
 cupld check --db <path.cupld>
+cupld sync markdown --db <path.cupld> [--root <path>]
+cupld source set-root --db <path.cupld> <path>
 cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld>] [--root <path>] [--force] [--yes]
 ```
 
@@ -43,9 +44,9 @@ Important constraints:
 
 For safe automation, prefer this order:
 
-1. `cupld check --db state/dev.cupld`
-2. `cupld schema --db state/dev.cupld`
-3. `cupld query --db state/dev.cupld --output json 'MATCH (n) RETURN n ORDER BY id(n) LIMIT 10'`
+1. `cupld check --db .cupld/default.cupld`
+2. `cupld schema --db .cupld/default.cupld`
+3. `cupld query --db .cupld/default.cupld --output json 'MATCH (n) RETURN n ORDER BY id(n) LIMIT 10'`
 4. Use `cupld context --db ...` when prompt assembly needs a top-k summary of nodes.
 5. Switch to the REPL when you need repeated interactive exploration.
 
@@ -56,19 +57,19 @@ Use explicit transactions for multi-statement batches. Outside a transaction, mu
 Inspect schema:
 
 ```bash
-cupld schema --db state/dev.cupld
+cupld schema --db .cupld/default.cupld
 ```
 
 Run one query inline:
 
 ```bash
-cupld query --db state/dev.cupld 'MATCH (n:Person) RETURN n.name ORDER BY n.name'
+cupld query --db .cupld/default.cupld 'MATCH (n:Person) RETURN n.name ORDER BY n.name'
 ```
 
 Run a multiline query from stdin:
 
 ```bash
-cat <<'EOF' | cupld query --db state/dev.cupld
+cat <<'EOF' | cupld query --db .cupld/default.cupld
 BEGIN;
 MATCH (n:Person {name: 'Ada'})
 SET n.role = 'engineer'
@@ -80,8 +81,8 @@ EOF
 Validate and compact a database:
 
 ```bash
-cupld check --db state/dev.cupld
-cupld compact --db state/dev.cupld
+cupld check --db .cupld/default.cupld
+cupld compact --db .cupld/default.cupld
 ```
 
 Install the bundled markdown-memory skill and bootstrap local memory:
@@ -94,16 +95,21 @@ cupld install --target opencode --scope home --db .cupld/default.cupld
 cupld install --path ~/.claude/skills --db .cupld/default.cupld --yes
 ```
 
+Defaults:
+
+- DB path: `.cupld/default.cupld`
+- Markdown root: `.cupld/data`
+
 Open the scene viewer:
 
 ```bash
-cupld --visualise state/dev.cupld
+cupld --visualise .cupld/default.cupld
 ```
 
 Seed the scene viewer with a read-only query:
 
 ```bash
-cupld --visualise --db state/dev.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
+cupld --visualise --db .cupld/default.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
 ```
 
 ## REPL
@@ -112,7 +118,7 @@ Start the REPL with either:
 
 ```bash
 cupld
-cupld state/dev.cupld
+cupld .cupld/default.cupld
 ```
 
 Available dot-commands:
