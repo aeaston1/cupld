@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use cupld::{Session, set_markdown_root};
+use cupld::{Session, package::WorkspacePackage, set_markdown_root};
 
 pub const BUNDLED_SKILL_NAME: &str = "cupld-md-memory";
 pub const BUNDLED_SKILL_FILENAME: &str = "SKILL.md";
@@ -12,8 +12,6 @@ const BUNDLED_SKILL_CONTENTS: &str = include_str!("../skills/cupld-md-memory/SKI
 const CONFIG_DIR_NAME: &str = ".cupld";
 const INSTALLED_SKILL_PATH_FILE: &str = "installed-skill-path.txt";
 const PROMPT_DISABLED_FILE: &str = "skill-install-prompt.disabled";
-const DEFAULT_DB_PATH: &str = ".cupld/default.cupld";
-const DEFAULT_ROOT_PATH: &str = ".cupld/data";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillInstallTarget {
@@ -199,6 +197,7 @@ fn resolve_install_request(
     command: InstallCommand,
     interactive: bool,
 ) -> Result<InstallRequest, String> {
+    let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
     if command.target.is_some() && command.path.is_some() {
         return Err("`install` accepts either --target or --path, not both".to_owned());
     }
@@ -233,13 +232,10 @@ fn resolve_install_request(
                     .to_owned(),
             );
         };
-        let Some(db_path) = db_path else {
-            return Err("non-interactive `install` requires --db <path.cupld>".to_owned());
-        };
         return Ok(InstallRequest {
             skills_root,
-            db_path,
-            root: root.unwrap_or(default_root_path()?),
+            db_path: db_path.unwrap_or_else(|| package.resolve_db_path(None)),
+            root: root.unwrap_or_else(|| package.resolve_markdown_root(None)),
             force: command.force,
             yes: command.yes,
         });
@@ -248,6 +244,7 @@ fn resolve_install_request(
     prompt_for_install_request(
         &mut io::stdin().lock(),
         &mut io::stdout(),
+        &package,
         skills_root,
         db_path,
         root,
@@ -262,6 +259,7 @@ fn prompt_for_repl_choice<R: BufRead, W: Write>(
     force: bool,
     yes: bool,
 ) -> Result<InstallChoice, String> {
+    let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
     let presets = install_presets()?;
 
     writeln!(output, "Install cupld agent memory bootstrap?").map_err(io_error)?;
@@ -318,13 +316,15 @@ fn prompt_for_repl_choice<R: BufRead, W: Write>(
         }
     };
 
-    let request = prompt_for_install_request(input, output, skills_root, None, None, force, yes)?;
+    let request =
+        prompt_for_install_request(input, output, &package, skills_root, None, None, force, yes)?;
     Ok(InstallChoice::Request(request))
 }
 
 fn prompt_for_install_request<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
+    package: &WorkspacePackage,
     skills_root: Option<PathBuf>,
     db_path: Option<PathBuf>,
     root: Option<PathBuf>,
@@ -337,11 +337,16 @@ fn prompt_for_install_request<R: BufRead, W: Write>(
     };
     let db_path = match db_path {
         Some(path) => path,
-        None => prompt_for_path(input, output, "DB path", DEFAULT_DB_PATH)?,
+        None => prompt_for_path(input, output, "DB path", &package.resolve_db_path(None))?,
     };
     let root = match root {
         Some(path) => path,
-        None => prompt_for_path(input, output, "Markdown root", DEFAULT_ROOT_PATH)?,
+        None => prompt_for_path(
+            input,
+            output,
+            "Markdown root",
+            &package.resolve_markdown_root(None),
+        )?,
     };
 
     Ok(InstallRequest {
@@ -405,14 +410,14 @@ fn prompt_for_path<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     label: &str,
-    default: &str,
+    default: &Path,
 ) -> Result<PathBuf, String> {
-    write!(output, "{label} [{default}]: ").map_err(io_error)?;
+    write!(output, "{label} [{}]: ", default.display()).map_err(io_error)?;
     output.flush().map_err(io_error)?;
     let value = read_prompt_line(input)?.unwrap_or_default();
     let value = value.trim();
     let path = if value.is_empty() {
-        PathBuf::from(default)
+        default.to_path_buf()
     } else {
         PathBuf::from(value)
     };
@@ -452,6 +457,7 @@ fn install_request(request: &InstallRequest, interactive: bool) -> Result<Instal
     };
 
     let db_path = bootstrap_memory(&request.db_path, &request.root)?;
+    persist_workspace_package_state(&db_path, &request.root)?;
     Ok(InstallOutcome {
         skill_path: canonicalize_existing_path(&skill_path)?,
         db_path,
@@ -484,6 +490,16 @@ fn bootstrap_memory(db_path: &Path, root: &Path) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?;
     session.save().map_err(|error| error.to_string())?;
     canonicalize_existing_path(db_path)
+}
+
+fn persist_workspace_package_state(db_path: &Path, root: &Path) -> Result<(), String> {
+    let mut package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
+    if !package.owns_path(db_path) || !package.owns_path(root) {
+        return Ok(());
+    }
+    package
+        .persist_package_config(Some(db_path), Some(root))
+        .map_err(|error| error.to_string())
 }
 
 fn confirm_overwrite(skill_path: &Path, interactive: bool) -> Result<bool, String> {
@@ -609,8 +625,11 @@ fn skills_root_for_target(
     Ok(target.skills_root(scope, &home, &cwd))
 }
 
+#[cfg(test)]
 fn default_root_path() -> Result<PathBuf, String> {
-    resolve_input_path(Path::new(DEFAULT_ROOT_PATH))
+    Ok(WorkspacePackage::discover_current()
+        .map_err(|error| error.to_string())?
+        .resolve_markdown_root(None))
 }
 
 fn resolve_input_path(path: &Path) -> Result<PathBuf, String> {
@@ -689,10 +708,11 @@ mod tests {
     use super::{
         BUNDLED_SKILL_CONTENTS, BUNDLED_SKILL_FILENAME, BUNDLED_SKILL_NAME, CONFIG_DIR_NAME,
         INSTALLED_SKILL_PATH_FILE, InstallChoice, InstallCommand, InstallRequest, InstallScope,
-        InstallStatus, PROMPT_DISABLED_FILE, PromptState, SkillInstallTarget, bootstrap_memory,
-        canonicalize_existing_path, default_root_path, expand_tilde_with_home, install_request,
-        load_installed_skill_path, prompt_for_install_request, prompt_for_repl_choice,
-        prompt_state_from_config_dir, resolve_install_request, should_prompt_for_repl,
+        InstallStatus, PROMPT_DISABLED_FILE, PromptState, SkillInstallTarget, WorkspacePackage,
+        bootstrap_memory, canonicalize_existing_path, default_root_path, expand_tilde_with_home,
+        install_request, load_installed_skill_path, prompt_for_install_request,
+        prompt_for_repl_choice, prompt_state_from_config_dir, resolve_install_request,
+        should_prompt_for_repl,
     };
     use cupld::{Session, configured_markdown_root};
     use std::fs;
@@ -718,6 +738,7 @@ mod tests {
     #[test]
     fn repl_prompt_supports_presets_skip_never_and_custom() {
         let root = temp_dir("repl_prompt_choice");
+        let package = WorkspacePackage::discover_current().unwrap();
 
         let mut codex = Cursor::new(b"1\n\n\n");
         let choice = prompt_for_repl_choice(&mut codex, &mut Vec::new(), false, false).unwrap();
@@ -729,11 +750,8 @@ mod tests {
                     .unwrap()
                     .join(".agents")
                     .join("skills"),
-                db_path: std::env::current_dir()
-                    .unwrap()
-                    .join(".cupld")
-                    .join("default.cupld"),
-                root: std::env::current_dir().unwrap().join(".cupld").join("data"),
+                db_path: package.resolve_db_path(None),
+                root: package.resolve_markdown_root(None),
                 force: false,
                 yes: false,
             }
@@ -779,21 +797,21 @@ mod tests {
     fn explicit_install_prompt_fills_missing_fields() {
         let root = temp_dir("explicit_prompt_choice");
         let mut input = Cursor::new(format!("7\n{}\n\n\n", root.display()).into_bytes());
-        let request =
-            prompt_for_install_request(&mut input, &mut Vec::new(), None, None, None, false, false)
-                .unwrap();
+        let package = WorkspacePackage::discover_current().unwrap();
+        let request = prompt_for_install_request(
+            &mut input,
+            &mut Vec::new(),
+            &package,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(request.skills_root, root);
-        assert_eq!(
-            request.db_path,
-            std::env::current_dir()
-                .unwrap()
-                .join(".cupld")
-                .join("default.cupld")
-        );
-        assert_eq!(
-            request.root,
-            std::env::current_dir().unwrap().join(".cupld").join("data")
-        );
+        assert_eq!(request.db_path, package.resolve_db_path(None));
+        assert_eq!(request.root, package.resolve_markdown_root(None));
     }
 
     #[test]
@@ -917,7 +935,9 @@ mod tests {
     fn default_root_path_uses_repo_convention() {
         assert_eq!(
             default_root_path().unwrap(),
-            std::env::current_dir().unwrap().join(".cupld").join("data")
+            WorkspacePackage::discover_current()
+                .unwrap()
+                .resolve_markdown_root(None)
         );
     }
 
@@ -953,7 +973,9 @@ mod tests {
             InstallRequest {
                 skills_root: cwd.join(".agents").join("skills"),
                 db_path: cwd.join("db.cupld"),
-                root: cwd.join(".cupld").join("data"),
+                root: WorkspacePackage::discover_current()
+                    .unwrap()
+                    .resolve_markdown_root(None),
                 force: false,
                 yes: false,
             }

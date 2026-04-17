@@ -13,7 +13,9 @@ use cupld::{
         context_as_ndjson, format_error_json as machine_error_json,
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
-    configured_markdown_root, set_markdown_root, sync_markdown_root,
+    configured_markdown_root,
+    package::WorkspacePackage,
+    set_markdown_root, sync_markdown_root,
 };
 use skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
 
@@ -1074,8 +1076,19 @@ fn run_source_set_root(db_path: PathBuf, root: PathBuf) -> Result<(), String> {
         .replace_engine(engine)
         .map_err(|error| error.to_string())?;
     session.save().map_err(|error| error.to_string())?;
+    persist_local_package_state(&db_path, &root)?;
     println!("markdown_root {}", root.display());
     Ok(())
+}
+
+fn persist_local_package_state(db_path: &Path, root: &Path) -> Result<(), String> {
+    let mut package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
+    if !package.owns_path(db_path) || !package.owns_path(root) {
+        return Ok(());
+    }
+    package
+        .persist_package_config(Some(db_path), Some(root))
+        .map_err(|error| error.to_string())
 }
 
 fn open_query_session_with_markdown(
@@ -1093,61 +1106,39 @@ fn resolve_markdown_root_for_automation(
     root_override: Option<&Path>,
     session: Option<&Session>,
 ) -> Result<PathBuf, AutomationError> {
+    let package = WorkspacePackage::discover_current()
+        .map_err(|error| AutomationError::new(error.code(), error.message()))?;
     if let Some(root) = root_override {
-        return absolutize_path_for_automation(root);
+        return Ok(package.resolve_markdown_root(Some(root)));
+    }
+    if let Some(root) = package.configured_markdown_root() {
+        return Ok(root);
     }
     if let Some(session) = session
         && let Some(root) = configured_markdown_root(session.engine())
     {
         return Ok(root);
     }
-    absolutize_path_for_automation(Path::new(".cupld/data"))
-}
-
-fn absolutize_path_for_automation(path: &Path) -> Result<PathBuf, AutomationError> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()
-            .map_err(|error| AutomationError::new("path_resolution", error.to_string()))?
-            .join(path)
-    };
-    if path.exists() {
-        path.canonicalize()
-            .map_err(|error| AutomationError::new("path_resolution", error.to_string()))
-    } else {
-        Ok(path)
-    }
+    Ok(package.default_markdown_root())
 }
 
 fn resolve_markdown_root(
     root_override: Option<&Path>,
     session: Option<&Session>,
 ) -> Result<PathBuf, String> {
+    let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
     if let Some(root) = root_override {
-        return absolutize_path(root);
+        return Ok(package.resolve_markdown_root(Some(root)));
+    }
+    if let Some(root) = package.configured_markdown_root() {
+        return Ok(root);
     }
     if let Some(session) = session
         && let Some(root) = configured_markdown_root(session.engine())
     {
         return Ok(root);
     }
-    absolutize_path(Path::new(".cupld/data"))
-}
-
-fn absolutize_path(path: &Path) -> Result<PathBuf, String> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()
-            .map_err(|error| error.to_string())?
-            .join(path)
-    };
-    if path.exists() {
-        path.canonicalize().map_err(|error| error.to_string())
-    } else {
-        Ok(path)
-    }
+    Ok(package.default_markdown_root())
 }
 
 fn run_repl(path: Option<PathBuf>) -> Result<(), String> {

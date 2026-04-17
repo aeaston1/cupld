@@ -39,6 +39,7 @@ Important constraints:
 - Dot-commands are REPL-only. They do not work with `cupld query`.
 - Passing a missing `path.cupld` to the REPL creates a new database file.
 - Interactive REPL launches may prompt once to run the same install/bootstrap flow if it has not been installed yet.
+- Repo-local package defaults live in `.cupld/config.toml`.
 
 ## Agent Workflow
 
@@ -202,6 +203,7 @@ Current automation controls:
 
 - `CUPLD_QUERY_MAX_ROWS` sets the default `query --max-rows` cap.
 - `CUPLD_NO_INSTALL_PROMPT=1` disables the interactive bootstrap prompt on REPL startup.
+- Markdown root resolution order is: explicit `--root`, then `.cupld/config.toml`, then DB metadata from `source set-root`, then `./.cupld/data`.
 - `cupld query --with-markdown` overlays markdown into a temporary session and does not persist the sync.
 - `cupld sync markdown` is the explicit persisted sync boundary.
 

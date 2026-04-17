@@ -175,3 +175,47 @@ fn cli_install_skill_supports_provider_home_and_cwd_scopes() {
             .exists()
     );
 }
+
+#[test]
+fn cli_install_uses_package_defaults_and_writes_package_config() {
+    let home = TempDir::new("home_defaults");
+    let config = TempDir::new("config_defaults");
+    let workspace = TempDir::new("workspace_defaults");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cupld"))
+        .args(["install", "--target", "codex", "--scope", "cwd"])
+        .env("HOME", home.path())
+        .env(
+            if cfg!(windows) {
+                "APPDATA"
+            } else {
+                "XDG_CONFIG_HOME"
+            },
+            config.path(),
+        )
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let db_path = workspace.path().join(".cupld").join("default.cupld");
+    let notes_root = workspace.path().join(".cupld").join("data");
+    let config_path = workspace.path().join(".cupld").join("config.toml");
+
+    assert!(db_path.exists());
+    assert!(notes_root.exists());
+    assert!(config_path.exists());
+
+    let contents = fs::read_to_string(config_path).unwrap();
+    assert!(contents.contains("db_path"));
+    assert!(contents.contains("default.cupld"));
+    assert!(contents.contains("markdown_root"));
+    assert!(contents.contains(".cupld/data"));
+
+    let session = Session::open(&db_path).unwrap();
+    assert_eq!(
+        configured_markdown_root(session.engine()),
+        Some(notes_root.canonicalize().unwrap())
+    );
+}

@@ -1,5 +1,6 @@
 pub mod automation;
 pub mod engine;
+pub mod package;
 pub mod query;
 pub mod runtime;
 pub mod source;

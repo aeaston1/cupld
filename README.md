@@ -119,6 +119,8 @@ cupld install --path /custom/skills --db .cupld/default.cupld --yes
 
 The interactive installer asks for a skill location, DB path, and markdown root. Interactive REPL launches can also offer the same bootstrap flow once.
 
+Repo-local package settings live in `.cupld/config.toml`. `install` and markdown-aware commands use it as the workspace default for DB path and markdown root.
+
 ## Documentation
 
 - Docs index: [`docs/README.md`](./docs/README.md)

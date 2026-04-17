@@ -10,8 +10,9 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
 ## Defaults
 
 - Edit markdown with normal filesystem tools. `cupld` reads and syncs markdown; it does not write notes back for you.
-- Root resolution order is: explicit `--root`, then the DB root set by `cupld source set-root`, then `./.cupld/data/` under the current working directory.
+- Root resolution order is: explicit `--root`, then `.cupld/config.toml`, then the DB root set by `cupld source set-root`, then `./.cupld/data/` under the current working directory.
 - `cupld install` bootstraps `./.cupld/default.cupld` by default for local markdown memory work.
+- `cupld install` and `source set-root` keep repo-local defaults in `.cupld/config.toml`.
 - The skill install location (`.agents/skills`, `.claude/skills`, or a custom path) is separate from the DB path and markdown root. Installing the skill elsewhere does not move `./.cupld/default.cupld` or `./.cupld/data/`.
 - `cupld query --with-markdown` overlays markdown into a temporary query session and does not persist the imported notes.
 - `cupld sync markdown` persists markdown documents and markdown link edges into the `.cupld` database.

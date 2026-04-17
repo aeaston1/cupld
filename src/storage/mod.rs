@@ -12,6 +12,8 @@ use crate::engine::{
 const MAGIC: &[u8; 8] = b"CUPLD01\0";
 const FORMAT_VERSION: u32 = 1;
 const COMPAT_VERSION: u32 = 1;
+const LEGACY_FORMAT_VERSION: u32 = 0;
+const LEGACY_COMPAT_VERSION: u32 = 0;
 const HEADER_SIZE: usize = 128;
 const WAL_RECORD_MAGIC: &[u8; 4] = b"WALR";
 
@@ -21,6 +23,12 @@ pub struct IntegrityReport {
     pub last_tx_id: u64,
     pub wal_records: usize,
     pub recovered_tail: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StorageFormatVersion {
+    version: u32,
+    compat: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +182,7 @@ pub fn append_commit(
 pub fn load(path: &Path) -> Result<(CupldEngine, IntegrityReport), StorageError> {
     let bytes = fs::read(path)?;
     let parsed = parse_file(&bytes)?;
+    maybe_migrate_file(path, parsed.format)?;
     let mut state = decode_state(&parsed.snapshot_bytes)?;
     for record in &parsed.wal_records {
         state = decode_state(&record.payload)?;
@@ -209,6 +218,7 @@ pub fn compact(path: &Path, engine: &CupldEngine, db_uuid: [u8; 16]) -> Result<(
 pub fn check(path: &Path) -> Result<IntegrityReport, StorageError> {
     let bytes = fs::read(path)?;
     let parsed = parse_file(&bytes)?;
+    maybe_migrate_file(path, parsed.format)?;
     Ok(IntegrityReport {
         db_uuid: parsed.header.db_uuid,
         last_tx_id: parsed.header.last_tx_id,
@@ -231,6 +241,7 @@ struct FileHeader {
 }
 
 struct ParsedFile {
+    format: StorageFormatVersion,
     header: FileHeader,
     snapshot_bytes: Vec<u8>,
     wal_records: Vec<WalRecord>,
@@ -247,7 +258,9 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, StorageError> {
     if bytes.len() < HEADER_SIZE {
         return Err(StorageError::new("file_header", "file too small"));
     }
-    let header = decode_header(&bytes[..HEADER_SIZE])?;
+    let decoded = decode_header(&bytes[..HEADER_SIZE])?;
+    let _migration = plan_migration(decoded.format)?;
+    let header = decoded.header;
     let snapshot_end = header
         .snapshot_offset
         .checked_add(header.snapshot_len)
@@ -279,6 +292,7 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, StorageError> {
     }
 
     Ok(ParsedFile {
+        format: decoded.format,
         header,
         snapshot_bytes,
         wal_records,
@@ -347,29 +361,72 @@ fn encode_header(header: &FileHeader, output: &mut [u8]) {
     output[88..96].copy_from_slice(&header.wal_checksum.to_le_bytes());
 }
 
-fn decode_header(bytes: &[u8]) -> Result<FileHeader, StorageError> {
+struct DecodedHeader {
+    format: StorageFormatVersion,
+    header: FileHeader,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MigrationPlan {
+    rewrite_header: bool,
+    target: StorageFormatVersion,
+}
+
+fn decode_header(bytes: &[u8]) -> Result<DecodedHeader, StorageError> {
     if &bytes[..8] != MAGIC {
         return Err(StorageError::new("file_magic", "invalid .cupld header"));
     }
-    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    let compat = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-    if version != FORMAT_VERSION || compat != COMPAT_VERSION {
-        return Err(StorageError::new(
-            "file_version",
-            "unsupported file format version",
-        ));
-    }
-    Ok(FileHeader {
-        clean: bytes[16] == 1,
-        db_uuid: bytes[24..40].try_into().unwrap(),
-        snapshot_offset: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
-        snapshot_len: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
-        wal_offset: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
-        wal_len: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
-        last_tx_id: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
-        snapshot_checksum: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
-        wal_checksum: u64::from_le_bytes(bytes[88..96].try_into().unwrap()),
+    Ok(DecodedHeader {
+        format: StorageFormatVersion {
+            version: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            compat: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        },
+        header: FileHeader {
+            clean: bytes[16] == 1,
+            db_uuid: bytes[24..40].try_into().unwrap(),
+            snapshot_offset: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            snapshot_len: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
+            wal_offset: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
+            wal_len: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            last_tx_id: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            snapshot_checksum: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            wal_checksum: u64::from_le_bytes(bytes[88..96].try_into().unwrap()),
+        },
     })
+}
+
+fn plan_migration(format: StorageFormatVersion) -> Result<MigrationPlan, StorageError> {
+    if format.version == FORMAT_VERSION && format.compat == COMPAT_VERSION {
+        return Ok(MigrationPlan {
+            rewrite_header: false,
+            target: format,
+        });
+    }
+    if format.version == LEGACY_FORMAT_VERSION && format.compat == LEGACY_COMPAT_VERSION {
+        return Ok(MigrationPlan {
+            rewrite_header: true,
+            target: StorageFormatVersion {
+                version: FORMAT_VERSION,
+                compat: COMPAT_VERSION,
+            },
+        });
+    }
+    Err(StorageError::new(
+        "file_version",
+        "unsupported file format version",
+    ))
+}
+
+fn maybe_migrate_file(path: &Path, format: StorageFormatVersion) -> Result<(), StorageError> {
+    let migration = plan_migration(format)?;
+    if !migration.rewrite_header {
+        return Ok(());
+    }
+
+    let mut bytes = fs::read(path)?;
+    bytes[8..12].copy_from_slice(&migration.target.version.to_le_bytes());
+    bytes[12..16].copy_from_slice(&migration.target.compat.to_le_bytes());
+    write_durable(path, &bytes)
 }
 
 fn encode_wal_record(seq_no: u64, tx_id: u64, payload: &[u8]) -> Vec<u8> {
@@ -857,7 +914,9 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{append_commit, check, compact, load, save_compacted};
+    use super::{
+        COMPAT_VERSION, FORMAT_VERSION, append_commit, check, compact, load, save_compacted,
+    };
     use crate::runtime::Session;
 
     fn temp_path(name: &str) -> PathBuf {
@@ -901,6 +960,56 @@ mod tests {
 
         let report = check(&path).unwrap();
         assert_eq!(report.wal_records, 0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_migrates_legacy_header_versions_in_place() {
+        let path = temp_path("cupld_storage_migrate");
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script("CREATE (n:Person {name: 'Ada'})", &BTreeMap::new())
+            .unwrap();
+        save_compacted(&path, session.engine()).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&0u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let report = check(&path).unwrap();
+        assert_eq!(report.wal_records, 0);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            FORMAT_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            COMPAT_VERSION
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unsupported_future_header_versions_fail() {
+        let path = temp_path("cupld_storage_future");
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script("CREATE (n:Person {name: 'Ada'})", &BTreeMap::new())
+            .unwrap();
+        save_compacted(&path, session.engine()).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&99u32.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let error = check(&path).unwrap_err();
+        assert_eq!(error.code(), "file_version");
 
         let _ = fs::remove_file(path);
     }
