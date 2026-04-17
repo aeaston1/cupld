@@ -9,12 +9,12 @@ pub use graph::{CupldEngine, Edge, GraphError, GraphSnapshot, GraphStats, Node};
 pub use ids::{EdgeId, NodeId, TxId};
 pub use properties::PropertyMap;
 pub use schema::{
-    ConstraintRow, ConstraintType, IndexRow, PropertyType, SchemaCatalog, SchemaRow, SchemaTarget,
-    TargetKind,
+    ConstraintRow, ConstraintType, IndexRow, PropertyType, SchemaCatalog, SchemaObjectOptions,
+    SchemaRow, SchemaTarget, TargetKind,
 };
 pub use value::Value;
 
 pub(crate) use schema::IndexStatus;
 pub(crate) use state::{
-    ConstraintState, EdgeState, EngineState, IndexState, NodeState, SchemaState,
+    ConstraintState, EdgeState, EngineState, IndexState, NodeState, SchemaObjectState, SchemaState,
 };

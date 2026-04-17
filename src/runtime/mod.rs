@@ -8,7 +8,7 @@ use regex::Regex;
 
 use crate::engine::{
     ConstraintRow, ConstraintType, CupldEngine, Edge, EdgeId, GraphError, GraphStats, IndexRow,
-    Node, NodeId, PropertyMap, SchemaRow, Value,
+    Node, NodeId, PropertyMap, SchemaRow, SchemaTarget, Value,
 };
 use crate::query::{
     BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, OrderItem, Pattern, PatternSegment,
@@ -18,6 +18,79 @@ use crate::storage;
 
 const DEFAULT_ROW_LIMIT: usize = 1_000;
 const INTERMEDIATE_ROW_LIMIT: usize = 100_000;
+
+#[derive(Clone, Debug)]
+struct MatchPlan {
+    access: MatchAccessPath,
+    start_candidates: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+enum MatchAccessPath {
+    NodeScan {
+        detail: String,
+    },
+    NodeIndexSeek {
+        target: SchemaTarget,
+        property: String,
+        value: RuntimeValue,
+    },
+    NodeIndexRangeScan {
+        target: SchemaTarget,
+        property: String,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct RangeBound {
+    value: RuntimeValue,
+    inclusive: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PropertyConstraint {
+    property: String,
+    kind: ConstraintKind,
+    value: RuntimeValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstraintKind {
+    Eq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+#[derive(Clone, Debug)]
+struct PlannerKey(RuntimeValue);
+
+impl PartialEq for PlannerKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PlannerKey {}
+
+impl PartialOrd for PlannerKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PlannerKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let ordering = compare_runtime_values(&self.0, &other.0);
+        if ordering == Ordering::Equal && !same_runtime_type(&self.0, &other.0) {
+            return runtime_type_name(&self.0).cmp(runtime_type_name(&other.0));
+        }
+        ordering
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct QueryResult {
@@ -312,8 +385,12 @@ impl Session {
     fn show(&self, kind: &ShowKind) -> Result<QueryResult, ExecutionError> {
         match kind {
             ShowKind::Schema => Ok(show_schema_result(self.engine.show_schema())),
-            ShowKind::Indexes => Ok(show_indexes_result(self.engine.show_indexes())),
-            ShowKind::Constraints => Ok(show_constraints_result(self.engine.show_constraints())),
+            ShowKind::Indexes(target) => Ok(show_indexes_result(
+                self.engine.show_indexes(target.as_ref()),
+            )),
+            ShowKind::Constraints(target) => Ok(show_constraints_result(
+                self.engine.show_constraints(target.as_ref()),
+            )),
             ShowKind::Stats => Ok(show_stats_result(self.engine.stats())),
             ShowKind::Transactions => Ok(show_transactions_result(self.transaction_info())),
         }
@@ -322,7 +399,17 @@ impl Session {
     fn explain(&self, statement: &Statement) -> Result<QueryResult, ExecutionError> {
         let mut rows = Vec::new();
         let mut next_id = 1i64;
-        build_explain_rows(statement, None, &mut next_id, &mut rows);
+        let match_plan = match statement {
+            Statement::Query(query) => self.plan_match(query, &BTreeMap::new())?,
+            _ => None,
+        };
+        build_explain_rows(
+            statement,
+            None,
+            &mut next_id,
+            &mut rows,
+            match_plan.as_ref(),
+        );
         Ok(QueryResult {
             columns: vec![
                 "id".to_owned(),
@@ -342,10 +429,11 @@ impl Session {
         match statement {
             Statement::CreateLabel {
                 name,
+                description,
                 if_not_exists,
             } => {
                 self.engine
-                    .create_label(name, *if_not_exists)
+                    .create_label(name, description.clone(), *if_not_exists)
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -357,10 +445,11 @@ impl Session {
             }
             Statement::CreateEdgeType {
                 name,
+                description,
                 if_not_exists,
             } => {
                 self.engine
-                    .create_edge_type(name, *if_not_exists)
+                    .create_edge_type(name, description.clone(), *if_not_exists)
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -431,8 +520,9 @@ impl Session {
         query: &Query,
         params: &BTreeMap<String, Value>,
     ) -> Result<QueryResult, ExecutionError> {
+        let match_plan = self.plan_match(query, params)?;
         let mut rows = if let Some(pattern) = &query.match_clause {
-            self.match_pattern(pattern, params)?
+            self.match_pattern(pattern, params, match_plan.as_ref())?
         } else {
             vec![Row::default()]
         };
@@ -507,13 +597,235 @@ impl Session {
         })
     }
 
+    fn plan_match(
+        &self,
+        query: &Query,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Option<MatchPlan>, ExecutionError> {
+        let Some(pattern) = &query.match_clause else {
+            return Ok(None);
+        };
+
+        let schema = self.engine.schema_catalog();
+        let mut equality_constraints = pattern
+            .start
+            .properties
+            .iter()
+            .filter_map(|(property, expr)| {
+                self.eval_expr(expr, &Row::default(), params)
+                    .ok()
+                    .map(|value| PropertyConstraint {
+                        property: property.clone(),
+                        kind: ConstraintKind::Eq,
+                        value,
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(variable) = pattern.start.variable.as_deref()
+            && let Some(predicate) = &query.where_clause
+        {
+            let mut derived = Vec::new();
+            self.collect_property_constraints(predicate, variable, params, &mut derived);
+            equality_constraints.extend(derived);
+        }
+
+        for label in &pattern.start.labels {
+            let target = SchemaTarget::label(label.clone());
+            for constraint in &equality_constraints {
+                if constraint.kind == ConstraintKind::Eq
+                    && schema.find_index(&target, &constraint.property).is_some()
+                {
+                    let start_candidates = self.index_seek_candidates(
+                        &target,
+                        &constraint.property,
+                        &constraint.value,
+                    );
+                    return Ok(Some(MatchPlan {
+                        access: MatchAccessPath::NodeIndexSeek {
+                            target,
+                            property: constraint.property.clone(),
+                            value: constraint.value.clone(),
+                        },
+                        start_candidates,
+                    }));
+                }
+            }
+
+            let range_constraints = fold_range_constraints(&equality_constraints);
+            for (property, bounds) in range_constraints {
+                if schema.find_index(&target, &property).is_some()
+                    && (bounds.lower.is_some() || bounds.upper.is_some())
+                {
+                    let start_candidates = self.index_range_candidates(
+                        &target,
+                        &property,
+                        bounds.lower.as_ref(),
+                        bounds.upper.as_ref(),
+                    );
+                    return Ok(Some(MatchPlan {
+                        access: MatchAccessPath::NodeIndexRangeScan {
+                            target,
+                            property,
+                            lower: bounds.lower,
+                            upper: bounds.upper,
+                        },
+                        start_candidates,
+                    }));
+                }
+            }
+        }
+
+        let start_candidates = if let Some(label) = pattern.start.labels.first() {
+            self.engine
+                .nodes()
+                .filter(|node| node.labels().contains(label))
+                .map(Node::id)
+                .collect::<Vec<_>>()
+        } else {
+            self.engine.nodes().map(Node::id).collect::<Vec<_>>()
+        };
+        let detail = if let Some(label) = pattern.start.labels.first() {
+            format!(
+                "label {}",
+                SchemaTarget::label(label.clone()).display_target()
+            )
+        } else {
+            "all nodes".to_owned()
+        };
+        Ok(Some(MatchPlan {
+            access: MatchAccessPath::NodeScan { detail },
+            start_candidates,
+        }))
+    }
+
+    fn collect_property_constraints(
+        &self,
+        expr: &Expr,
+        variable: &str,
+        params: &BTreeMap<String, Value>,
+        output: &mut Vec<PropertyConstraint>,
+    ) {
+        match expr {
+            Expr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                self.collect_property_constraints(left, variable, params, output);
+                self.collect_property_constraints(right, variable, params, output);
+            }
+            Expr::Binary { left, op, right } => {
+                if let Some(constraint) =
+                    self.property_constraint_from_binary(left, *op, right, variable, params)
+                {
+                    output.push(constraint);
+                } else if let Some(constraint) = self.property_constraint_from_binary(
+                    right,
+                    reverse_constraint_op(*op),
+                    left,
+                    variable,
+                    params,
+                ) {
+                    output.push(constraint);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn property_constraint_from_binary(
+        &self,
+        property_side: &Expr,
+        op: BinaryOp,
+        value_side: &Expr,
+        variable: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Option<PropertyConstraint> {
+        let property = match property_side {
+            Expr::Property(base, property) => match &**base {
+                Expr::Variable(name) if name == variable => property.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let kind = constraint_kind_from_binary(op)?;
+        let value = self.eval_expr(value_side, &Row::default(), params).ok()?;
+        Some(PropertyConstraint {
+            property,
+            kind,
+            value,
+        })
+    }
+
+    fn index_seek_candidates(
+        &self,
+        target: &SchemaTarget,
+        property: &str,
+        value: &RuntimeValue,
+    ) -> Vec<NodeId> {
+        let entries = self.build_node_index_entries(target, property);
+        entries
+            .get(&PlannerKey(value.clone()))
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn index_range_candidates(
+        &self,
+        target: &SchemaTarget,
+        property: &str,
+        lower: Option<&RangeBound>,
+        upper: Option<&RangeBound>,
+    ) -> Vec<NodeId> {
+        self.build_node_index_entries(target, property)
+            .into_iter()
+            .filter(|(value, _)| range_matches(&value.0, lower, upper))
+            .flat_map(|(_, ids)| ids.into_iter())
+            .collect()
+    }
+
+    fn build_node_index_entries(
+        &self,
+        target: &SchemaTarget,
+        property: &str,
+    ) -> BTreeMap<PlannerKey, BTreeSet<NodeId>> {
+        if target.kind() != crate::engine::TargetKind::Label {
+            return BTreeMap::new();
+        }
+        let mut entries = BTreeMap::<PlannerKey, BTreeSet<NodeId>>::new();
+        for node in self.engine.nodes() {
+            if !node.labels().contains(target.name()) {
+                continue;
+            }
+            let Some(value) = node.property(property) else {
+                continue;
+            };
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            entries
+                .entry(PlannerKey(runtime_from_value(value)))
+                .or_default()
+                .insert(node.id());
+        }
+        entries
+    }
+
     fn match_pattern(
         &self,
         pattern: &Pattern,
         params: &BTreeMap<String, Value>,
+        plan: Option<&MatchPlan>,
     ) -> Result<Vec<Row>, ExecutionError> {
         let mut rows = Vec::new();
-        for node in self.engine.nodes() {
+        let planned_nodes = plan.map(|plan| plan.start_candidates.clone());
+        let candidate_ids =
+            planned_nodes.unwrap_or_else(|| self.engine.nodes().map(Node::id).collect::<Vec<_>>());
+        for node_id in candidate_ids {
+            let Some(node) = self.engine.node(node_id) else {
+                continue;
+            };
             let row = Row::default();
             if let Some(row) = self.bind_node_pattern(&row, node, &pattern.start, params)? {
                 self.match_segments(&row, node.id(), &pattern.segments, params, &mut rows)?;
@@ -1865,12 +2177,15 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
 
 fn show_schema_result(rows: Vec<SchemaRow>) -> QueryResult {
     query_result(
-        &["kind", "name", "ddl"],
+        &["kind", "name", "description", "ddl"],
         rows.into_iter()
             .map(|row| {
                 vec![
                     RuntimeValue::String(row.kind),
                     RuntimeValue::String(row.name),
+                    row.description
+                        .map(RuntimeValue::String)
+                        .unwrap_or(RuntimeValue::Null),
                     RuntimeValue::String(row.ddl),
                 ]
             })
@@ -1970,11 +2285,12 @@ fn build_explain_rows(
     parent_id: Option<i64>,
     next_id: &mut i64,
     rows: &mut Vec<Vec<RuntimeValue>>,
+    match_plan: Option<&MatchPlan>,
 ) {
     let id = *next_id;
     *next_id += 1;
     let (operator, detail) = match statement {
-        Statement::Show(kind) => ("Show", format!("{kind:?}")),
+        Statement::Show(kind) => ("Show", show_kind_detail(kind)),
         Statement::Explain(_) => ("Explain", String::new()),
         Statement::CreateLabel { name, .. } => ("CreateLabel", name.clone()),
         Statement::DropLabel { name, .. } => ("DropLabel", name.clone()),
@@ -2000,7 +2316,17 @@ fn build_explain_rows(
                 RuntimeValue::String(String::new()),
             ]);
             if query.match_clause.is_some() {
-                add_explain_child(next_id, rows, id, "Match", "pattern");
+                if let Some(match_plan) = match_plan {
+                    add_explain_child(
+                        next_id,
+                        rows,
+                        id,
+                        match_plan_operator(match_plan),
+                        &match_plan_detail(match_plan),
+                    );
+                } else {
+                    add_explain_child(next_id, rows, id, "Match", "pattern");
+                }
             }
             if query.where_clause.is_some() {
                 add_explain_child(next_id, rows, id, "Filter", "WHERE");
@@ -2055,6 +2381,182 @@ fn add_explain_child(
         RuntimeValue::String(operator.to_owned()),
         RuntimeValue::String(detail.to_owned()),
     ]);
+}
+
+#[derive(Default)]
+struct RangeConstraintSet {
+    lower: Option<RangeBound>,
+    upper: Option<RangeBound>,
+}
+
+fn fold_range_constraints(
+    constraints: &[PropertyConstraint],
+) -> BTreeMap<String, RangeConstraintSet> {
+    let mut ranges = BTreeMap::<String, RangeConstraintSet>::new();
+    for constraint in constraints {
+        let slot = ranges.entry(constraint.property.clone()).or_default();
+        match constraint.kind {
+            ConstraintKind::Eq => {
+                slot.lower = Some(RangeBound {
+                    value: constraint.value.clone(),
+                    inclusive: true,
+                });
+                slot.upper = Some(RangeBound {
+                    value: constraint.value.clone(),
+                    inclusive: true,
+                });
+            }
+            ConstraintKind::Gt | ConstraintKind::Gte => {
+                let candidate = RangeBound {
+                    value: constraint.value.clone(),
+                    inclusive: constraint.kind == ConstraintKind::Gte,
+                };
+                if slot
+                    .lower
+                    .as_ref()
+                    .is_none_or(|existing| bound_is_tighter_lower(&candidate, existing))
+                {
+                    slot.lower = Some(candidate);
+                }
+            }
+            ConstraintKind::Lt | ConstraintKind::Lte => {
+                let candidate = RangeBound {
+                    value: constraint.value.clone(),
+                    inclusive: constraint.kind == ConstraintKind::Lte,
+                };
+                if slot
+                    .upper
+                    .as_ref()
+                    .is_none_or(|existing| bound_is_tighter_upper(&candidate, existing))
+                {
+                    slot.upper = Some(candidate);
+                }
+            }
+        }
+    }
+    ranges
+}
+
+fn bound_is_tighter_lower(candidate: &RangeBound, existing: &RangeBound) -> bool {
+    let ordering = compare_runtime_values(&candidate.value, &existing.value);
+    ordering == Ordering::Greater
+        || (ordering == Ordering::Equal && !candidate.inclusive && existing.inclusive)
+}
+
+fn bound_is_tighter_upper(candidate: &RangeBound, existing: &RangeBound) -> bool {
+    let ordering = compare_runtime_values(&candidate.value, &existing.value);
+    ordering == Ordering::Less
+        || (ordering == Ordering::Equal && !candidate.inclusive && existing.inclusive)
+}
+
+fn range_matches(
+    value: &RuntimeValue,
+    lower: Option<&RangeBound>,
+    upper: Option<&RangeBound>,
+) -> bool {
+    if let Some(lower) = lower {
+        if !same_runtime_type(value, &lower.value) {
+            return false;
+        }
+        let ordering = compare_runtime_values(value, &lower.value);
+        if ordering == Ordering::Less || (ordering == Ordering::Equal && !lower.inclusive) {
+            return false;
+        }
+    }
+    if let Some(upper) = upper {
+        if !same_runtime_type(value, &upper.value) {
+            return false;
+        }
+        let ordering = compare_runtime_values(value, &upper.value);
+        if ordering == Ordering::Greater || (ordering == Ordering::Equal && !upper.inclusive) {
+            return false;
+        }
+    }
+    true
+}
+
+fn constraint_kind_from_binary(op: BinaryOp) -> Option<ConstraintKind> {
+    match op {
+        BinaryOp::Eq => Some(ConstraintKind::Eq),
+        BinaryOp::Lt => Some(ConstraintKind::Lt),
+        BinaryOp::Lte => Some(ConstraintKind::Lte),
+        BinaryOp::Gt => Some(ConstraintKind::Gt),
+        BinaryOp::Gte => Some(ConstraintKind::Gte),
+        _ => None,
+    }
+}
+
+fn reverse_constraint_op(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::Lte => BinaryOp::Gte,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::Gte => BinaryOp::Lte,
+        other => other,
+    }
+}
+
+fn match_plan_operator(plan: &MatchPlan) -> &'static str {
+    match plan.access {
+        MatchAccessPath::NodeScan { .. } => "NodeScan",
+        MatchAccessPath::NodeIndexSeek { .. } => "NodeIndexSeek",
+        MatchAccessPath::NodeIndexRangeScan { .. } => "NodeIndexRangeScan",
+    }
+}
+
+fn match_plan_detail(plan: &MatchPlan) -> String {
+    match &plan.access {
+        MatchAccessPath::NodeScan { detail } => detail.clone(),
+        MatchAccessPath::NodeIndexSeek {
+            target,
+            property,
+            value,
+        } => format!("{}({}) = {:?}", target.display_target(), property, value),
+        MatchAccessPath::NodeIndexRangeScan {
+            target,
+            property,
+            lower,
+            upper,
+        } => format!(
+            "{}({}) range {} {}",
+            target.display_target(),
+            property,
+            lower
+                .as_ref()
+                .map(|bound| format_bound(">=", ">", bound))
+                .unwrap_or_else(|| "-inf".to_owned()),
+            upper
+                .as_ref()
+                .map(|bound| format_bound("<=", "<", bound))
+                .unwrap_or_else(|| "+inf".to_owned())
+        ),
+    }
+}
+
+fn format_bound(inclusive: &str, exclusive: &str, bound: &RangeBound) -> String {
+    format!(
+        "{} {:?}",
+        if bound.inclusive {
+            inclusive
+        } else {
+            exclusive
+        },
+        bound.value
+    )
+}
+
+fn show_kind_detail(kind: &ShowKind) -> String {
+    match kind {
+        ShowKind::Schema => "SCHEMA".to_owned(),
+        ShowKind::Indexes(Some(target)) => format!("INDEXES ON {}", target.display_target()),
+        ShowKind::Indexes(None) => "INDEXES".to_owned(),
+        ShowKind::Constraints(Some(target)) => {
+            format!("CONSTRAINTS ON {}", target.display_target())
+        }
+        ShowKind::Constraints(None) => "CONSTRAINTS".to_owned(),
+        ShowKind::Stats => "STATS".to_owned(),
+        ShowKind::Transactions => "TRANSACTIONS".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -2143,7 +2645,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(show[0].columns, vec!["kind", "name", "ddl"]);
+        assert_eq!(show[0].columns, vec!["kind", "name", "description", "ddl"]);
         assert_eq!(
             explain[0].columns,
             vec!["id", "parent_id", "operator", "detail"]

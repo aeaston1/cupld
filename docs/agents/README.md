@@ -61,6 +61,14 @@ Inspect schema:
 cupld schema --db .cupld/default.cupld
 ```
 
+Create described schema objects and inspect filtered catalogs:
+
+```bash
+cupld query --db .cupld/default.cupld "CREATE LABEL Service DESCRIPTION 'Long-running services'"
+cupld query --db .cupld/default.cupld "CREATE INDEX ON :Service(name)"
+cupld query --db .cupld/default.cupld "SHOW INDEXES ON :Service"
+```
+
 Run one query inline:
 
 ```bash

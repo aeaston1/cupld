@@ -8,8 +8,8 @@ pub mod storage;
 
 pub use engine::{
     ConstraintRow, ConstraintType, CupldEngine, Edge, EdgeId, GraphError, GraphSnapshot,
-    GraphStats, IndexRow, Node, NodeId, PropertyMap, PropertyType, SchemaCatalog, SchemaRow,
-    SchemaTarget, TargetKind, TxId, Value,
+    GraphStats, IndexRow, Node, NodeId, PropertyMap, PropertyType, SchemaCatalog,
+    SchemaObjectOptions, SchemaRow, SchemaTarget, TargetKind, TxId, Value,
 };
 pub use query::{
     BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, HopRange, NodePattern, OrderItem,

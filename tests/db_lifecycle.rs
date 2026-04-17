@@ -113,21 +113,24 @@ fn file_backed_db_lifecycle_create_query_compact_and_spin_down() {
     );
 
     let show_schema = run(&mut session, "SHOW SCHEMA");
-    assert_eq!(show_schema.columns, vec!["kind", "name", "ddl"]);
+    assert_eq!(
+        show_schema.columns,
+        vec!["kind", "name", "description", "ddl"]
+    );
     assert!(
         show_schema
             .rows
             .iter()
-            .any(|row| { row[2] == RuntimeValue::String("CREATE LABEL Person".to_owned()) })
+            .any(|row| { row[3] == RuntimeValue::String("CREATE LABEL Person".to_owned()) })
     );
     assert!(show_schema.rows.iter().any(|row| {
-        row[2]
+        row[3]
             == RuntimeValue::String(
                 "CREATE INDEX idx_label_Person_email_eq ON :Person(email)".to_owned(),
             )
     }));
     assert!(show_schema.rows.iter().any(|row| {
-        row[2]
+        row[3]
             == RuntimeValue::String(
                 "CREATE CONSTRAINT constraint_label_Person_email_unique ON :Person REQUIRE email UNIQUE"
                     .to_owned(),
@@ -338,6 +341,109 @@ fn query_ergonomics_report_stable_errors() {
         .execute_script("RETURN [1]['bad']", &BTreeMap::new())
         .unwrap_err();
     assert_eq!(index_error.code(), "index_type_error");
+}
+
+#[test]
+fn schema_metadata_filters_and_planner_survive_reopen() {
+    let db = TestDb::new("schema_wave3");
+    let mut session = db.open();
+
+    run(
+        &mut session,
+        "CREATE LABEL Service DESCRIPTION 'Long-running services'",
+    );
+    run(
+        &mut session,
+        "CREATE EDGE TYPE CALLS DESCRIPTION 'Service-to-service calls'",
+    );
+    run(&mut session, "CREATE INDEX ON :Service(name)");
+    run(
+        &mut session,
+        "CREATE CONSTRAINT ON [:CALLS] REQUIRE latency TYPE int",
+    );
+
+    let schema = run(&mut session, "SHOW SCHEMA");
+    let service_row = schema
+        .rows
+        .iter()
+        .find(|row| row[1] == RuntimeValue::String("Service".to_owned()))
+        .unwrap();
+    assert_eq!(
+        service_row[2],
+        RuntimeValue::String("Long-running services".to_owned())
+    );
+    assert_eq!(
+        service_row[3],
+        RuntimeValue::String(
+            "CREATE LABEL Service DESCRIPTION \"Long-running services\"".to_owned(),
+        )
+    );
+
+    let filtered_indexes = run(&mut session, "SHOW INDEXES ON :Service");
+    assert_eq!(filtered_indexes.rows.len(), 1);
+    assert_eq!(string_cell(&filtered_indexes, 0, 2), "Service");
+    assert_eq!(string_cell(&filtered_indexes, 0, 3), "name");
+
+    let filtered_constraints = run(&mut session, "SHOW CONSTRAINTS ON [:CALLS]");
+    assert_eq!(filtered_constraints.rows.len(), 1);
+    assert_eq!(string_cell(&filtered_constraints, 0, 2), "CALLS");
+    assert_eq!(string_cell(&filtered_constraints, 0, 3), "latency");
+
+    drop(session);
+
+    let mut reopened = db.open();
+    let reopened_schema = run(&mut reopened, "SHOW SCHEMA");
+    assert!(reopened_schema.rows.iter().any(|row| {
+        row[1] == RuntimeValue::String("CALLS".to_owned())
+            && row[2] == RuntimeValue::String("Service-to-service calls".to_owned())
+    }));
+}
+
+#[test]
+fn explain_uses_index_seek_and_range_scan() {
+    let db = TestDb::new("planner_wave3");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+    run(&mut session, "CREATE INDEX ON :Person(age)");
+
+    let explain_seek = run(
+        &mut session,
+        "EXPLAIN MATCH (n:Person) WHERE n.email = 'ada@example.com' RETURN n.name",
+    );
+    assert!(explain_seek.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("NodeIndexSeek".to_owned())
+            && format!("{:?}", row[3]).contains(":Person(email)")
+    }));
+
+    let explain_range = run(
+        &mut session,
+        "EXPLAIN MATCH (n:Person) WHERE n.age >= 37 RETURN n.name",
+    );
+    assert!(explain_range.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("NodeIndexRangeScan".to_owned())
+            && format!("{:?}", row[3]).contains(":Person(age)")
+    }));
+
+    let seek_result = run(
+        &mut session,
+        "MATCH (n:Person) WHERE n.email = 'ada@example.com' RETURN n.name",
+    );
+    assert_eq!(
+        seek_result.rows,
+        vec![vec![RuntimeValue::String("Ada".to_owned())]]
+    );
+
+    let range_result = run(
+        &mut session,
+        "MATCH (n:Person) WHERE n.age >= 37 RETURN n.name ORDER BY n.name",
+    );
+    assert_eq!(
+        range_result.rows,
+        vec![
+            vec![RuntimeValue::String("Alan".to_owned())],
+            vec![RuntimeValue::String("Grace".to_owned())],
+        ]
+    );
 }
 
 #[test]

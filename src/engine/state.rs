@@ -31,8 +31,15 @@ pub(crate) struct EdgeState {
 pub(crate) struct SchemaState {
     pub labels: Vec<String>,
     pub edge_types: Vec<String>,
+    pub object_options: Vec<SchemaObjectState>,
     pub indexes: Vec<IndexState>,
     pub constraints: Vec<ConstraintState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SchemaObjectState {
+    pub target: SchemaTarget,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -294,12 +294,12 @@ impl GraphSnapshot {
         self.data.schema.show_schema_rows()
     }
 
-    pub fn show_indexes(&self) -> Vec<IndexRow> {
-        self.data.schema.show_index_rows()
+    pub fn show_indexes(&self, target_filter: Option<&SchemaTarget>) -> Vec<IndexRow> {
+        self.data.schema.show_index_rows(target_filter)
     }
 
-    pub fn show_constraints(&self) -> Vec<ConstraintRow> {
-        self.data.schema.show_constraint_rows()
+    pub fn show_constraints(&self, target_filter: Option<&SchemaTarget>) -> Vec<ConstraintRow> {
+        self.data.schema.show_constraint_rows(target_filter)
     }
 
     pub fn stats(&self) -> GraphStats {
@@ -484,12 +484,22 @@ impl CupldEngine {
         Ok(edge_id)
     }
 
-    pub fn create_label(&mut self, name: &str, if_not_exists: bool) -> Result<(), GraphError> {
-        self.create_schema_object(SchemaObjectKind::Label, name, if_not_exists)
+    pub fn create_label(
+        &mut self,
+        name: &str,
+        description: Option<String>,
+        if_not_exists: bool,
+    ) -> Result<(), GraphError> {
+        self.create_schema_object(SchemaObjectKind::Label, name, description, if_not_exists)
     }
 
-    pub fn create_edge_type(&mut self, name: &str, if_not_exists: bool) -> Result<(), GraphError> {
-        self.create_schema_object(SchemaObjectKind::EdgeType, name, if_not_exists)
+    pub fn create_edge_type(
+        &mut self,
+        name: &str,
+        description: Option<String>,
+        if_not_exists: bool,
+    ) -> Result<(), GraphError> {
+        self.create_schema_object(SchemaObjectKind::EdgeType, name, description, if_not_exists)
     }
 
     pub fn drop_label(&mut self, name: &str, if_exists: bool) -> Result<(), GraphError> {
@@ -672,12 +682,16 @@ impl CupldEngine {
         self.working.schema.show_schema_rows()
     }
 
-    pub fn show_indexes(&self) -> Vec<IndexRow> {
-        self.working.schema.show_index_rows()
+    pub fn show_indexes(&self, target_filter: Option<&SchemaTarget>) -> Vec<IndexRow> {
+        self.working.schema.show_index_rows(target_filter)
     }
 
-    pub fn show_constraints(&self) -> Vec<ConstraintRow> {
-        self.working.schema.show_constraint_rows()
+    pub fn show_constraints(&self, target_filter: Option<&SchemaTarget>) -> Vec<ConstraintRow> {
+        self.working.schema.show_constraint_rows(target_filter)
+    }
+
+    pub fn schema_catalog(&self) -> &SchemaCatalog {
+        &self.working.schema
     }
 
     pub fn set_node_property<K>(
@@ -850,6 +864,7 @@ impl CupldEngine {
         &mut self,
         kind: SchemaObjectKind,
         name: &str,
+        description: Option<String>,
         if_not_exists: bool,
     ) -> Result<(), GraphError> {
         if name.is_empty() {
@@ -868,10 +883,10 @@ impl CupldEngine {
 
         match kind {
             SchemaObjectKind::Label => {
-                self.working.schema.create_label(name);
+                self.working.schema.create_label(name, description);
             }
             SchemaObjectKind::EdgeType => {
-                self.working.schema.create_edge_type(name);
+                self.working.schema.create_edge_type(name, description);
             }
         }
         Ok(())
@@ -1305,8 +1320,8 @@ mod tests {
     #[test]
     fn explicit_and_implicit_schema_targets_share_the_catalog() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", false).unwrap();
-        engine.create_edge_type("KNOWS", false).unwrap();
+        engine.create_label("Person", None, false).unwrap();
+        engine.create_edge_type("KNOWS", None, false).unwrap();
         let left = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         let right = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine
@@ -1321,7 +1336,7 @@ mod tests {
     #[test]
     fn generated_schema_names_are_deterministic_and_visible_in_show_schema() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", false).unwrap();
+        engine.create_label("Person", None, false).unwrap();
         let index_name = engine
             .create_index(None, SchemaTarget::label("Person"), "email", false)
             .unwrap();
@@ -1350,7 +1365,7 @@ mod tests {
     #[test]
     fn unique_constraints_allow_missing_values_but_reject_duplicate_non_null_values() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", false).unwrap();
+        engine.create_label("Person", None, false).unwrap();
         engine
             .create_constraint(
                 None,
@@ -1377,7 +1392,7 @@ mod tests {
     #[test]
     fn required_and_type_constraints_validate_existing_data_immediately() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", false).unwrap();
+        engine.create_label("Person", None, false).unwrap();
         let node = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine
             .set_node_property(node, "age", Value::from("wrong"))
@@ -1408,8 +1423,8 @@ mod tests {
     #[test]
     fn dropping_labels_or_edge_types_is_blocked_when_data_or_schema_depends_on_them() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", false).unwrap();
-        engine.create_edge_type("KNOWS", false).unwrap();
+        engine.create_label("Person", None, false).unwrap();
+        engine.create_edge_type("KNOWS", None, false).unwrap();
         let left = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         let right = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine
@@ -1432,7 +1447,7 @@ mod tests {
     #[test]
     fn unique_constraints_create_backing_indexes_that_cannot_be_dropped_directly() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", false).unwrap();
+        engine.create_label("Person", None, false).unwrap();
         let constraint_name = engine
             .create_constraint(
                 None,
@@ -1451,7 +1466,7 @@ mod tests {
         engine.drop_constraint(&constraint_name, false).unwrap();
         assert!(
             !engine
-                .show_indexes()
+                .show_indexes(None)
                 .iter()
                 .any(|row| row.name == backing_index)
         );

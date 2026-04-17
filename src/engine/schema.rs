@@ -18,6 +18,21 @@ impl TargetKind {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SchemaObjectOptions {
+    description: Option<String>,
+}
+
+impl SchemaObjectOptions {
+    pub fn new(description: Option<String>) -> Self {
+        Self { description }
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaTarget {
     kind: TargetKind,
@@ -277,6 +292,7 @@ impl ConstraintDefinition {
 pub struct SchemaCatalog {
     labels: BTreeSet<String>,
     edge_types: BTreeSet<String>,
+    object_options: BTreeMap<SchemaTarget, SchemaObjectOptions>,
     indexes: BTreeMap<String, IndexDefinition>,
     constraints: BTreeMap<String, ConstraintDefinition>,
 }
@@ -298,39 +314,63 @@ impl SchemaCatalog {
         self.constraints.values()
     }
 
+    pub fn object_options(&self, target: &SchemaTarget) -> Option<&SchemaObjectOptions> {
+        self.object_options.get(target)
+    }
+
     pub fn ensure_label<S>(&mut self, name: S)
     where
         S: Into<String>,
     {
-        self.labels.insert(name.into());
+        let name = name.into();
+        self.labels.insert(name.clone());
+        self.object_options
+            .entry(SchemaTarget::label(name))
+            .or_default();
     }
 
     pub fn ensure_edge_type<S>(&mut self, name: S)
     where
         S: Into<String>,
     {
-        self.edge_types.insert(name.into());
+        let name = name.into();
+        self.edge_types.insert(name.clone());
+        self.object_options
+            .entry(SchemaTarget::edge_type(name))
+            .or_default();
     }
 
-    pub fn create_label<S>(&mut self, name: S) -> String
+    pub fn create_label<S>(&mut self, name: S, description: Option<String>) -> String
     where
         S: Into<String>,
     {
-        insert_name(&mut self.labels, name.into())
+        let name = insert_name(&mut self.labels, name.into());
+        self.object_options.insert(
+            SchemaTarget::label(name.clone()),
+            SchemaObjectOptions::new(description),
+        );
+        name
     }
 
-    pub fn create_edge_type<S>(&mut self, name: S) -> String
+    pub fn create_edge_type<S>(&mut self, name: S, description: Option<String>) -> String
     where
         S: Into<String>,
     {
-        insert_name(&mut self.edge_types, name.into())
+        let name = insert_name(&mut self.edge_types, name.into());
+        self.object_options.insert(
+            SchemaTarget::edge_type(name.clone()),
+            SchemaObjectOptions::new(description),
+        );
+        name
     }
 
     pub fn remove_label(&mut self, name: &str) -> bool {
+        self.object_options.remove(&SchemaTarget::label(name));
         self.labels.remove(name)
     }
 
     pub fn remove_edge_type(&mut self, name: &str) -> bool {
+        self.object_options.remove(&SchemaTarget::edge_type(name));
         self.edge_types.remove(name)
     }
 
@@ -399,6 +439,14 @@ impl SchemaCatalog {
         self.indexes.get(name)
     }
 
+    pub fn find_index(&self, target: &SchemaTarget, property: &str) -> Option<&IndexDefinition> {
+        self.indexes.values().find(|index| {
+            index.target() == target
+                && index.property() == property
+                && index.status() == IndexStatus::Ready
+        })
+    }
+
     pub fn constraint(&self, name: &str) -> Option<&ConstraintDefinition> {
         self.constraints.get(name)
     }
@@ -418,23 +466,38 @@ impl SchemaCatalog {
     pub fn show_schema_rows(&self) -> Vec<SchemaRow> {
         let mut rows = Vec::new();
         for label in &self.labels {
+            let target = SchemaTarget::label(label.clone());
+            let options = self
+                .object_options
+                .get(&target)
+                .cloned()
+                .unwrap_or_default();
             rows.push(SchemaRow {
                 kind: "label".to_owned(),
                 name: label.clone(),
-                ddl: format!("CREATE LABEL {}", label),
+                description: options.description().map(ToOwned::to_owned),
+                ddl: schema_object_ddl(&target, &options),
             });
         }
         for edge_type in &self.edge_types {
+            let target = SchemaTarget::edge_type(edge_type.clone());
+            let options = self
+                .object_options
+                .get(&target)
+                .cloned()
+                .unwrap_or_default();
             rows.push(SchemaRow {
                 kind: "edge_type".to_owned(),
                 name: edge_type.clone(),
-                ddl: format!("CREATE EDGE TYPE {}", edge_type),
+                description: options.description().map(ToOwned::to_owned),
+                ddl: schema_object_ddl(&target, &options),
             });
         }
         for index in self.indexes.values() {
             rows.push(SchemaRow {
                 kind: "index".to_owned(),
                 name: index.name.clone(),
+                description: None,
                 ddl: index.canonical_ddl(),
             });
         }
@@ -442,15 +505,17 @@ impl SchemaCatalog {
             rows.push(SchemaRow {
                 kind: "constraint".to_owned(),
                 name: constraint.name.clone(),
+                description: None,
                 ddl: constraint.canonical_ddl(),
             });
         }
         rows
     }
 
-    pub fn show_index_rows(&self) -> Vec<IndexRow> {
+    pub fn show_index_rows(&self, target_filter: Option<&SchemaTarget>) -> Vec<IndexRow> {
         self.indexes
             .values()
+            .filter(|index| target_filter.is_none_or(|target| index.target() == target))
             .map(|index| IndexRow {
                 name: index.name.clone(),
                 target_kind: index.target.kind.as_str().to_owned(),
@@ -462,9 +527,10 @@ impl SchemaCatalog {
             .collect()
     }
 
-    pub fn show_constraint_rows(&self) -> Vec<ConstraintRow> {
+    pub fn show_constraint_rows(&self, target_filter: Option<&SchemaTarget>) -> Vec<ConstraintRow> {
         self.constraints
             .values()
+            .filter(|constraint| target_filter.is_none_or(|target| constraint.target() == target))
             .map(|constraint| ConstraintRow {
                 name: constraint.name.clone(),
                 target_kind: constraint.target.kind.as_str().to_owned(),
@@ -480,6 +546,14 @@ impl SchemaCatalog {
         SchemaState {
             labels: self.labels.iter().cloned().collect(),
             edge_types: self.edge_types.iter().cloned().collect(),
+            object_options: self
+                .object_options
+                .iter()
+                .map(|(target, options)| super::state::SchemaObjectState {
+                    target: target.clone(),
+                    description: options.description().map(ToOwned::to_owned),
+                })
+                .collect(),
             indexes: self
                 .indexes
                 .values()
@@ -509,6 +583,11 @@ impl SchemaCatalog {
         Self {
             labels: state.labels.into_iter().collect(),
             edge_types: state.edge_types.into_iter().collect(),
+            object_options: state
+                .object_options
+                .into_iter()
+                .map(|object| (object.target, SchemaObjectOptions::new(object.description)))
+                .collect(),
             indexes: state
                 .indexes
                 .into_iter()
@@ -549,6 +628,7 @@ impl SchemaCatalog {
 pub struct SchemaRow {
     pub kind: String,
     pub name: String,
+    pub description: Option<String>,
     pub ddl: String,
 }
 
@@ -570,6 +650,28 @@ pub struct ConstraintRow {
     pub property: String,
     pub constraint_type: String,
     pub details: String,
+}
+
+fn schema_object_ddl(target: &SchemaTarget, options: &SchemaObjectOptions) -> String {
+    let mut ddl = match target.kind() {
+        TargetKind::Label => format!("CREATE LABEL {}", target.name()),
+        TargetKind::EdgeType => format!("CREATE EDGE TYPE {}", target.name()),
+    };
+    if let Some(description) = options.description() {
+        ddl.push_str(" DESCRIPTION ");
+        ddl.push_str(&quote_ddl_string(description));
+    }
+    ddl
+}
+
+fn quote_ddl_string(input: &str) -> String {
+    let escaped = input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
 }
 
 pub(crate) fn generated_name(

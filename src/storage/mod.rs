@@ -6,12 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::{
     ConstraintState, CupldEngine, EdgeState, EngineState, GraphError, IndexState, IndexStatus,
-    NodeState, PropertyMap, SchemaState, Value,
+    NodeState, PropertyMap, SchemaObjectState, SchemaState, Value,
 };
 
 const MAGIC: &[u8; 8] = b"CUPLD01\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const COMPAT_VERSION: u32 = 1;
+const PREVIOUS_FORMAT_VERSION: u32 = 1;
 const LEGACY_FORMAT_VERSION: u32 = 0;
 const LEGACY_COMPAT_VERSION: u32 = 0;
 const HEADER_SIZE: usize = 128;
@@ -39,6 +40,7 @@ enum StorageErrorKind {
     FileLayout,
     FileMagic,
     FileVersion,
+    DecodeEof,
     IndexStatus,
     PropertyType,
     SchemaTarget,
@@ -57,6 +59,7 @@ impl StorageErrorKind {
             Self::FileLayout => "file_layout",
             Self::FileMagic => "file_magic",
             Self::FileVersion => "file_version",
+            Self::DecodeEof => "decode_eof",
             Self::IndexStatus => "index_status",
             Self::PropertyType => "property_type",
             Self::SchemaTarget => "schema_target",
@@ -76,6 +79,7 @@ impl From<&'static str> for StorageErrorKind {
             "file_layout" => Self::FileLayout,
             "file_magic" => Self::FileMagic,
             "file_version" => Self::FileVersion,
+            "decode_eof" => Self::DecodeEof,
             "index_status" => Self::IndexStatus,
             "property_type" => Self::PropertyType,
             "schema_target" => Self::SchemaTarget,
@@ -183,9 +187,9 @@ pub fn load(path: &Path) -> Result<(CupldEngine, IntegrityReport), StorageError>
     let bytes = fs::read(path)?;
     let parsed = parse_file(&bytes)?;
     maybe_migrate_file(path, parsed.format)?;
-    let mut state = decode_state(&parsed.snapshot_bytes)?;
+    let mut state = decode_state(&parsed.snapshot_bytes, parsed.format)?;
     for record in &parsed.wal_records {
-        state = decode_state(&record.payload)?;
+        state = decode_state(&record.payload, parsed.format)?;
     }
     let engine = CupldEngine::from_state(state)?;
     let report = IntegrityReport {
@@ -402,6 +406,15 @@ fn plan_migration(format: StorageFormatVersion) -> Result<MigrationPlan, Storage
             target: format,
         });
     }
+    if format.version == PREVIOUS_FORMAT_VERSION && format.compat == COMPAT_VERSION {
+        return Ok(MigrationPlan {
+            rewrite_header: true,
+            target: StorageFormatVersion {
+                version: FORMAT_VERSION,
+                compat: COMPAT_VERSION,
+            },
+        });
+    }
     if format.version == LEGACY_FORMAT_VERSION && format.compat == LEGACY_COMPAT_VERSION {
         return Ok(MigrationPlan {
             rewrite_header: true,
@@ -423,10 +436,25 @@ fn maybe_migrate_file(path: &Path, format: StorageFormatVersion) -> Result<(), S
         return Ok(());
     }
 
-    let mut bytes = fs::read(path)?;
-    bytes[8..12].copy_from_slice(&migration.target.version.to_le_bytes());
-    bytes[12..16].copy_from_slice(&migration.target.compat.to_le_bytes());
-    write_durable(path, &bytes)
+    let bytes = fs::read(path)?;
+    let parsed = parse_file(&bytes)?;
+    let migrated = (|| -> Result<(), StorageError> {
+        let mut state = decode_state(&parsed.snapshot_bytes, parsed.format)?;
+        for record in &parsed.wal_records {
+            state = decode_state(&record.payload, parsed.format)?;
+        }
+        let engine = CupldEngine::from_state(state)?;
+        compact(path, &engine, parsed.header.db_uuid)
+    })();
+
+    if migrated.is_ok() {
+        return migrated;
+    }
+
+    let mut header_only = bytes;
+    header_only[8..12].copy_from_slice(&migration.target.version.to_le_bytes());
+    header_only[12..16].copy_from_slice(&migration.target.compat.to_le_bytes());
+    write_durable(path, &header_only)
 }
 
 fn encode_wal_record(seq_no: u64, tx_id: u64, payload: &[u8]) -> Vec<u8> {
@@ -466,12 +494,12 @@ fn encode_state(state: &EngineState) -> Result<Vec<u8>, StorageError> {
     Ok(bytes)
 }
 
-fn decode_state(bytes: &[u8]) -> Result<EngineState, StorageError> {
+fn decode_state(bytes: &[u8], format: StorageFormatVersion) -> Result<EngineState, StorageError> {
     let mut cursor = 0usize;
     let next_tx_id = read_u64(bytes, &mut cursor)?;
     let next_node_id = read_u64(bytes, &mut cursor)?;
     let next_edge_id = read_u64(bytes, &mut cursor)?;
-    let schema = decode_schema_state(bytes, &mut cursor)?;
+    let schema = decode_schema_state(bytes, &mut cursor, format)?;
     let node_count = read_u32(bytes, &mut cursor)? as usize;
     let mut nodes = Vec::with_capacity(node_count);
     for _ in 0..node_count {
@@ -505,6 +533,11 @@ fn decode_state(bytes: &[u8]) -> Result<EngineState, StorageError> {
 fn encode_schema_state(output: &mut Vec<u8>, state: &SchemaState) {
     push_strings(output, &state.labels);
     push_strings(output, &state.edge_types);
+    push_u32(output, state.object_options.len() as u32);
+    for object in &state.object_options {
+        push_schema_target(output, &object.target);
+        push_optional_string(output, object.description.as_deref());
+    }
     push_u32(output, state.indexes.len() as u32);
     for index in &state.indexes {
         push_string(output, &index.name);
@@ -537,9 +570,26 @@ fn encode_schema_state(output: &mut Vec<u8>, state: &SchemaState) {
     }
 }
 
-fn decode_schema_state(bytes: &[u8], cursor: &mut usize) -> Result<SchemaState, StorageError> {
+fn decode_schema_state(
+    bytes: &[u8],
+    cursor: &mut usize,
+    format: StorageFormatVersion,
+) -> Result<SchemaState, StorageError> {
     let labels = read_strings(bytes, cursor)?;
     let edge_types = read_strings(bytes, cursor)?;
+    let object_options = if format.version >= FORMAT_VERSION {
+        let object_count = read_u32(bytes, cursor)? as usize;
+        let mut object_options = Vec::with_capacity(object_count);
+        for _ in 0..object_count {
+            object_options.push(SchemaObjectState {
+                target: read_schema_target(bytes, cursor)?,
+                description: read_optional_string(bytes, cursor)?,
+            });
+        }
+        object_options
+    } else {
+        Vec::new()
+    };
     let index_count = read_u32(bytes, cursor)? as usize;
     let mut indexes = Vec::with_capacity(index_count);
     for _ in 0..index_count {
@@ -585,6 +635,7 @@ fn decode_schema_state(bytes: &[u8], cursor: &mut usize) -> Result<SchemaState, 
     Ok(SchemaState {
         labels,
         edge_types,
+        object_options,
         indexes,
         constraints,
     })

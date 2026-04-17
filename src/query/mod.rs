@@ -14,6 +14,7 @@ pub enum Statement {
     ReleaseSavepoint(String),
     CreateLabel {
         name: String,
+        description: Option<String>,
         if_not_exists: bool,
     },
     DropLabel {
@@ -22,6 +23,7 @@ pub enum Statement {
     },
     CreateEdgeType {
         name: String,
+        description: Option<String>,
         if_not_exists: bool,
     },
     DropEdgeType {
@@ -57,8 +59,8 @@ pub enum Statement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShowKind {
     Schema,
-    Indexes,
-    Constraints,
+    Indexes(Option<SchemaTarget>),
+    Constraints(Option<SchemaTarget>),
     Stats,
     Transactions,
 }
@@ -484,10 +486,20 @@ impl Parser {
             return Ok(ShowKind::Schema);
         }
         if self.consume_keyword("INDEXES")? {
-            return Ok(ShowKind::Indexes);
+            let target = if self.consume_keyword("ON")? {
+                Some(self.parse_schema_target()?)
+            } else {
+                None
+            };
+            return Ok(ShowKind::Indexes(target));
         }
         if self.consume_keyword("CONSTRAINTS")? {
-            return Ok(ShowKind::Constraints);
+            let target = if self.consume_keyword("ON")? {
+                Some(self.parse_schema_target()?)
+            } else {
+                None
+            };
+            return Ok(ShowKind::Constraints(target));
         }
         if self.consume_keyword("STATS")? {
             return Ok(ShowKind::Stats);
@@ -520,6 +532,7 @@ impl Parser {
         if self.consume_keyword("LABEL")? {
             return Ok(Statement::CreateLabel {
                 name: self.expect_identifier()?,
+                description: self.parse_optional_description()?,
                 if_not_exists,
             });
         }
@@ -527,6 +540,7 @@ impl Parser {
             self.expect_keyword("TYPE")?;
             return Ok(Statement::CreateEdgeType {
                 name: self.expect_identifier()?,
+                description: self.parse_optional_description()?,
                 if_not_exists,
             });
         }
@@ -1150,6 +1164,28 @@ impl Parser {
         } else {
             Ok(Some(self.expect_identifier()?))
         }
+    }
+
+    fn parse_optional_description(&mut self) -> Result<Option<String>, QueryError> {
+        if self.consume_keyword("DESCRIPTION")? {
+            return self
+                .try_string()
+                .ok_or_else(|| {
+                    let token = self.peek().cloned().unwrap_or(Token {
+                        kind: TokenKind::Semicolon,
+                        line: 1,
+                        column: 1,
+                    });
+                    QueryError::new(
+                        "parse_string",
+                        "expected a string literal after DESCRIPTION",
+                        token.line,
+                        token.column,
+                    )
+                })
+                .map(Some);
+        }
+        Ok(None)
     }
 
     fn expect_limit_value(&mut self) -> Result<usize, QueryError> {
@@ -2168,10 +2204,12 @@ mod tests {
             vec![
                 Statement::CreateLabel {
                     name: "Person".to_owned(),
+                    description: None,
                     if_not_exists: false,
                 },
                 Statement::CreateEdgeType {
                     name: "KNOWS".to_owned(),
+                    description: None,
                     if_not_exists: false,
                 },
                 Statement::CreateIndex {
@@ -2187,8 +2225,46 @@ mod tests {
                     constraint: ConstraintSpec::Type(PropertyType::Int),
                     if_not_exists: false,
                 },
-                Statement::Show(ShowKind::Indexes),
+                Statement::Show(ShowKind::Indexes(None)),
             ]
+        );
+    }
+
+    #[test]
+    fn parses_schema_metadata_and_filtered_show() {
+        let statements = parse_script(
+            "CREATE LABEL Person DESCRIPTION 'People';
+             CREATE EDGE TYPE KNOWS DESCRIPTION 'Relationships';
+             SHOW INDEXES ON :Person;
+             SHOW CONSTRAINTS ON [:KNOWS];",
+        )
+        .unwrap();
+
+        assert_eq!(
+            statements[0],
+            Statement::CreateLabel {
+                name: "Person".to_owned(),
+                description: Some("People".to_owned()),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            statements[1],
+            Statement::CreateEdgeType {
+                name: "KNOWS".to_owned(),
+                description: Some("Relationships".to_owned()),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            statements[2],
+            Statement::Show(ShowKind::Indexes(Some(SchemaTarget::label("Person"))))
+        );
+        assert_eq!(
+            statements[3],
+            Statement::Show(ShowKind::Constraints(Some(SchemaTarget::edge_type(
+                "KNOWS"
+            ))))
         );
     }
 
