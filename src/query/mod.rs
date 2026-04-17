@@ -83,10 +83,13 @@ pub enum Direction {
 pub struct Query {
     pub match_clause: Option<Pattern>,
     pub where_clause: Option<Expr>,
+    pub with_clauses: Vec<WithClause>,
+    pub merge_clause: Option<Pattern>,
     pub create_clause: Option<Pattern>,
     pub set_clause: Vec<SetAssignment>,
     pub remove_clause: Vec<PropertyTarget>,
     pub delete_clause: Vec<String>,
+    pub return_all: bool,
     pub return_clause: Vec<ReturnItem>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<usize>,
@@ -96,10 +99,13 @@ impl Query {
     fn is_empty(&self) -> bool {
         self.match_clause.is_none()
             && self.where_clause.is_none()
+            && self.with_clauses.is_empty()
+            && self.merge_clause.is_none()
             && self.create_clause.is_none()
             && self.set_clause.is_empty()
             && self.remove_clause.is_empty()
             && self.delete_clause.is_empty()
+            && !self.return_all
             && self.return_clause.is_empty()
             && self.order_by.is_empty()
             && self.limit.is_none()
@@ -107,7 +113,17 @@ impl Query {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct WithClause {
+    pub all: bool,
+    pub items: Vec<ReturnItem>,
+    pub where_clause: Option<Expr>,
+    pub order_by: Vec<OrderItem>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Pattern {
+    pub path_variable: Option<String>,
     pub start: NodePattern,
     pub segments: Vec<PatternSegment>,
 }
@@ -173,6 +189,7 @@ pub enum Expr {
     String(String),
     Bytes(Vec<u8>),
     Datetime(SystemTime),
+    Wildcard,
     Parameter(String),
     Variable(String),
     Property(Box<Expr>, String),
@@ -628,10 +645,13 @@ impl Parser {
         let mut query = Query {
             match_clause: None,
             where_clause: None,
+            with_clauses: Vec::new(),
+            merge_clause: None,
             create_clause: None,
             set_clause: Vec::new(),
             remove_clause: Vec::new(),
             delete_clause: Vec::new(),
+            return_all: false,
             return_clause: Vec::new(),
             order_by: Vec::new(),
             limit: None,
@@ -642,6 +662,35 @@ impl Parser {
         }
         if self.consume_keyword("WHERE")? {
             query.where_clause = Some(self.parse_expr()?);
+        }
+        while self.consume_keyword("WITH")? {
+            let (all, items) = self.parse_projection_items()?;
+            let where_clause = if self.consume_keyword("WHERE")? {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            let order_by = if self.consume_keyword("ORDER")? {
+                self.expect_keyword("BY")?;
+                self.parse_order_clause()?
+            } else {
+                Vec::new()
+            };
+            let limit = if self.consume_keyword("LIMIT")? {
+                Some(self.expect_limit_value()?)
+            } else {
+                None
+            };
+            query.with_clauses.push(WithClause {
+                all,
+                items,
+                where_clause,
+                order_by,
+                limit,
+            });
+        }
+        if self.consume_keyword("MERGE")? {
+            query.merge_clause = Some(self.parse_pattern()?);
         }
         if self.consume_keyword("CREATE")? {
             query.create_clause = Some(self.parse_pattern()?);
@@ -656,7 +705,9 @@ impl Parser {
             query.delete_clause = self.parse_delete_clause()?;
         }
         if self.consume_keyword("RETURN")? {
-            query.return_clause = self.parse_return_clause()?;
+            let (all, items) = self.parse_projection_items()?;
+            query.return_all = all;
+            query.return_clause = items;
         }
         if self.consume_keyword("ORDER")? {
             self.expect_keyword("BY")?;
@@ -670,6 +721,13 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, QueryError> {
+        let path_variable = if self.peek_identifier_followed_by_token(TokenDiscriminant::Eq) {
+            let variable = self.expect_identifier()?;
+            self.expect_token(TokenDiscriminant::Eq)?;
+            Some(variable)
+        } else {
+            None
+        };
         let start = self.parse_node_pattern()?;
         let mut segments = Vec::new();
 
@@ -705,7 +763,11 @@ impl Parser {
             break;
         }
 
-        Ok(Pattern { start, segments })
+        Ok(Pattern {
+            path_variable,
+            start,
+            segments,
+        })
     }
 
     fn parse_node_pattern(&mut self) -> Result<NodePattern, QueryError> {
@@ -848,6 +910,13 @@ impl Parser {
             }
         }
         Ok(items)
+    }
+
+    fn parse_projection_items(&mut self) -> Result<(bool, Vec<ReturnItem>), QueryError> {
+        if self.consume_token(TokenDiscriminant::Star) {
+            return Ok((true, Vec::new()));
+        }
+        self.parse_return_clause().map(|items| (false, items))
     }
 
     fn parse_order_clause(&mut self) -> Result<Vec<OrderItem>, QueryError> {
@@ -1091,12 +1160,19 @@ impl Parser {
         if self.check(TokenDiscriminant::LBrace) {
             return Ok(Expr::Map(self.parse_property_map()?));
         }
+        if self.consume_token(TokenDiscriminant::Star) {
+            return Ok(Expr::Wildcard);
+        }
         let ident = self.expect_identifier()?;
         if self.consume_token(TokenDiscriminant::LParen) {
             let mut args = Vec::new();
             if !self.consume_token(TokenDiscriminant::RParen) {
                 loop {
-                    args.push(self.parse_expr()?);
+                    if self.consume_token(TokenDiscriminant::Star) {
+                        args.push(Expr::Wildcard);
+                    } else {
+                        args.push(self.parse_expr()?);
+                    }
                     if self.consume_token(TokenDiscriminant::Comma) {
                         continue;
                     }
@@ -1326,6 +1402,16 @@ impl Parser {
                 self.tokens.get(self.idx + 1).map(|token| &token.kind),
             ),
             (Some(TokenKind::Identifier(value)), Some(TokenKind::String(_))) if value == keyword
+        )
+    }
+
+    fn peek_identifier_followed_by_token(&self, expected: TokenDiscriminant) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.idx).map(|token| &token.kind),
+                self.tokens.get(self.idx + 1),
+            ),
+            (Some(TokenKind::Identifier(_)), Some(token)) if expected.matches(&token.kind)
         )
     }
 

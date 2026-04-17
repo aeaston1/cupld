@@ -99,6 +99,16 @@ RETURN b.name, {name: b.name}['name'], bytes'gold', datetime'2024-01-02T03:04:05
 "
 ```
 
+Use staged projections, aggregates, and `MERGE` in one query:
+
+```bash
+cupld query --db .cupld/default.cupld "
+MATCH (n:Person)
+WITH n.age >= 37 AS senior, count(*) AS total
+RETURN senior, total
+"
+```
+
 Validate and compact a database:
 
 ```bash

@@ -14,7 +14,7 @@ pub use engine::{
 pub use query::{
     BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, HopRange, NodePattern, OrderItem,
     Pattern, PatternSegment, PropertyTarget, Query, QueryError, ReturnItem, SetAssignment,
-    ShowKind, Statement, UnaryOp, parse_script,
+    ShowKind, Statement, UnaryOp, WithClause, parse_script,
 };
 pub use runtime::{ExecutionError, QueryResult, RuntimeValue, Session, TransactionInfo};
 pub use source::{

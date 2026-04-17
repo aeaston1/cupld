@@ -447,6 +447,84 @@ fn explain_uses_index_seek_and_range_scan() {
 }
 
 #[test]
+fn with_and_aggregates_share_the_projection_pipeline() {
+    let db = TestDb::new("pipeline_wave4");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+
+    let grouped = run(
+        &mut session,
+        "MATCH (n:Person)
+         WITH n.age >= 37 AS senior, count(*) AS total, collect(n.name) AS names
+         RETURN senior, total, names
+         ORDER BY senior",
+    );
+
+    assert_eq!(grouped.columns, vec!["col_1", "col_2", "col_3"]);
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![
+                RuntimeValue::Bool(false),
+                RuntimeValue::Int(2),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("Ada".to_owned()),
+                    RuntimeValue::String("Bob".to_owned()),
+                ]),
+            ],
+            vec![
+                RuntimeValue::Bool(true),
+                RuntimeValue::Int(2),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("Grace".to_owned()),
+                    RuntimeValue::String("Alan".to_owned()),
+                ]),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn merge_path_results_and_return_star_use_the_staged_executor() {
+    let db = TestDb::new("merge_wave4");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+
+    let merged = run(
+        &mut session,
+        "MATCH (a:Person {name: 'Ada'})
+         MERGE p = (a)-[:MENTORS]->(m:Person {name: 'Lin', email: 'lin@example.com', age: 33})
+         RETURN *",
+    );
+
+    assert_eq!(merged.columns, vec!["a", "m", "p"]);
+    assert!(matches!(merged.rows[0][0], RuntimeValue::Node(_)));
+    assert!(matches!(merged.rows[0][1], RuntimeValue::Node(_)));
+    match &merged.rows[0][2] {
+        RuntimeValue::Map(entries) => {
+            assert_eq!(entries.len(), 2);
+            assert!(matches!(&entries[0].1, RuntimeValue::List(nodes) if nodes.len() == 2));
+            assert!(matches!(&entries[1].1, RuntimeValue::List(edges) if edges.len() == 1));
+        }
+        other => panic!("expected path map, got {other:?}"),
+    }
+
+    run(
+        &mut session,
+        "MATCH (a:Person {name: 'Ada'})
+         MERGE p = (a)-[:MENTORS]->(m:Person {name: 'Lin', email: 'lin@example.com', age: 33})
+         RETURN p",
+    );
+
+    let mentors = run(
+        &mut session,
+        "MATCH (a:Person)-[:MENTORS]->(m:Person {name: 'Lin'})
+         RETURN count(*)",
+    );
+    assert_eq!(mentors.rows, vec![vec![RuntimeValue::Int(1)]]);
+}
+
+#[test]
 fn file_backed_transaction_rollback_discards_changes() {
     let db = TestDb::new("rollback");
     let mut session = db.open();

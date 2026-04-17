@@ -12,7 +12,7 @@ use crate::engine::{
 };
 use crate::query::{
     BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, OrderItem, Pattern, PatternSegment,
-    PropertyTarget, Query, QueryError, ShowKind, Statement, UnaryOp, parse_script,
+    PropertyTarget, Query, QueryError, ReturnItem, ShowKind, Statement, UnaryOp, parse_script,
 };
 use crate::storage;
 
@@ -23,6 +23,12 @@ const INTERMEDIATE_ROW_LIMIT: usize = 100_000;
 struct MatchPlan {
     access: MatchAccessPath,
     start_candidates: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+struct PathTrace {
+    nodes: Vec<NodeId>,
+    edges: Vec<EdgeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -522,24 +528,21 @@ impl Session {
     ) -> Result<QueryResult, ExecutionError> {
         let match_plan = self.plan_match(query, params)?;
         let mut rows = if let Some(pattern) = &query.match_clause {
-            self.match_pattern(pattern, params, match_plan.as_ref())?
+            self.match_pattern_rows(vec![Row::default()], pattern, params, match_plan.as_ref())?
         } else {
             vec![Row::default()]
         };
 
         if let Some(predicate) = &query.where_clause {
-            rows = rows
-                .into_iter()
-                .filter_map(|row| match self.eval_expr(predicate, &row, params) {
-                    Ok(RuntimeValue::Bool(true)) => Some(Ok(row)),
-                    Ok(RuntimeValue::Bool(false) | RuntimeValue::Null) => None,
-                    Ok(_) => Some(Err(ExecutionError::new(
-                        "where_type_error",
-                        "WHERE expressions must evaluate to bool or null",
-                    ))),
-                    Err(error) => Some(Err(error)),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            rows = self.filter_rows(rows, predicate, params)?;
+        }
+
+        for with_clause in &query.with_clauses {
+            rows = self.apply_with_clause_rows(rows, with_clause, params)?;
+        }
+
+        if let Some(pattern) = &query.merge_clause {
+            rows = self.merge_pattern_rows(rows, pattern, params)?;
         }
 
         if let Some(pattern) = &query.create_clause {
@@ -555,46 +558,17 @@ impl Session {
             self.apply_delete_clause(&rows, &query.delete_clause)?;
         }
 
-        if !query.order_by.is_empty() {
-            rows.sort_by(|left, right| self.compare_rows(left, right, &query.order_by, params));
-        }
-        let limit = query
-            .limit
-            .unwrap_or(DEFAULT_ROW_LIMIT)
-            .min(DEFAULT_ROW_LIMIT);
-        if rows.len() > limit {
-            rows.truncate(limit);
+        rows = self.apply_order_and_limit(rows, &query.order_by, query.limit, params);
+
+        if query.return_all {
+            return self.return_all_rows(rows);
         }
 
         if query.return_clause.is_empty() {
             return Ok(empty_result());
         }
 
-        let columns = query
-            .return_clause
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                item.alias
-                    .clone()
-                    .unwrap_or_else(|| format!("col_{}", index + 1))
-            })
-            .collect::<Vec<_>>();
-        let output_rows = rows
-            .iter()
-            .map(|row| {
-                query
-                    .return_clause
-                    .iter()
-                    .map(|item| self.eval_expr(&item.expr, row, params))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(QueryResult {
-            columns,
-            rows: output_rows,
-        })
+        self.project_result_rows(rows, &query.return_clause, params)
     }
 
     fn plan_match(
@@ -812,23 +786,325 @@ impl Session {
         entries
     }
 
-    fn match_pattern(
+    fn filter_rows(
         &self,
+        rows: Vec<Row>,
+        predicate: &Expr,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Row>, ExecutionError> {
+        rows.into_iter()
+            .filter_map(|row| match self.eval_expr(predicate, &row, params) {
+                Ok(RuntimeValue::Bool(true)) => Some(Ok(row)),
+                Ok(RuntimeValue::Bool(false) | RuntimeValue::Null) => None,
+                Ok(_) => Some(Err(ExecutionError::new(
+                    "where_type_error",
+                    "WHERE expressions must evaluate to bool or null",
+                ))),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn apply_with_clause_rows(
+        &self,
+        mut rows: Vec<Row>,
+        with_clause: &crate::query::WithClause,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Row>, ExecutionError> {
+        if with_clause.all {
+            if let Some(predicate) = &with_clause.where_clause {
+                rows = self.filter_rows(rows, predicate, params)?;
+            }
+            return Ok(self.apply_order_and_limit(
+                rows,
+                &with_clause.order_by,
+                with_clause.limit,
+                params,
+            ));
+        }
+
+        let projection =
+            self.project_rows(rows, &with_clause.items, params, projection_name_for_with)?;
+        let mut projected_rows = projection.1;
+        if let Some(predicate) = &with_clause.where_clause {
+            projected_rows = self.filter_rows(projected_rows, predicate, params)?;
+        }
+        Ok(self.apply_order_and_limit(
+            projected_rows,
+            &with_clause.order_by,
+            with_clause.limit,
+            params,
+        ))
+    }
+
+    fn apply_order_and_limit(
+        &self,
+        mut rows: Vec<Row>,
+        order_by: &[OrderItem],
+        limit: Option<usize>,
+        params: &BTreeMap<String, Value>,
+    ) -> Vec<Row> {
+        if !order_by.is_empty() {
+            rows.sort_by(|left, right| self.compare_rows(left, right, order_by, params));
+        }
+        let limit = limit.unwrap_or(DEFAULT_ROW_LIMIT).min(DEFAULT_ROW_LIMIT);
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        rows
+    }
+
+    fn return_all_rows(&self, rows: Vec<Row>) -> Result<QueryResult, ExecutionError> {
+        let mut columns = rows
+            .iter()
+            .flat_map(|row| row.keys().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            columns = Vec::new();
+        }
+        let output_rows = rows
+            .into_iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .map(|column| row.get(column).cloned().unwrap_or(RuntimeValue::Null))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Ok(QueryResult {
+            columns,
+            rows: output_rows,
+        })
+    }
+
+    fn project_result_rows(
+        &self,
+        rows: Vec<Row>,
+        items: &[ReturnItem],
+        params: &BTreeMap<String, Value>,
+    ) -> Result<QueryResult, ExecutionError> {
+        let (columns, projected_rows) =
+            self.project_rows(rows, items, params, projection_name_for_return)?;
+        let output_columns = columns.clone();
+        Ok(QueryResult {
+            columns,
+            rows: projected_rows
+                .into_iter()
+                .map(|row| {
+                    output_columns
+                        .iter()
+                        .map(|column| row.get(column).cloned().unwrap_or(RuntimeValue::Null))
+                        .collect()
+                })
+                .collect(),
+        })
+    }
+
+    fn project_rows(
+        &self,
+        rows: Vec<Row>,
+        items: &[ReturnItem],
+        params: &BTreeMap<String, Value>,
+        name_fn: fn(usize, &ReturnItem) -> String,
+    ) -> Result<(Vec<String>, Vec<Row>), ExecutionError> {
+        let columns = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| name_fn(index, item))
+            .collect::<Vec<_>>();
+        let aggregate_flags = items
+            .iter()
+            .map(|item| expr_contains_aggregate(&item.expr))
+            .collect::<Vec<_>>();
+        if aggregate_flags.iter().any(|flag| *flag) {
+            if items
+                .iter()
+                .any(|item| aggregate_expression_is_invalid(&item.expr))
+            {
+                return Err(ExecutionError::new(
+                    "function_error",
+                    "aggregate expressions must be top-level aggregate function calls",
+                ));
+            }
+            return self.project_aggregate_rows(rows, items, &columns, &aggregate_flags, params);
+        }
+        let output_rows = rows
+            .into_iter()
+            .map(|row| {
+                let mut projected = Row::default();
+                for (index, item) in items.iter().enumerate() {
+                    projected.insert(
+                        columns[index].clone(),
+                        self.eval_expr(&item.expr, &row, params)?,
+                    );
+                }
+                Ok(projected)
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        Ok((columns, output_rows))
+    }
+
+    fn project_aggregate_rows(
+        &self,
+        rows: Vec<Row>,
+        items: &[ReturnItem],
+        columns: &[String],
+        aggregate_flags: &[bool],
+        params: &BTreeMap<String, Value>,
+    ) -> Result<(Vec<String>, Vec<Row>), ExecutionError> {
+        let grouping_items = items
+            .iter()
+            .zip(aggregate_flags.iter())
+            .enumerate()
+            .filter_map(|(index, (item, is_aggregate))| (!is_aggregate).then_some((index, item)))
+            .collect::<Vec<_>>();
+
+        let mut groups = BTreeMap::<Vec<PlannerKey>, Vec<Row>>::new();
+        for row in rows {
+            let mut key = Vec::new();
+            for (_, item) in &grouping_items {
+                key.push(PlannerKey(self.eval_expr(&item.expr, &row, params)?));
+            }
+            groups.entry(key).or_default().push(row);
+        }
+        if groups.is_empty() && grouping_items.is_empty() {
+            groups.insert(Vec::new(), Vec::new());
+        }
+
+        let mut output_rows = Vec::new();
+        for (key, group_rows) in groups {
+            let mut projected = Row::default();
+            let mut key_iter = key.into_iter();
+            for (index, item) in items.iter().enumerate() {
+                let value = if aggregate_flags[index] {
+                    self.eval_aggregate_expr(&item.expr, &group_rows, params)?
+                } else {
+                    key_iter
+                        .next()
+                        .map(|value| value.0)
+                        .unwrap_or(RuntimeValue::Null)
+                };
+                projected.insert(columns[index].clone(), value);
+            }
+            output_rows.push(projected);
+        }
+        Ok((columns.to_vec(), output_rows))
+    }
+
+    fn eval_aggregate_expr(
+        &self,
+        expr: &Expr,
+        rows: &[Row],
+        params: &BTreeMap<String, Value>,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        let Expr::FunctionCall { name, args } = expr else {
+            return Err(ExecutionError::new(
+                "function_error",
+                "aggregate expressions must be aggregate function calls",
+            ));
+        };
+        if args.is_empty() && name != "count" {
+            return Err(ExecutionError::new(
+                "function_error",
+                format!("{name}() requires an argument"),
+            ));
+        }
+        match name.as_str() {
+            "count" => {
+                if args.is_empty() {
+                    return Err(ExecutionError::new(
+                        "function_error",
+                        "count() requires an argument",
+                    ));
+                }
+                if matches!(args.as_slice(), [Expr::Wildcard]) {
+                    return Ok(RuntimeValue::Int(rows.len() as i64));
+                }
+                let mut count = 0i64;
+                for row in rows {
+                    let value = self.eval_expr(&args[0], row, params)?;
+                    if value != RuntimeValue::Null {
+                        count += 1;
+                    }
+                }
+                Ok(RuntimeValue::Int(count))
+            }
+            "collect" => rows
+                .iter()
+                .map(|row| self.eval_expr(&args[0], row, params))
+                .collect::<Result<Vec<_>, _>>()
+                .map(RuntimeValue::List),
+            "sum" => sum_aggregate(rows, |row| self.eval_expr(&args[0], row, params)),
+            "avg" => avg_aggregate(rows, |row| self.eval_expr(&args[0], row, params)),
+            "min" => min_max_aggregate(rows, |row| self.eval_expr(&args[0], row, params), true),
+            "max" => min_max_aggregate(rows, |row| self.eval_expr(&args[0], row, params), false),
+            _ => Err(ExecutionError::new(
+                "function_error",
+                format!("unsupported aggregate function {name}"),
+            )),
+        }
+    }
+
+    fn match_pattern_rows(
+        &self,
+        seed_rows: Vec<Row>,
         pattern: &Pattern,
         params: &BTreeMap<String, Value>,
         plan: Option<&MatchPlan>,
     ) -> Result<Vec<Row>, ExecutionError> {
         let mut rows = Vec::new();
-        let planned_nodes = plan.map(|plan| plan.start_candidates.clone());
-        let candidate_ids =
-            planned_nodes.unwrap_or_else(|| self.engine.nodes().map(Node::id).collect::<Vec<_>>());
-        for node_id in candidate_ids {
-            let Some(node) = self.engine.node(node_id) else {
+        let planned_nodes = plan
+            .map(|plan| plan.start_candidates.clone())
+            .unwrap_or_else(|| self.engine.nodes().map(Node::id).collect::<Vec<_>>());
+        for seed_row in seed_rows {
+            if let Some(variable) = &pattern.start.variable
+                && let Some(bound_value) = seed_row.get(variable)
+            {
+                if let RuntimeValue::Node(node_id) = bound_value
+                    && let Some(node) = self.engine.node(*node_id)
+                    && let Some(row) =
+                        self.bind_node_pattern(&seed_row, node, &pattern.start, params)?
+                {
+                    let trace = PathTrace {
+                        nodes: vec![node.id()],
+                        edges: Vec::new(),
+                    };
+                    self.match_segments(
+                        &row,
+                        node.id(),
+                        &pattern.segments,
+                        params,
+                        &mut rows,
+                        pattern.path_variable.as_deref(),
+                        trace,
+                    )?;
+                }
                 continue;
-            };
-            let row = Row::default();
-            if let Some(row) = self.bind_node_pattern(&row, node, &pattern.start, params)? {
-                self.match_segments(&row, node.id(), &pattern.segments, params, &mut rows)?;
+            }
+
+            for node_id in &planned_nodes {
+                let Some(node) = self.engine.node(*node_id) else {
+                    continue;
+                };
+                if let Some(row) =
+                    self.bind_node_pattern(&seed_row, node, &pattern.start, params)?
+                {
+                    let trace = PathTrace {
+                        nodes: vec![node.id()],
+                        edges: Vec::new(),
+                    };
+                    self.match_segments(
+                        &row,
+                        node.id(),
+                        &pattern.segments,
+                        params,
+                        &mut rows,
+                        pattern.path_variable.as_deref(),
+                        trace,
+                    )?;
+                }
             }
         }
         if rows.len() > INTERMEDIATE_ROW_LIMIT {
@@ -847,9 +1123,15 @@ impl Session {
         segments: &[PatternSegment],
         params: &BTreeMap<String, Value>,
         output: &mut Vec<Row>,
+        path_variable: Option<&str>,
+        trace: PathTrace,
     ) -> Result<(), ExecutionError> {
         let Some((segment, remaining_segments)) = segments.split_first() else {
-            output.push(row.clone());
+            let mut final_row = row.clone();
+            if let Some(path_variable) = path_variable {
+                final_row.insert(path_variable.to_owned(), path_runtime_value(&trace));
+            }
+            output.push(final_row);
             return Ok(());
         };
         if segment.edge.hops.is_some() {
@@ -860,6 +1142,8 @@ impl Session {
                 remaining_segments,
                 params,
                 output,
+                path_variable,
+                trace,
             )?;
             return Ok(());
         }
@@ -884,7 +1168,18 @@ impl Session {
             let Some(row) = self.bind_node_pattern(&row, node, &segment.node, params)? else {
                 continue;
             };
-            self.match_segments(&row, next_node, remaining_segments, params, output)?;
+            let mut next_trace = trace.clone();
+            next_trace.edges.push(edge.id());
+            next_trace.nodes.push(next_node);
+            self.match_segments(
+                &row,
+                next_node,
+                remaining_segments,
+                params,
+                output,
+                path_variable,
+                next_trace,
+            )?;
         }
         Ok(())
     }
@@ -897,6 +1192,8 @@ impl Session {
         remaining_segments: &[PatternSegment],
         params: &BTreeMap<String, Value>,
         output: &mut Vec<Row>,
+        path_variable: Option<&str>,
+        trace: PathTrace,
     ) -> Result<(), ExecutionError> {
         if segment.edge.variable.is_some() {
             return Err(ExecutionError::new(
@@ -905,10 +1202,10 @@ impl Session {
             ));
         }
         let hops = segment.edge.hops.expect("checked");
-        let mut queue = VecDeque::from([(current_node, 0u8)]);
+        let mut queue = VecDeque::from([(current_node, 0u8, trace)]);
         let mut seen = BTreeSet::from([(current_node, 0u8)]);
 
-        while let Some((node_id, depth)) = queue.pop_front() {
+        while let Some((node_id, depth, trace)) = queue.pop_front() {
             if depth >= hops.max {
                 continue;
             }
@@ -930,7 +1227,10 @@ impl Session {
                 }
                 let next_depth = depth + 1;
                 if seen.insert((next_node, next_depth)) {
-                    queue.push_back((next_node, next_depth));
+                    let mut next_trace = trace.clone();
+                    next_trace.edges.push(edge.id());
+                    next_trace.nodes.push(next_node);
+                    queue.push_back((next_node, next_depth, next_trace));
                 }
                 if next_depth < hops.min {
                     continue;
@@ -940,10 +1240,39 @@ impl Session {
                 else {
                     continue;
                 };
-                self.match_segments(&bound_row, next_node, remaining_segments, params, output)?;
+                let mut next_trace = trace.clone();
+                next_trace.edges.push(edge.id());
+                next_trace.nodes.push(next_node);
+                self.match_segments(
+                    &bound_row,
+                    next_node,
+                    remaining_segments,
+                    params,
+                    output,
+                    path_variable,
+                    next_trace,
+                )?;
             }
         }
         Ok(())
+    }
+
+    fn merge_pattern_rows(
+        &mut self,
+        rows: Vec<Row>,
+        pattern: &Pattern,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Row>, ExecutionError> {
+        let mut merged_rows = Vec::new();
+        for row in rows {
+            let matches = self.match_pattern_rows(vec![row.clone()], pattern, params, None)?;
+            if matches.is_empty() {
+                merged_rows.extend(self.create_pattern_rows(vec![row], pattern, params)?);
+            } else {
+                merged_rows.extend(matches);
+            }
+        }
+        Ok(merged_rows)
     }
 
     fn create_pattern_rows(
@@ -957,6 +1286,10 @@ impl Session {
             let (row, current_node) = self.realize_node_pattern(row, &pattern.start, params)?;
             let mut row = row;
             let mut current_node = current_node;
+            let mut trace = PathTrace {
+                nodes: vec![current_node],
+                edges: Vec::new(),
+            };
             for segment in &pattern.segments {
                 if segment.edge.hops.is_some() {
                     return Err(ExecutionError::new(
@@ -997,7 +1330,12 @@ impl Session {
                 if let Some(variable) = &segment.edge.variable {
                     row.insert(variable.clone(), RuntimeValue::Edge(edge_id));
                 }
+                trace.edges.push(edge_id);
+                trace.nodes.push(next_node);
                 current_node = next_node;
+            }
+            if let Some(path_variable) = &pattern.path_variable {
+                row.insert(path_variable.clone(), path_runtime_value(&trace));
             }
             created_rows.push(row);
         }
@@ -1293,6 +1631,10 @@ impl Session {
             Expr::String(value) => Ok(RuntimeValue::String(value.clone())),
             Expr::Bytes(value) => Ok(RuntimeValue::Bytes(value.clone())),
             Expr::Datetime(value) => Ok(RuntimeValue::Datetime(*value)),
+            Expr::Wildcard => Err(ExecutionError::new(
+                "function_error",
+                "wildcard expressions are only valid in projection or aggregate contexts",
+            )),
             Expr::Parameter(name) => Ok(params
                 .get(name)
                 .map(runtime_from_value)
@@ -1723,7 +2065,8 @@ impl Statement {
             | Self::CreateConstraint { .. }
             | Self::DropConstraint { .. } => true,
             Self::Query(query) => {
-                query.create_clause.is_some()
+                query.merge_clause.is_some()
+                    || query.create_clause.is_some()
                     || !query.set_clause.is_empty()
                     || !query.remove_clause.is_empty()
                     || !query.delete_clause.is_empty()
@@ -2331,6 +2674,12 @@ fn build_explain_rows(
             if query.where_clause.is_some() {
                 add_explain_child(next_id, rows, id, "Filter", "WHERE");
             }
+            if !query.with_clauses.is_empty() {
+                add_explain_child(next_id, rows, id, "With", "WITH");
+            }
+            if query.merge_clause.is_some() {
+                add_explain_child(next_id, rows, id, "Merge", "pattern");
+            }
             if query.create_clause.is_some() {
                 add_explain_child(next_id, rows, id, "Create", "pattern");
             }
@@ -2343,7 +2692,7 @@ fn build_explain_rows(
             if !query.delete_clause.is_empty() {
                 add_explain_child(next_id, rows, id, "Delete", "variables");
             }
-            if !query.return_clause.is_empty() {
+            if query.return_all || !query.return_clause.is_empty() {
                 add_explain_child(next_id, rows, id, "Project", "RETURN");
             }
             if !query.order_by.is_empty() {
@@ -2543,6 +2892,197 @@ fn format_bound(inclusive: &str, exclusive: &str, bound: &RangeBound) -> String 
         },
         bound.value
     )
+}
+
+fn projection_name_for_with(index: usize, item: &ReturnItem) -> String {
+    item.alias.clone().unwrap_or_else(|| match &item.expr {
+        Expr::Variable(name) => name.clone(),
+        _ => format!("col_{}", index + 1),
+    })
+}
+
+fn projection_name_for_return(index: usize, item: &ReturnItem) -> String {
+    item.alias
+        .clone()
+        .unwrap_or_else(|| format!("col_{}", index + 1))
+}
+
+fn path_runtime_value(trace: &PathTrace) -> RuntimeValue {
+    RuntimeValue::Map(vec![
+        (
+            "nodes".to_owned(),
+            RuntimeValue::List(
+                trace
+                    .nodes
+                    .iter()
+                    .copied()
+                    .map(RuntimeValue::Node)
+                    .collect(),
+            ),
+        ),
+        (
+            "edges".to_owned(),
+            RuntimeValue::List(
+                trace
+                    .edges
+                    .iter()
+                    .copied()
+                    .map(RuntimeValue::Edge)
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, .. } if is_aggregate_function(name) => true,
+        Expr::Property(base, _) => expr_contains_aggregate(base),
+        Expr::Index { target, index } => {
+            expr_contains_aggregate(target) || expr_contains_aggregate(index)
+        }
+        Expr::List(values) => values.iter().any(expr_contains_aggregate),
+        Expr::Map(entries) => entries
+            .iter()
+            .any(|(_, value)| expr_contains_aggregate(value)),
+        Expr::Unary { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Binary { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::IsNull { expr, .. } => expr_contains_aggregate(expr),
+        Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_aggregate),
+        _ => false,
+    }
+}
+
+fn aggregate_expression_is_invalid(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args } if is_aggregate_function(name) => {
+            args.iter().any(expr_contains_aggregate)
+        }
+        _ => expr_contains_aggregate(expr),
+    }
+}
+
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(name, "count" | "sum" | "avg" | "min" | "max" | "collect")
+}
+
+fn sum_aggregate<F>(rows: &[Row], mut value_fn: F) -> Result<RuntimeValue, ExecutionError>
+where
+    F: FnMut(&Row) -> Result<RuntimeValue, ExecutionError>,
+{
+    let mut int_sum = 0i64;
+    let mut float_sum = 0f64;
+    let mut kind = None::<&'static str>;
+    for row in rows {
+        match value_fn(row)? {
+            RuntimeValue::Null => {}
+            RuntimeValue::Int(value) => match kind {
+                None | Some("int") => {
+                    int_sum += value;
+                    kind = Some("int");
+                }
+                Some(_) => {
+                    return Err(ExecutionError::new(
+                        "function_error",
+                        "sum() requires numeric values of one type",
+                    ));
+                }
+            },
+            RuntimeValue::Float(value) => match kind {
+                None | Some("float") => {
+                    float_sum += value;
+                    kind = Some("float");
+                }
+                Some(_) => {
+                    return Err(ExecutionError::new(
+                        "function_error",
+                        "sum() requires numeric values of one type",
+                    ));
+                }
+            },
+            _ => {
+                return Err(ExecutionError::new(
+                    "function_error",
+                    "sum() requires numeric values",
+                ));
+            }
+        }
+    }
+    Ok(match kind {
+        Some("int") => RuntimeValue::Int(int_sum),
+        Some("float") => RuntimeValue::Float(float_sum),
+        _ => RuntimeValue::Null,
+    })
+}
+
+fn avg_aggregate<F>(rows: &[Row], mut value_fn: F) -> Result<RuntimeValue, ExecutionError>
+where
+    F: FnMut(&Row) -> Result<RuntimeValue, ExecutionError>,
+{
+    let mut sum = 0f64;
+    let mut count = 0usize;
+    for row in rows {
+        match value_fn(row)? {
+            RuntimeValue::Null => {}
+            RuntimeValue::Int(value) => {
+                sum += value as f64;
+                count += 1;
+            }
+            RuntimeValue::Float(value) => {
+                sum += value;
+                count += 1;
+            }
+            _ => {
+                return Err(ExecutionError::new(
+                    "function_error",
+                    "avg() requires numeric values",
+                ));
+            }
+        }
+    }
+    if count == 0 {
+        Ok(RuntimeValue::Null)
+    } else {
+        Ok(RuntimeValue::Float(sum / count as f64))
+    }
+}
+
+fn min_max_aggregate<F>(
+    rows: &[Row],
+    mut value_fn: F,
+    min: bool,
+) -> Result<RuntimeValue, ExecutionError>
+where
+    F: FnMut(&Row) -> Result<RuntimeValue, ExecutionError>,
+{
+    let mut selected = None::<RuntimeValue>;
+    for row in rows {
+        let value = value_fn(row)?;
+        if value == RuntimeValue::Null {
+            continue;
+        }
+        match &selected {
+            None => selected = Some(value),
+            Some(current)
+                if same_runtime_type(&value, current)
+                    && ((min && compare_runtime_values(&value, current) == Ordering::Less)
+                        || (!min
+                            && compare_runtime_values(&value, current) == Ordering::Greater)) =>
+            {
+                selected = Some(value);
+            }
+            Some(current) if !same_runtime_type(&value, current) => {
+                return Err(ExecutionError::new(
+                    "function_error",
+                    "min()/max() require comparable values of one type",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(selected.unwrap_or(RuntimeValue::Null))
 }
 
 fn show_kind_detail(kind: &ShowKind) -> String {
