@@ -9,8 +9,8 @@ pub use graph::{CupldEngine, Edge, GraphError, GraphSnapshot, GraphStats, Node};
 pub use ids::{EdgeId, NodeId, TxId};
 pub use properties::PropertyMap;
 pub use schema::{
-    ConstraintRow, ConstraintType, IndexRow, PropertyType, SchemaCatalog, SchemaObjectOptions,
-    SchemaRow, SchemaTarget, TargetKind,
+    ConstraintRow, ConstraintType, IndexKind, IndexRow, PropertyType, SchemaCatalog,
+    SchemaObjectOptions, SchemaRow, SchemaTarget, TargetKind,
 };
 pub use value::Value;
 

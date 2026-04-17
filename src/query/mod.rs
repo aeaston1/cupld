@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::engine::{IndexStatus, PropertyType, SchemaTarget, TargetKind};
+use crate::engine::{IndexKind, IndexStatus, PropertyType, SchemaTarget, TargetKind};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +36,7 @@ pub enum Statement {
         name: Option<ParamValue>,
         target: SchemaTargetExpr,
         property: ParamValue,
+        kind: IndexKind,
         if_not_exists: bool,
         or_replace: bool,
     },
@@ -663,10 +664,16 @@ impl Parser {
             self.expect_token(TokenDiscriminant::LParen)?;
             let property = self.expect_param_value()?;
             self.expect_token(TokenDiscriminant::RParen)?;
+            let kind = if self.consume_keyword("KIND")? {
+                self.parse_index_kind()?
+            } else {
+                IndexKind::Equality
+            };
             return Ok(Statement::CreateIndex {
                 name,
                 target,
                 property,
+                kind,
                 if_not_exists,
                 or_replace,
             });
@@ -1446,6 +1453,19 @@ impl Parser {
             _ => self.error_here(
                 "parse_index_status",
                 "expected READY, BUILDING, or INVALID",
+            ),
+        }
+    }
+
+    fn parse_index_kind(&mut self) -> Result<IndexKind, QueryError> {
+        match self.expect_identifier()?.as_str() {
+            "EQ" | "eq" => Ok(IndexKind::Equality),
+            "RANGE" | "range" => Ok(IndexKind::Range),
+            "LIST" | "list" => Ok(IndexKind::ListMembership),
+            "FULLTEXT" | "fulltext" => Ok(IndexKind::FullText),
+            _ => self.error_here(
+                "parse_index_kind",
+                "expected EQ, RANGE, LIST, or FULLTEXT",
             ),
         }
     }
@@ -2503,7 +2523,7 @@ mod tests {
         BinaryOp, ConstraintSpec, Expr, ParamValue, PropertyTarget, Query, RemoveTarget,
         SchemaTargetExpr, SetOperator, SetTarget, ShowKind, Statement, parse_script,
     };
-    use crate::engine::{PropertyType, SchemaTarget};
+    use crate::engine::{IndexKind, PropertyType, SchemaTarget};
 
     #[test]
     fn parses_schema_statements_and_show_commands() {
@@ -2535,6 +2555,7 @@ mod tests {
                     name: None,
                     target: SchemaTargetExpr::label(ParamValue::Literal("Person".to_owned())),
                     property: ParamValue::Literal("email".to_owned()),
+                    kind: IndexKind::Equality,
                     if_not_exists: false,
                     or_replace: false,
                 },

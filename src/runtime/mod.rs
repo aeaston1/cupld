@@ -48,6 +48,16 @@ enum MatchAccessPath {
         lower: Option<RangeBound>,
         upper: Option<RangeBound>,
     },
+    NodeListIndexScan {
+        target: SchemaTarget,
+        property: String,
+        value: RuntimeValue,
+    },
+    NodeFullTextIndexScan {
+        target: SchemaTarget,
+        property: String,
+        term: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +80,8 @@ enum ConstraintKind {
     Lte,
     Gt,
     Gte,
+    ListContains,
+    FullTextContains,
 }
 
 #[derive(Clone, Debug)]
@@ -482,6 +494,7 @@ impl Session {
                 name,
                 target,
                 property,
+                kind,
                 if_not_exists,
                 or_replace,
             } => {
@@ -493,6 +506,7 @@ impl Session {
                         resolved_name.as_deref(),
                         resolved_target,
                         &resolved_property,
+                        *kind,
                         *if_not_exists,
                         *or_replace,
                     )
@@ -650,7 +664,9 @@ impl Session {
             let target = SchemaTarget::label(label.clone());
             for constraint in &equality_constraints {
                 if constraint.kind == ConstraintKind::Eq
-                    && schema.find_index(&target, &constraint.property).is_some()
+                    && schema
+                        .find_index(&target, &constraint.property, crate::engine::IndexKind::Equality)
+                        .is_some()
                 {
                     let start_candidates = self.index_seek_candidates(
                         &target,
@@ -670,7 +686,9 @@ impl Session {
 
             let range_constraints = fold_range_constraints(&equality_constraints);
             for (property, bounds) in range_constraints {
-                if schema.find_index(&target, &property).is_some()
+                if schema
+                    .find_index(&target, &property, crate::engine::IndexKind::Range)
+                    .is_some()
                     && (bounds.lower.is_some() || bounds.upper.is_some())
                 {
                     let start_candidates = self.index_range_candidates(
@@ -685,6 +703,53 @@ impl Session {
                             property,
                             lower: bounds.lower,
                             upper: bounds.upper,
+                        },
+                        start_candidates,
+                    }));
+                }
+            }
+
+            for constraint in &equality_constraints {
+                if constraint.kind == ConstraintKind::ListContains
+                    && schema
+                        .find_index(
+                            &target,
+                            &constraint.property,
+                            crate::engine::IndexKind::ListMembership,
+                        )
+                        .is_some()
+                {
+                    let start_candidates = self.list_index_candidates(
+                        &target,
+                        &constraint.property,
+                        &constraint.value,
+                    );
+                    return Ok(Some(MatchPlan {
+                        access: MatchAccessPath::NodeListIndexScan {
+                            target,
+                            property: constraint.property.clone(),
+                            value: constraint.value.clone(),
+                        },
+                        start_candidates,
+                    }));
+                }
+                if constraint.kind == ConstraintKind::FullTextContains
+                    && schema
+                        .find_index(
+                            &target,
+                            &constraint.property,
+                            crate::engine::IndexKind::FullText,
+                        )
+                        .is_some()
+                    && let RuntimeValue::String(term) = &constraint.value
+                {
+                    let start_candidates =
+                        self.full_text_index_candidates(&target, &constraint.property, term);
+                    return Ok(Some(MatchPlan {
+                        access: MatchAccessPath::NodeFullTextIndexScan {
+                            target,
+                            property: constraint.property.clone(),
+                            term: term.clone(),
                         },
                         start_candidates,
                     }));
@@ -731,6 +796,17 @@ impl Session {
                 self.collect_property_constraints(left, variable, params, output);
                 self.collect_property_constraints(right, variable, params, output);
             }
+            Expr::Binary {
+                left,
+                op: BinaryOp::In,
+                right,
+            } => {
+                if let Some(constraint) =
+                    self.property_membership_constraint(right, left, variable, params)
+                {
+                    output.push(constraint);
+                }
+            }
             Expr::Binary { left, op, right } => {
                 if let Some(constraint) =
                     self.property_constraint_from_binary(left, *op, right, variable, params)
@@ -750,6 +826,28 @@ impl Session {
         }
     }
 
+    fn property_membership_constraint(
+        &self,
+        property_side: &Expr,
+        value_side: &Expr,
+        variable: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Option<PropertyConstraint> {
+        let property = match property_side {
+            Expr::Property(base, property) => match &**base {
+                Expr::Variable(name) if name == variable => property.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let value = self.eval_expr(value_side, &Row::default(), params).ok()?;
+        Some(PropertyConstraint {
+            property,
+            kind: ConstraintKind::ListContains,
+            value,
+        })
+    }
+
     fn property_constraint_from_binary(
         &self,
         property_side: &Expr,
@@ -765,7 +863,25 @@ impl Session {
             },
             _ => return None,
         };
-        let kind = constraint_kind_from_binary(op)?;
+        let kind = match op {
+            BinaryOp::Contains => match self.eval_expr(value_side, &Row::default(), params).ok()? {
+                RuntimeValue::String(value) => {
+                    return Some(PropertyConstraint {
+                        property,
+                        kind: ConstraintKind::FullTextContains,
+                        value: RuntimeValue::String(value),
+                    });
+                }
+                value => {
+                    return Some(PropertyConstraint {
+                        property,
+                        kind: ConstraintKind::ListContains,
+                        value,
+                    });
+                }
+            },
+            _ => constraint_kind_from_binary(op)?,
+        };
         let value = self.eval_expr(value_side, &Row::default(), params).ok()?;
         Some(PropertyConstraint {
             property,
@@ -798,6 +914,51 @@ impl Session {
             .into_iter()
             .filter(|(value, _)| range_matches(&value.0, lower, upper))
             .flat_map(|(_, ids)| ids.into_iter())
+            .collect()
+    }
+
+    fn list_index_candidates(
+        &self,
+        target: &SchemaTarget,
+        property: &str,
+        value: &RuntimeValue,
+    ) -> Vec<NodeId> {
+        if target.kind() != crate::engine::TargetKind::Label {
+            return Vec::new();
+        }
+        self.engine
+            .nodes()
+            .filter(|node| node.labels().contains(target.name()))
+            .filter(|node| {
+                matches!(
+                    node.property(property),
+                    Some(Value::List(values)) if values.iter().map(runtime_from_value).any(|entry| entry == *value)
+                )
+            })
+            .map(Node::id)
+            .collect()
+    }
+
+    fn full_text_index_candidates(
+        &self,
+        target: &SchemaTarget,
+        property: &str,
+        term: &str,
+    ) -> Vec<NodeId> {
+        if target.kind() != crate::engine::TargetKind::Label {
+            return Vec::new();
+        }
+        let needle = term.to_ascii_lowercase();
+        self.engine
+            .nodes()
+            .filter(|node| node.labels().contains(target.name()))
+            .filter(|node| {
+                matches!(
+                    node.property(property),
+                    Some(Value::String(value)) if value.to_ascii_lowercase().contains(&needle)
+                )
+            })
+            .map(Node::id)
             .collect()
     }
 
@@ -1920,18 +2081,44 @@ impl Session {
         property: &str,
     ) -> Result<RuntimeValue, ExecutionError> {
         match value {
-            RuntimeValue::Node(node_id) => Ok(self
-                .engine
-                .node(*node_id)
-                .and_then(|node| node.property(property))
-                .map(runtime_from_value)
-                .unwrap_or(RuntimeValue::Null)),
+            RuntimeValue::Node(node_id) => Ok(match self.engine.node(*node_id) {
+                Some(node) => match node.property(property) {
+                    Some(value) => runtime_from_value(value),
+                    None => match property {
+                        "valid_from" => node
+                            .valid_from()
+                            .map(RuntimeValue::Datetime)
+                            .unwrap_or(RuntimeValue::Null),
+                        "valid_to" => node
+                            .valid_to()
+                            .map(RuntimeValue::Datetime)
+                            .unwrap_or(RuntimeValue::Null),
+                        _ => RuntimeValue::Null,
+                    },
+                },
+                None => RuntimeValue::Null,
+            }),
             RuntimeValue::Edge(edge_id) => Ok(self
                 .engine
                 .edge(*edge_id)
                 .and_then(|edge| edge.property(property))
                 .map(runtime_from_value)
-                .unwrap_or(RuntimeValue::Null)),
+                .unwrap_or_else(|| {
+                    self.engine
+                        .edge(*edge_id)
+                        .map(|edge| match property {
+                            "valid_from" => edge
+                                .valid_from()
+                                .map(RuntimeValue::Datetime)
+                                .unwrap_or(RuntimeValue::Null),
+                            "valid_to" => edge
+                                .valid_to()
+                                .map(RuntimeValue::Datetime)
+                                .unwrap_or(RuntimeValue::Null),
+                            _ => RuntimeValue::Null,
+                        })
+                        .unwrap_or(RuntimeValue::Null)
+                })),
             RuntimeValue::Map(entries) => Ok(entries
                 .iter()
                 .find(|(key, _)| key == property)
@@ -2854,6 +3041,7 @@ fn show_indexes_result(rows: Vec<IndexRow>) -> QueryResult {
             "property",
             "unique",
             "status",
+            "kind",
         ],
         rows.into_iter()
             .map(|row| {
@@ -2864,6 +3052,7 @@ fn show_indexes_result(rows: Vec<IndexRow>) -> QueryResult {
                     RuntimeValue::String(row.property),
                     RuntimeValue::Bool(row.unique),
                     RuntimeValue::String(row.status),
+                    RuntimeValue::String(row.kind),
                 ]
             })
             .collect(),
@@ -3133,6 +3322,7 @@ fn fold_range_constraints(
                     slot.upper = Some(candidate);
                 }
             }
+            ConstraintKind::ListContains | ConstraintKind::FullTextContains => {}
         }
     }
     ranges
@@ -3202,6 +3392,8 @@ fn match_plan_operator(plan: &MatchPlan) -> &'static str {
         MatchAccessPath::NodeScan { .. } => "NodeScan",
         MatchAccessPath::NodeIndexSeek { .. } => "NodeIndexSeek",
         MatchAccessPath::NodeIndexRangeScan { .. } => "NodeIndexRangeScan",
+        MatchAccessPath::NodeListIndexScan { .. } => "NodeListIndexScan",
+        MatchAccessPath::NodeFullTextIndexScan { .. } => "NodeFullTextIndexScan",
     }
 }
 
@@ -3231,6 +3423,16 @@ fn match_plan_detail(plan: &MatchPlan) -> String {
                 .map(|bound| format_bound("<=", "<", bound))
                 .unwrap_or_else(|| "+inf".to_owned())
         ),
+        MatchAccessPath::NodeListIndexScan {
+            target,
+            property,
+            value,
+        } => format!("{}({}) contains {:?}", target.display_target(), property, value),
+        MatchAccessPath::NodeFullTextIndexScan {
+            target,
+            property,
+            term,
+        } => format!("{}({}) fulltext {:?}", target.display_target(), property, term),
     }
 }
 

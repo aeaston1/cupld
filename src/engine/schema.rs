@@ -178,11 +178,40 @@ impl IndexStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexKind {
+    Equality,
+    Range,
+    ListMembership,
+    FullText,
+}
+
+impl IndexKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Equality => "eq",
+            Self::Range => "range",
+            Self::ListMembership => "list",
+            Self::FullText => "fulltext",
+        }
+    }
+
+    pub fn ddl_fragment(self) -> Option<&'static str> {
+        match self {
+            Self::Equality => None,
+            Self::Range => Some("RANGE"),
+            Self::ListMembership => Some("LIST"),
+            Self::FullText => Some("FULLTEXT"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexDefinition {
     name: String,
     target: SchemaTarget,
     property: String,
+    kind: IndexKind,
     unique: bool,
     status: IndexStatus,
     owned_by_constraint: Option<String>,
@@ -193,6 +222,7 @@ impl IndexDefinition {
         name: String,
         target: SchemaTarget,
         property: String,
+        kind: IndexKind,
         unique: bool,
         status: IndexStatus,
         owned_by_constraint: Option<String>,
@@ -201,6 +231,7 @@ impl IndexDefinition {
             name,
             target,
             property,
+            kind,
             unique,
             status,
             owned_by_constraint,
@@ -223,6 +254,10 @@ impl IndexDefinition {
         self.unique
     }
 
+    pub fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
     pub fn status(&self) -> IndexStatus {
         self.status
     }
@@ -232,12 +267,17 @@ impl IndexDefinition {
     }
 
     pub fn canonical_ddl(&self) -> String {
-        format!(
+        let mut ddl = format!(
             "CREATE INDEX {} ON {}({})",
             self.name,
             self.target.display_target(),
             self.property
-        )
+        );
+        if let Some(kind) = self.kind.ddl_fragment() {
+            ddl.push_str(" KIND ");
+            ddl.push_str(kind);
+        }
+        ddl
     }
 }
 
@@ -420,16 +460,18 @@ impl SchemaCatalog {
         name: Option<String>,
         target: SchemaTarget,
         property: String,
+        kind: IndexKind,
         unique: bool,
         owned_by_constraint: Option<String>,
     ) -> String {
         let name = name.unwrap_or_else(|| {
-            generated_name("idx", target.kind(), target.name(), &property, Some("eq"))
+            generated_name("idx", target.kind(), target.name(), &property, Some(kind.as_str()))
         });
         let definition = IndexDefinition::new(
             name.clone(),
             target,
             property,
+            kind,
             unique,
             IndexStatus::Ready,
             owned_by_constraint,
@@ -502,10 +544,16 @@ impl SchemaCatalog {
         self.indexes.get(name)
     }
 
-    pub fn find_index(&self, target: &SchemaTarget, property: &str) -> Option<&IndexDefinition> {
+    pub fn find_index(
+        &self,
+        target: &SchemaTarget,
+        property: &str,
+        kind: IndexKind,
+    ) -> Option<&IndexDefinition> {
         self.indexes.values().find(|index| {
             index.target() == target
                 && index.property() == property
+                && index.kind() == kind
                 && index.status() == IndexStatus::Ready
         })
     }
@@ -586,6 +634,7 @@ impl SchemaCatalog {
                 property: index.property.clone(),
                 unique: index.unique,
                 status: index.status.as_str().to_owned(),
+                kind: index.kind.as_str().to_owned(),
             })
             .collect()
     }
@@ -624,6 +673,7 @@ impl SchemaCatalog {
                     name: index.name.clone(),
                     target: index.target.clone(),
                     property: index.property.clone(),
+                    kind: index.kind,
                     unique: index.unique,
                     status: index.status,
                     owned_by_constraint: index.owned_by_constraint.clone(),
@@ -661,6 +711,7 @@ impl SchemaCatalog {
                             index.name,
                             index.target,
                             index.property,
+                            index.kind,
                             index.unique,
                             index.status,
                             index.owned_by_constraint,
@@ -703,6 +754,7 @@ pub struct IndexRow {
     pub property: String,
     pub unique: bool,
     pub status: String,
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

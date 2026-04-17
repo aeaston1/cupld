@@ -5,14 +5,15 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::{
-    ConstraintState, CupldEngine, EdgeState, EngineState, GraphError, IndexState, IndexStatus,
-    NodeState, PropertyMap, SchemaObjectState, SchemaState, Value,
+    ConstraintState, CupldEngine, EdgeState, EngineState, GraphError, IndexKind, IndexState,
+    IndexStatus, NodeState, PropertyMap, SchemaObjectState, SchemaState, Value,
 };
 
 const MAGIC: &[u8; 8] = b"CUPLD01\0";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const COMPAT_VERSION: u32 = 1;
-const PREVIOUS_FORMAT_VERSION: u32 = 1;
+const PREVIOUS_FORMAT_VERSION: u32 = 2;
+const OLDER_FORMAT_VERSION: u32 = 1;
 const LEGACY_FORMAT_VERSION: u32 = 0;
 const LEGACY_COMPAT_VERSION: u32 = 0;
 const HEADER_SIZE: usize = 128;
@@ -41,6 +42,7 @@ enum StorageErrorKind {
     FileMagic,
     FileVersion,
     DecodeEof,
+    IndexKind,
     IndexStatus,
     PropertyType,
     SchemaTarget,
@@ -60,6 +62,7 @@ impl StorageErrorKind {
             Self::FileMagic => "file_magic",
             Self::FileVersion => "file_version",
             Self::DecodeEof => "decode_eof",
+            Self::IndexKind => "index_kind",
             Self::IndexStatus => "index_status",
             Self::PropertyType => "property_type",
             Self::SchemaTarget => "schema_target",
@@ -80,6 +83,7 @@ impl From<&'static str> for StorageErrorKind {
             "file_magic" => Self::FileMagic,
             "file_version" => Self::FileVersion,
             "decode_eof" => Self::DecodeEof,
+            "index_kind" => Self::IndexKind,
             "index_status" => Self::IndexStatus,
             "property_type" => Self::PropertyType,
             "schema_target" => Self::SchemaTarget,
@@ -415,6 +419,15 @@ fn plan_migration(format: StorageFormatVersion) -> Result<MigrationPlan, Storage
             },
         });
     }
+    if format.version == OLDER_FORMAT_VERSION && format.compat == COMPAT_VERSION {
+        return Ok(MigrationPlan {
+            rewrite_header: true,
+            target: StorageFormatVersion {
+                version: FORMAT_VERSION,
+                compat: COMPAT_VERSION,
+            },
+        });
+    }
     if format.version == LEGACY_FORMAT_VERSION && format.compat == LEGACY_COMPAT_VERSION {
         return Ok(MigrationPlan {
             rewrite_header: true,
@@ -482,6 +495,8 @@ fn encode_state(state: &EngineState) -> Result<Vec<u8>, StorageError> {
         push_u64(&mut bytes, node.id);
         push_strings(&mut bytes, &node.labels);
         encode_property_map(&mut bytes, node.properties.iter())?;
+        push_optional_system_time(&mut bytes, node.valid_from);
+        push_optional_system_time(&mut bytes, node.valid_to);
     }
     push_u32(&mut bytes, state.edges.len() as u32);
     for edge in &state.edges {
@@ -490,6 +505,8 @@ fn encode_state(state: &EngineState) -> Result<Vec<u8>, StorageError> {
         push_u64(&mut bytes, edge.to);
         push_string(&mut bytes, &edge.edge_type);
         encode_property_map(&mut bytes, edge.properties.iter())?;
+        push_optional_system_time(&mut bytes, edge.valid_from);
+        push_optional_system_time(&mut bytes, edge.valid_to);
     }
     Ok(bytes)
 }
@@ -507,6 +524,16 @@ fn decode_state(bytes: &[u8], format: StorageFormatVersion) -> Result<EngineStat
             id: read_u64(bytes, &mut cursor)?,
             labels: read_strings(bytes, &mut cursor)?,
             properties: decode_property_map(bytes, &mut cursor)?,
+            valid_from: if format.version >= FORMAT_VERSION {
+                read_optional_system_time(bytes, &mut cursor)?
+            } else {
+                None
+            },
+            valid_to: if format.version >= FORMAT_VERSION {
+                read_optional_system_time(bytes, &mut cursor)?
+            } else {
+                None
+            },
         });
     }
     let edge_count = read_u32(bytes, &mut cursor)? as usize;
@@ -518,6 +545,16 @@ fn decode_state(bytes: &[u8], format: StorageFormatVersion) -> Result<EngineStat
             to: read_u64(bytes, &mut cursor)?,
             edge_type: read_string(bytes, &mut cursor)?,
             properties: decode_property_map(bytes, &mut cursor)?,
+            valid_from: if format.version >= FORMAT_VERSION {
+                read_optional_system_time(bytes, &mut cursor)?
+            } else {
+                None
+            },
+            valid_to: if format.version >= FORMAT_VERSION {
+                read_optional_system_time(bytes, &mut cursor)?
+            } else {
+                None
+            },
         });
     }
     Ok(EngineState {
@@ -543,6 +580,15 @@ fn encode_schema_state(output: &mut Vec<u8>, state: &SchemaState) {
         push_string(output, &index.name);
         push_schema_target(output, &index.target);
         push_string(output, &index.property);
+        push_u8(
+            output,
+            match index.kind {
+                IndexKind::Equality => 0,
+                IndexKind::Range => 1,
+                IndexKind::ListMembership => 2,
+                IndexKind::FullText => 3,
+            },
+        );
         push_bool(output, index.unique);
         push_u8(
             output,
@@ -589,7 +635,7 @@ fn decode_schema_state(
 ) -> Result<SchemaState, StorageError> {
     let labels = read_strings(bytes, cursor)?;
     let edge_types = read_strings(bytes, cursor)?;
-    let object_options = if format.version >= FORMAT_VERSION {
+    let object_options = if format.version >= PREVIOUS_FORMAT_VERSION {
         let object_count = read_u32(bytes, cursor)? as usize;
         let mut object_options = Vec::with_capacity(object_count);
         for _ in 0..object_count {
@@ -609,6 +655,17 @@ fn decode_schema_state(
             name: read_string(bytes, cursor)?,
             target: read_schema_target(bytes, cursor)?,
             property: read_string(bytes, cursor)?,
+            kind: if format.version >= FORMAT_VERSION {
+                match read_u8(bytes, cursor)? {
+                    0 => IndexKind::Equality,
+                    1 => IndexKind::Range,
+                    2 => IndexKind::ListMembership,
+                    3 => IndexKind::FullText,
+                    _ => return Err(StorageError::new("index_kind", "invalid index kind")),
+                }
+            } else {
+                IndexKind::Equality
+            },
             unique: read_bool(bytes, cursor)?,
             status: match read_u8(bytes, cursor)? {
                 0 => IndexStatus::Ready,
@@ -817,6 +874,28 @@ fn file_uuid() -> [u8; 16] {
     (nanos ^ (pid << 64)).to_le_bytes()
 }
 
+fn push_optional_system_time(output: &mut Vec<u8>, value: Option<SystemTime>) {
+    push_bool(output, value.is_some());
+    if let Some(value) = value {
+        let (secs, nanos) = system_time_parts(value);
+        push_i64(output, secs);
+        push_u32(output, nanos);
+    }
+}
+
+fn read_optional_system_time(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<Option<SystemTime>, StorageError> {
+    if !read_bool(bytes, cursor)? {
+        return Ok(None);
+    }
+    Ok(Some(system_time_from_parts(
+        read_i64(bytes, cursor)?,
+        read_u32(bytes, cursor)?,
+    )))
+}
+
 fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let mut file = fs::File::create(path)?;
     file.write_all(bytes)?;
@@ -983,12 +1062,87 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        COMPAT_VERSION, FORMAT_VERSION, append_commit, check, compact, load, save_compacted,
+        COMPAT_VERSION, FileHeader, FORMAT_VERSION, HEADER_SIZE, IndexStatus, StorageError,
+        append_commit, assemble_file, check, checksum, compact, encode_property_map, file_uuid,
+        load, push_bool, push_optional_string, push_property_type, push_schema_target, push_string,
+        push_strings, push_u32, push_u64, push_u8, save_compacted,
     };
+    use crate::engine::{EngineState, IndexKind};
     use crate::runtime::Session;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{}_{}.cupld", name, std::process::id()))
+    }
+
+    fn encode_state_v2(state: &EngineState) -> Result<Vec<u8>, StorageError> {
+        let mut bytes = Vec::new();
+        push_u64(&mut bytes, state.next_tx_id);
+        push_u64(&mut bytes, state.next_node_id);
+        push_u64(&mut bytes, state.next_edge_id);
+        push_strings(&mut bytes, &state.schema.labels);
+        push_strings(&mut bytes, &state.schema.edge_types);
+        push_u32(&mut bytes, state.schema.object_options.len() as u32);
+        for object in &state.schema.object_options {
+            push_schema_target(&mut bytes, &object.target);
+            push_optional_string(&mut bytes, object.description.as_deref());
+        }
+        push_u32(&mut bytes, state.schema.indexes.len() as u32);
+        for index in &state.schema.indexes {
+            push_string(&mut bytes, &index.name);
+            push_schema_target(&mut bytes, &index.target);
+            push_string(&mut bytes, &index.property);
+            push_bool(&mut bytes, index.unique);
+            push_u8(
+                &mut bytes,
+                match index.status {
+                    IndexStatus::Ready => 0,
+                    IndexStatus::Building => 1,
+                    IndexStatus::Invalid => 2,
+                },
+            );
+            push_optional_string(&mut bytes, index.owned_by_constraint.as_deref());
+        }
+        push_u32(&mut bytes, state.schema.constraints.len() as u32);
+        for constraint in &state.schema.constraints {
+            push_string(&mut bytes, &constraint.name);
+            push_schema_target(&mut bytes, &constraint.target);
+            push_string(&mut bytes, &constraint.property);
+            match &constraint.constraint_type {
+                crate::engine::ConstraintType::Unique => push_u8(&mut bytes, 0),
+                crate::engine::ConstraintType::Required => push_u8(&mut bytes, 1),
+                crate::engine::ConstraintType::Type(kind) => {
+                    push_u8(&mut bytes, 2);
+                    push_property_type(&mut bytes, *kind);
+                }
+                crate::engine::ConstraintType::Endpoints {
+                    from_label,
+                    to_label,
+                } => {
+                    push_u8(&mut bytes, 3);
+                    push_string(&mut bytes, from_label);
+                    push_string(&mut bytes, to_label);
+                }
+                crate::engine::ConstraintType::MaxOutgoing(limit) => {
+                    push_u8(&mut bytes, 4);
+                    push_u32(&mut bytes, *limit as u32);
+                }
+            }
+        }
+        push_u32(&mut bytes, state.nodes.len() as u32);
+        for node in &state.nodes {
+            push_u64(&mut bytes, node.id);
+            push_strings(&mut bytes, &node.labels);
+            encode_property_map(&mut bytes, node.properties.iter())?;
+        }
+        push_u32(&mut bytes, state.edges.len() as u32);
+        for edge in &state.edges {
+            push_u64(&mut bytes, edge.id);
+            push_u64(&mut bytes, edge.from);
+            push_u64(&mut bytes, edge.to);
+            push_string(&mut bytes, &edge.edge_type);
+            encode_property_map(&mut bytes, edge.properties.iter())?;
+        }
+        Ok(bytes)
     }
 
     #[test]
@@ -1078,6 +1232,53 @@ mod tests {
 
         let error = check(&path).unwrap_err();
         assert_eq!(error.code(), "file_version");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_v2_defaults_for_index_kinds_and_temporal_validity() {
+        let path = temp_path("cupld_storage_v2_defaults");
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script("CREATE (:Doc {title: 'Legacy', published: 2024})", &BTreeMap::new())
+            .unwrap();
+        session
+            .execute_script("CREATE INDEX ON :Doc(published)", &BTreeMap::new())
+            .unwrap();
+
+        let snapshot = encode_state_v2(&session.engine().to_state()).unwrap();
+        let header = FileHeader {
+            clean: true,
+            db_uuid: file_uuid(),
+            snapshot_offset: HEADER_SIZE as u64,
+            snapshot_len: snapshot.len() as u64,
+            wal_offset: (HEADER_SIZE + snapshot.len()) as u64,
+            wal_len: 0,
+            last_tx_id: session.engine().snapshot().tx_id().get(),
+            snapshot_checksum: checksum(&snapshot),
+            wal_checksum: checksum(&[]),
+        };
+        let bytes = assemble_file(&header, &snapshot, &[]);
+        let mut bytes = bytes;
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let (engine, _) = load(&path).unwrap();
+        let node = engine.nodes().next().unwrap();
+        assert_eq!(node.valid_from(), None);
+        assert_eq!(node.valid_to(), None);
+        let index = engine.schema_catalog().indexes().next().unwrap();
+        assert_eq!(index.kind(), IndexKind::Equality);
+
+        let checked = check(&path).unwrap();
+        assert_eq!(checked.wal_records, 0);
+        let migrated = fs::read(&path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(migrated[8..12].try_into().unwrap()),
+            FORMAT_VERSION
+        );
 
         let _ = fs::remove_file(path);
     }

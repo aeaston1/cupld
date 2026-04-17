@@ -1,6 +1,7 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use cupld::{PropertyMap, RuntimeValue, Session, Value};
 
@@ -404,7 +405,7 @@ fn explain_uses_index_seek_and_range_scan() {
     let db = TestDb::new("planner_wave3");
     let mut session = db.open();
     seed_person_graph(&mut session);
-    run(&mut session, "CREATE INDEX ON :Person(age)");
+    run(&mut session, "CREATE INDEX ON :Person(age) KIND RANGE");
 
     let explain_seek = run(
         &mut session,
@@ -803,4 +804,135 @@ fn wave5_edge_endpoint_and_cardinality_constraints_validate_existing_data() {
         )
         .unwrap_err();
     assert_eq!(cardinality_error.code(), "constraint_cardinality_violation");
+}
+
+#[test]
+fn wave6_index_kinds_and_temporal_fields_survive_reopen() {
+    let db = TestDb::new("wave6_indexes");
+    let mut session = db.open();
+
+    run(
+        &mut session,
+        "CREATE (:Article {
+            title: 'Rust Systems',
+            published: 2024,
+            tags: ['rust', 'systems'],
+            body: 'Rust systems programming and compiler work'
+        })",
+    );
+    run(
+        &mut session,
+        "CREATE (:Article {
+            title: 'Graph Search',
+            published: 2022,
+            tags: ['graphs', 'query'],
+            body: 'Query planners and storage indexes'
+        })",
+    );
+    run(&mut session, "CREATE INDEX ON :Article(published) KIND RANGE");
+    run(&mut session, "CREATE INDEX ON :Article(tags) KIND LIST");
+    run(&mut session, "CREATE INDEX ON :Article(body) KIND FULLTEXT");
+
+    let explain_range = run(
+        &mut session,
+        "EXPLAIN MATCH (a:Article) WHERE a.published >= 2024 RETURN a.title",
+    );
+    assert!(explain_range.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("NodeIndexRangeScan".to_owned())
+            && format!("{:?}", row[3]).contains(":Article(published)")
+    }));
+
+    let explain_list = run(
+        &mut session,
+        "EXPLAIN MATCH (a:Article) WHERE 'rust' IN a.tags RETURN a.title",
+    );
+    assert!(explain_list.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("NodeListIndexScan".to_owned())
+            && format!("{:?}", row[3]).contains(":Article(tags)")
+    }));
+
+    let explain_text = run(
+        &mut session,
+        "EXPLAIN MATCH (a:Article) WHERE a.body CONTAINS 'compiler' RETURN a.title",
+    );
+    assert!(explain_text.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("NodeFullTextIndexScan".to_owned())
+            && format!("{:?}", row[3]).contains(":Article(body)")
+    }));
+
+    let temporal = run(
+        &mut session,
+        "MATCH (a:Article {title: 'Rust Systems'}) RETURN a.valid_from, a.valid_to",
+    );
+    assert!(matches!(temporal.rows[0][0], RuntimeValue::Datetime(_)));
+    assert_eq!(temporal.rows[0][1], RuntimeValue::Null);
+
+    drop(session);
+
+    let mut reopened = db.open();
+    let indexes = run(&mut reopened, "SHOW INDEXES ON :Article");
+    assert!(indexes.rows.iter().any(|row| {
+        row[3] == RuntimeValue::String("published".to_owned())
+            && row[6] == RuntimeValue::String("range".to_owned())
+    }));
+    assert!(indexes.rows.iter().any(|row| {
+        row[3] == RuntimeValue::String("tags".to_owned())
+            && row[6] == RuntimeValue::String("list".to_owned())
+    }));
+    assert!(indexes.rows.iter().any(|row| {
+        row[3] == RuntimeValue::String("body".to_owned())
+            && row[6] == RuntimeValue::String("fulltext".to_owned())
+    }));
+
+    let reopened_temporal = run(
+        &mut reopened,
+        "MATCH (a:Article {title: 'Rust Systems'}) RETURN a.valid_from, a.valid_to",
+    );
+    assert!(matches!(reopened_temporal.rows[0][0], RuntimeValue::Datetime(_)));
+    assert_eq!(reopened_temporal.rows[0][1], RuntimeValue::Null);
+}
+
+#[test]
+fn wave6_index_kind_benchmark_smoke() {
+    let db = TestDb::new("wave6_bench");
+    let mut session = db.open();
+
+    for index in 0..100 {
+        run(
+            &mut session,
+            &format!(
+                "CREATE (:Doc {{
+                    rank: {},
+                    tags: ['tag{}', 'shared'],
+                    body: 'document {} contains benchmark text'
+                }})",
+                index,
+                index % 5,
+                index
+            ),
+        );
+    }
+    run(&mut session, "CREATE INDEX ON :Doc(rank) KIND RANGE");
+    run(&mut session, "CREATE INDEX ON :Doc(tags) KIND LIST");
+    run(&mut session, "CREATE INDEX ON :Doc(body) KIND FULLTEXT");
+
+    let started = Instant::now();
+    for _ in 0..25 {
+        let range = run(
+            &mut session,
+            "MATCH (d:Doc) WHERE d.rank >= 90 RETURN d.rank ORDER BY d.rank",
+        );
+        assert_eq!(range.rows.len(), 10);
+        let list = run(
+            &mut session,
+            "MATCH (d:Doc) WHERE 'shared' IN d.tags RETURN d.rank ORDER BY d.rank",
+        );
+        assert_eq!(list.rows.len(), 100);
+        let text = run(
+            &mut session,
+            "MATCH (d:Doc) WHERE d.body CONTAINS 'benchmark' RETURN d.rank ORDER BY d.rank",
+        );
+        assert_eq!(text.rows.len(), 100);
+    }
+    assert!(started.elapsed().as_nanos() > 0);
 }

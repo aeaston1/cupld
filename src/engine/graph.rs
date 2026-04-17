@@ -15,14 +15,24 @@ pub struct Node {
     id: NodeId,
     labels: BTreeSet<String>,
     properties: PropertyMap,
+    valid_from: Option<SystemTime>,
+    valid_to: Option<SystemTime>,
 }
 
 impl Node {
-    fn new(id: NodeId, labels: BTreeSet<String>, properties: PropertyMap) -> Self {
+    fn new(
+        id: NodeId,
+        labels: BTreeSet<String>,
+        properties: PropertyMap,
+        valid_from: Option<SystemTime>,
+        valid_to: Option<SystemTime>,
+    ) -> Self {
         Self {
             id,
             labels,
             properties,
+            valid_from,
+            valid_to,
         }
     }
 
@@ -41,6 +51,14 @@ impl Node {
     pub fn property(&self, key: &str) -> Option<&Value> {
         self.properties.get(key)
     }
+
+    pub fn valid_from(&self) -> Option<SystemTime> {
+        self.valid_from
+    }
+
+    pub fn valid_to(&self) -> Option<SystemTime> {
+        self.valid_to
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +68,8 @@ pub struct Edge {
     to: NodeId,
     edge_type: String,
     properties: PropertyMap,
+    valid_from: Option<SystemTime>,
+    valid_to: Option<SystemTime>,
 }
 
 impl Edge {
@@ -59,6 +79,8 @@ impl Edge {
         to: NodeId,
         edge_type: String,
         properties: PropertyMap,
+        valid_from: Option<SystemTime>,
+        valid_to: Option<SystemTime>,
     ) -> Self {
         Self {
             id,
@@ -66,6 +88,8 @@ impl Edge {
             to,
             edge_type,
             properties,
+            valid_from,
+            valid_to,
         }
     }
 
@@ -91,6 +115,14 @@ impl Edge {
 
     pub fn property(&self, key: &str) -> Option<&Value> {
         self.properties.get(key)
+    }
+
+    pub fn valid_from(&self) -> Option<SystemTime> {
+        self.valid_from
+    }
+
+    pub fn valid_to(&self) -> Option<SystemTime> {
+        self.valid_to
     }
 }
 
@@ -344,6 +376,8 @@ impl CupldEngine {
                     id: node.id().get(),
                     labels: node.labels().iter().cloned().collect(),
                     properties: node.properties().clone(),
+                    valid_from: node.valid_from(),
+                    valid_to: node.valid_to(),
                 })
                 .collect(),
             edges: self
@@ -356,6 +390,8 @@ impl CupldEngine {
                     to: edge.to().get(),
                     edge_type: edge.edge_type().to_owned(),
                     properties: edge.properties().clone(),
+                    valid_from: edge.valid_from(),
+                    valid_to: edge.valid_to(),
                 })
                 .collect(),
             schema: self.working.schema.to_state(),
@@ -380,7 +416,16 @@ impl CupldEngine {
             data.outgoing.entry(node_id).or_default();
             data.incoming.entry(node_id).or_default();
             data.nodes
-                .insert(node_id, Node::new(node_id, labels, node.properties));
+                .insert(
+                    node_id,
+                    Node::new(
+                        node_id,
+                        labels,
+                        node.properties,
+                        node.valid_from,
+                        node.valid_to,
+                    ),
+                );
         }
         for edge in state.edges {
             let edge_id = EdgeId::new(edge.id);
@@ -397,7 +442,15 @@ impl CupldEngine {
             }
             data.edges.insert(
                 edge_id,
-                Edge::new(edge_id, from, to, edge.edge_type.clone(), edge.properties),
+                Edge::new(
+                    edge_id,
+                    from,
+                    to,
+                    edge.edge_type.clone(),
+                    edge.properties,
+                    edge.valid_from,
+                    edge.valid_to,
+                ),
             );
             data.outgoing.entry(from).or_default().insert(edge_id);
             data.incoming.entry(to).or_default().insert(edge_id);
@@ -435,7 +488,7 @@ impl CupldEngine {
         }
 
         let node_id = self.working.allocate_node_id();
-        let node = Node::new(node_id, label_set, properties);
+        let node = Node::new(node_id, label_set, properties, Some(SystemTime::now()), None);
         self.working.nodes.insert(node_id, node);
         self.working.outgoing.entry(node_id).or_default();
         self.working.incoming.entry(node_id).or_default();
@@ -475,7 +528,15 @@ impl CupldEngine {
 
         self.working.schema.ensure_edge_type(edge_type.clone());
         let edge_id = self.working.allocate_edge_id();
-        let edge = Edge::new(edge_id, from, to, edge_key.edge_type.clone(), properties);
+        let edge = Edge::new(
+            edge_id,
+            from,
+            to,
+            edge_key.edge_type.clone(),
+            properties,
+            Some(SystemTime::now()),
+            None,
+        );
         self.working.edges.insert(edge_id, edge);
         self.working
             .outgoing
@@ -532,6 +593,7 @@ impl CupldEngine {
         name: Option<&str>,
         target: SchemaTarget,
         property: &str,
+        kind: super::IndexKind,
         if_not_exists: bool,
         or_replace: bool,
     ) -> Result<String, GraphError> {
@@ -539,7 +601,7 @@ impl CupldEngine {
         ensure_target_exists(&self.working.schema, &target)?;
 
         let requested_name = name.map(ToOwned::to_owned).unwrap_or_else(|| {
-            generated_name("idx", target.kind(), target.name(), property, Some("eq"))
+            generated_name("idx", target.kind(), target.name(), property, Some(kind.as_str()))
         });
 
         if self.working.schema.object_exists(&requested_name) {
@@ -567,6 +629,7 @@ impl CupldEngine {
             Some(requested_name.clone()),
             target,
             property.to_owned(),
+            kind,
             false,
             None,
         );
@@ -681,6 +744,7 @@ impl CupldEngine {
                 Some(backing_name),
                 target,
                 property.to_owned(),
+                super::IndexKind::Equality,
                 true,
                 Some(created_name.clone()),
             );
@@ -1370,6 +1434,7 @@ mod tests {
     use super::{
         ConstraintType, CupldEngine, GraphError, PropertyMap, PropertyType, SchemaTarget, Value,
     };
+    use crate::engine::IndexKind;
 
     #[test]
     fn ids_are_monotonic_across_creates_and_deletes() {
@@ -1514,7 +1579,14 @@ mod tests {
         let mut engine = CupldEngine::default();
         engine.create_label("Person", None, false, false).unwrap();
         let index_name = engine
-            .create_index(None, SchemaTarget::label("Person"), "email", false, false)
+            .create_index(
+                None,
+                SchemaTarget::label("Person"),
+                "email",
+                IndexKind::Equality,
+                false,
+                false,
+            )
             .unwrap();
         let constraint_name = engine
             .create_constraint(
@@ -1611,7 +1683,14 @@ mod tests {
             .create_edge(left, right, "KNOWS", PropertyMap::new())
             .unwrap();
         engine
-            .create_index(None, SchemaTarget::label("Person"), "email", false, false)
+            .create_index(
+                None,
+                SchemaTarget::label("Person"),
+                "email",
+                IndexKind::Equality,
+                false,
+                false,
+            )
             .unwrap();
 
         assert_eq!(

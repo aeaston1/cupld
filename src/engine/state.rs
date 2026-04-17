@@ -1,5 +1,6 @@
 use super::PropertyMap;
-use super::schema::{ConstraintType, IndexStatus, SchemaTarget};
+use super::schema::{ConstraintType, IndexKind, IndexStatus, SchemaTarget};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EngineState {
@@ -16,6 +17,8 @@ pub(crate) struct NodeState {
     pub id: u64,
     pub labels: Vec<String>,
     pub properties: PropertyMap,
+    pub valid_from: Option<SystemTime>,
+    pub valid_to: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +28,8 @@ pub(crate) struct EdgeState {
     pub to: u64,
     pub edge_type: String,
     pub properties: PropertyMap,
+    pub valid_from: Option<SystemTime>,
+    pub valid_to: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +52,7 @@ pub(crate) struct IndexState {
     pub name: String,
     pub target: SchemaTarget,
     pub property: String,
+    pub kind: IndexKind,
     pub unique: bool,
     pub status: IndexStatus,
     pub owned_by_constraint: Option<String>,
