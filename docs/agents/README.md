@@ -79,6 +79,18 @@ COMMIT;
 EOF
 ```
 
+Use typed literals, dynamic indexing, and richer edge filters:
+
+```bash
+cupld query --db .cupld/default.cupld "
+MATCH (a:Person)-[e:KNOWS|MENTORS]->(b:Person)
+WHERE has_label(a, 'Person')
+  AND edge_type(e) =~ '^(KNOWS|MENTORS)$'
+  AND b.name ENDS WITH 'n'
+RETURN b.name, {name: b.name}['name'], bytes'gold', datetime'2024-01-02T03:04:05Z'
+"
+```
+
 Validate and compact a database:
 
 ```bash

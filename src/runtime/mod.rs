@@ -4,6 +4,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use regex::Regex;
+
 use crate::engine::{
     ConstraintRow, ConstraintType, CupldEngine, Edge, EdgeId, GraphError, GraphStats, IndexRow,
     Node, NodeId, PropertyMap, SchemaRow, Value,
@@ -652,9 +654,21 @@ impl Session {
                 }
                 let (next_row, next_node) =
                     self.realize_node_pattern(row.clone(), &segment.node, params)?;
-                let edge_type = segment.edge.edge_type.clone().ok_or_else(|| {
-                    ExecutionError::new("create_edge_type", "CREATE edges require a type")
-                })?;
+                let edge_type = match segment.edge.edge_types.as_slice() {
+                    [edge_type] => edge_type.clone(),
+                    [] => {
+                        return Err(ExecutionError::new(
+                            "create_edge_type",
+                            "CREATE edges require a type",
+                        ));
+                    }
+                    _ => {
+                        return Err(ExecutionError::new(
+                            "create_edge_type",
+                            "CREATE edges require exactly one type",
+                        ));
+                    }
+                };
                 let properties =
                     eval_property_map(self, &next_row, &segment.edge.properties, params)?;
                 let edge_id = match segment.direction {
@@ -919,8 +933,11 @@ impl Session {
         row: &Row,
         params: &BTreeMap<String, Value>,
     ) -> Result<bool, ExecutionError> {
-        if let Some(edge_type) = &pattern.edge_type
-            && edge.edge_type() != edge_type
+        if !pattern.edge_types.is_empty()
+            && !pattern
+                .edge_types
+                .iter()
+                .any(|edge_type| edge.edge_type() == edge_type)
         {
             return Ok(false);
         }
@@ -962,6 +979,8 @@ impl Session {
             Expr::Int(value) => Ok(RuntimeValue::Int(*value)),
             Expr::Float(value) => Ok(RuntimeValue::Float(*value)),
             Expr::String(value) => Ok(RuntimeValue::String(value.clone())),
+            Expr::Bytes(value) => Ok(RuntimeValue::Bytes(value.clone())),
+            Expr::Datetime(value) => Ok(RuntimeValue::Datetime(*value)),
             Expr::Parameter(name) => Ok(params
                 .get(name)
                 .map(runtime_from_value)
@@ -972,6 +991,11 @@ impl Session {
             Expr::Property(base, property) => {
                 let value = self.eval_expr(base, row, params)?;
                 self.lookup_property(&value, property)
+            }
+            Expr::Index { target, index } => {
+                let target = self.eval_expr(target, row, params)?;
+                let index = self.eval_expr(index, row, params)?;
+                self.lookup_index(target, index)
             }
             Expr::List(values) => values
                 .iter()
@@ -1054,6 +1078,31 @@ impl Session {
             _ => Err(ExecutionError::new(
                 "property_access_type_error",
                 "property access requires a node, edge, or map value",
+            )),
+        }
+    }
+
+    fn lookup_index(
+        &self,
+        target: RuntimeValue,
+        index: RuntimeValue,
+    ) -> Result<RuntimeValue, ExecutionError> {
+        match (target, index) {
+            (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => Ok(RuntimeValue::Null),
+            (RuntimeValue::List(values), RuntimeValue::Int(index)) => {
+                let Ok(index) = usize::try_from(index) else {
+                    return Ok(RuntimeValue::Null);
+                };
+                Ok(values.get(index).cloned().unwrap_or(RuntimeValue::Null))
+            }
+            (RuntimeValue::Map(entries), RuntimeValue::String(key)) => Ok(entries
+                .into_iter()
+                .find(|(existing, _)| *existing == key)
+                .map(|(_, value)| value)
+                .unwrap_or(RuntimeValue::Null)),
+            _ => Err(ExecutionError::new(
+                "index_type_error",
+                "index access requires list[int] or map[string]",
             )),
         }
     }
@@ -1143,18 +1192,40 @@ impl Session {
             },
             Op::In => match right {
                 RuntimeValue::List(values) => Ok(RuntimeValue::Bool(values.contains(&left))),
+                RuntimeValue::String(right) => match left {
+                    RuntimeValue::String(left) => Ok(RuntimeValue::Bool(right.contains(&left))),
+                    _ => Err(ExecutionError::new(
+                        "in_type_error",
+                        "IN requires string operands when matching against a string",
+                    )),
+                },
+                RuntimeValue::Map(entries) => match left {
+                    RuntimeValue::String(left) => Ok(RuntimeValue::Bool(
+                        entries.iter().any(|(key, _)| key == &left),
+                    )),
+                    _ => Err(ExecutionError::new(
+                        "in_type_error",
+                        "IN requires a string key when matching against a map",
+                    )),
+                },
                 _ => Err(ExecutionError::new(
                     "in_type_error",
-                    "IN requires a list on the right-hand side",
+                    "IN requires a list, string, or map on the right-hand side",
                 )),
             },
             Op::Contains => match (left, right) {
                 (RuntimeValue::String(left), RuntimeValue::String(right)) => {
                     Ok(RuntimeValue::Bool(left.contains(&right)))
                 }
+                (RuntimeValue::List(values), value) => {
+                    Ok(RuntimeValue::Bool(values.contains(&value)))
+                }
+                (RuntimeValue::Map(entries), RuntimeValue::String(key)) => Ok(RuntimeValue::Bool(
+                    entries.iter().any(|(existing, _)| existing == &key),
+                )),
                 _ => Err(ExecutionError::new(
                     "contains_type_error",
-                    "CONTAINS requires string operands",
+                    "CONTAINS requires string operands, list membership, or a map key",
                 )),
             },
             Op::StartsWith => match (left, right) {
@@ -1164,6 +1235,30 @@ impl Session {
                 _ => Err(ExecutionError::new(
                     "starts_with_type_error",
                     "STARTS WITH requires string operands",
+                )),
+            },
+            Op::EndsWith => match (left, right) {
+                (RuntimeValue::String(left), RuntimeValue::String(right)) => {
+                    Ok(RuntimeValue::Bool(left.ends_with(&right)))
+                }
+                _ => Err(ExecutionError::new(
+                    "ends_with_type_error",
+                    "ENDS WITH requires string operands",
+                )),
+            },
+            Op::RegexMatch => match (left, right) {
+                (RuntimeValue::String(left), RuntimeValue::String(right)) => {
+                    let regex = Regex::new(&right).map_err(|error| {
+                        ExecutionError::new(
+                            "regex_compile_error",
+                            format!("invalid regex pattern: {error}"),
+                        )
+                    })?;
+                    Ok(RuntimeValue::Bool(regex.is_match(&left)))
+                }
+                _ => Err(ExecutionError::new(
+                    "regex_type_error",
+                    "regex matching requires string operands",
                 )),
             },
             Op::Or | Op::And => unreachable!(),
@@ -1211,6 +1306,12 @@ impl Session {
             ("type", [value]) => Ok(RuntimeValue::String(runtime_type_name(value).to_owned())),
             ("id", [RuntimeValue::Node(node_id)]) => Ok(RuntimeValue::Int(node_id.get() as i64)),
             ("id", [RuntimeValue::Edge(edge_id)]) => Ok(RuntimeValue::Int(edge_id.get() as i64)),
+            ("edge_type", [RuntimeValue::Null]) => Ok(RuntimeValue::Null),
+            ("edge_type", [RuntimeValue::Edge(edge_id)]) => Ok(self
+                .engine
+                .edge(*edge_id)
+                .map(|edge| RuntimeValue::String(edge.edge_type().to_owned()))
+                .unwrap_or(RuntimeValue::Null)),
             ("labels", [RuntimeValue::Node(node_id)]) => Ok(RuntimeValue::List(
                 self.engine
                     .node(*node_id)
@@ -1241,6 +1342,17 @@ impl Session {
                     RuntimeValue::Null => false,
                     _ => false,
                 }))
+            }
+            ("has_label", [RuntimeValue::Null, RuntimeValue::String(_)]) => {
+                Ok(RuntimeValue::Bool(false))
+            }
+            ("has_label", [RuntimeValue::Node(node_id), RuntimeValue::String(label)]) => {
+                Ok(RuntimeValue::Bool(
+                    self.engine
+                        .node(*node_id)
+                        .map(|node| node.labels().iter().any(|existing| existing == label))
+                        .unwrap_or(false),
+                ))
             }
             ("keys", [RuntimeValue::Null]) => Ok(RuntimeValue::Null),
             ("keys", [RuntimeValue::Map(entries)]) => Ok(RuntimeValue::List(
@@ -1320,12 +1432,16 @@ enum ExecutionErrorCode {
     DbUuidMissing,
     DeleteTarget,
     DivisionByZero,
+    EndsWithTypeError,
     FunctionError,
     GraphValueConversion,
     InTypeError,
+    IndexTypeError,
     MultiStatementRequiresTransaction,
     PropertyAccessTypeError,
     RemoveTarget,
+    RegexCompileError,
+    RegexTypeError,
     RowLimitExceeded,
     SaveRequiresPath,
     SavepointExists,
@@ -1354,12 +1470,16 @@ impl ExecutionErrorCode {
             Self::DbUuidMissing => "db_uuid_missing",
             Self::DeleteTarget => "delete_target",
             Self::DivisionByZero => "division_by_zero",
+            Self::EndsWithTypeError => "ends_with_type_error",
             Self::FunctionError => "function_error",
             Self::GraphValueConversion => "graph_value_conversion",
             Self::InTypeError => "in_type_error",
+            Self::IndexTypeError => "index_type_error",
             Self::MultiStatementRequiresTransaction => "multi_statement_requires_transaction",
             Self::PropertyAccessTypeError => "property_access_type_error",
             Self::RemoveTarget => "remove_target",
+            Self::RegexCompileError => "regex_compile_error",
+            Self::RegexTypeError => "regex_type_error",
             Self::RowLimitExceeded => "row_limit_exceeded",
             Self::SaveRequiresPath => "save_requires_path",
             Self::SavepointExists => "savepoint_exists",
@@ -1390,12 +1510,16 @@ impl From<&'static str> for ExecutionErrorCode {
             "db_uuid_missing" => Self::DbUuidMissing,
             "delete_target" => Self::DeleteTarget,
             "division_by_zero" => Self::DivisionByZero,
+            "ends_with_type_error" => Self::EndsWithTypeError,
             "function_error" => Self::FunctionError,
             "graph_value_conversion" => Self::GraphValueConversion,
             "in_type_error" => Self::InTypeError,
+            "index_type_error" => Self::IndexTypeError,
             "multi_statement_requires_transaction" => Self::MultiStatementRequiresTransaction,
             "property_access_type_error" => Self::PropertyAccessTypeError,
             "remove_target" => Self::RemoveTarget,
+            "regex_compile_error" => Self::RegexCompileError,
+            "regex_type_error" => Self::RegexTypeError,
             "row_limit_exceeded" => Self::RowLimitExceeded,
             "save_requires_path" => Self::SaveRequiresPath,
             "savepoint_exists" => Self::SavepointExists,

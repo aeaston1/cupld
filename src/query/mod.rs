@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::{PropertyType, SchemaTarget};
 
@@ -126,7 +127,7 @@ pub struct NodePattern {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgePattern {
     pub variable: Option<String>,
-    pub edge_type: Option<String>,
+    pub edge_types: Vec<String>,
     pub properties: Vec<(String, Expr)>,
     pub hops: Option<HopRange>,
 }
@@ -168,9 +169,15 @@ pub enum Expr {
     Int(i64),
     Float(f64),
     String(String),
+    Bytes(Vec<u8>),
+    Datetime(SystemTime),
     Parameter(String),
     Variable(String),
     Property(Box<Expr>, String),
+    Index {
+        target: Box<Expr>,
+        index: Box<Expr>,
+    },
     List(Vec<Expr>),
     Map(Vec<(String, Expr)>),
     Unary {
@@ -215,6 +222,8 @@ pub enum BinaryOp {
     In,
     Contains,
     StartsWith,
+    EndsWith,
+    RegexMatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +241,7 @@ enum QueryErrorKind {
     Number,
     Parameter,
     PropertyType,
+    Datetime,
     ShowKind,
     String,
     UnexpectedEof,
@@ -254,6 +264,7 @@ impl QueryErrorKind {
             Self::Number => "parse_number",
             Self::Parameter => "parse_parameter",
             Self::PropertyType => "parse_property_type",
+            Self::Datetime => "parse_datetime",
             Self::ShowKind => "parse_show_kind",
             Self::String => "parse_string",
             Self::UnexpectedEof => "parse_unexpected_eof",
@@ -278,6 +289,7 @@ impl From<&'static str> for QueryErrorKind {
             "parse_number" => Self::Number,
             "parse_parameter" => Self::Parameter,
             "parse_property_type" => Self::PropertyType,
+            "parse_datetime" => Self::Datetime,
             "parse_show_kind" => Self::ShowKind,
             "parse_string" => Self::String,
             "parse_unexpected_eof" => Self::UnexpectedEof,
@@ -371,6 +383,7 @@ enum TokenKind {
     Minus,
     Slash,
     Eq,
+    RegexEq,
     NotEq,
     Lt,
     Lte,
@@ -379,6 +392,7 @@ enum TokenKind {
     ArrowRight,
     ArrowLeft,
     Range,
+    Pipe,
 }
 
 pub fn parse_script(input: &str) -> Result<Vec<Statement>, QueryError> {
@@ -703,10 +717,14 @@ impl Parser {
     fn parse_edge_pattern(&mut self) -> Result<EdgePattern, QueryError> {
         self.expect_token(TokenDiscriminant::LBracket)?;
         let variable = self.try_identifier()?;
-        let edge_type = if self.consume_token(TokenDiscriminant::Colon) {
-            Some(self.expect_identifier()?)
+        let edge_types = if self.consume_token(TokenDiscriminant::Colon) {
+            let mut edge_types = vec![self.expect_identifier()?];
+            while self.consume_token(TokenDiscriminant::Pipe) {
+                edge_types.push(self.expect_identifier()?);
+            }
+            edge_types
         } else {
-            None
+            Vec::new()
         };
         let hops = if self.consume_token(TokenDiscriminant::Star) {
             let min = self.expect_u8()?;
@@ -733,7 +751,7 @@ impl Parser {
         self.expect_token(TokenDiscriminant::RBracket)?;
         Ok(EdgePattern {
             variable,
-            edge_type,
+            edge_types,
             properties,
             hops,
         })
@@ -906,6 +924,11 @@ impl Parser {
             } else if self.consume_keyword("STARTS")? {
                 self.expect_keyword("WITH")?;
                 Some(BinaryOp::StartsWith)
+            } else if self.consume_keyword("ENDS")? {
+                self.expect_keyword("WITH")?;
+                Some(BinaryOp::EndsWith)
+            } else if self.consume_token(TokenDiscriminant::RegexEq) {
+                Some(BinaryOp::RegexMatch)
             } else {
                 None
             };
@@ -984,8 +1007,21 @@ impl Parser {
 
     fn parse_postfix_expr(&mut self) -> Result<Expr, QueryError> {
         let mut expr = self.parse_primary_expr()?;
-        while self.consume_token(TokenDiscriminant::Dot) {
-            expr = Expr::Property(Box::new(expr), self.expect_identifier()?);
+        loop {
+            if self.consume_token(TokenDiscriminant::Dot) {
+                expr = Expr::Property(Box::new(expr), self.expect_identifier()?);
+                continue;
+            }
+            if self.consume_token(TokenDiscriminant::LBracket) {
+                let index = self.parse_expr()?;
+                self.expect_token(TokenDiscriminant::RBracket)?;
+                expr = Expr::Index {
+                    target: Box::new(expr),
+                    index: Box::new(index),
+                };
+                continue;
+            }
+            break;
         }
         Ok(expr)
     }
@@ -1011,6 +1047,24 @@ impl Parser {
         }
         if let Some(value) = self.try_string() {
             return Ok(Expr::String(value));
+        }
+        if self.peek_keyword_followed_by_string("b")
+            || self.peek_keyword_followed_by_string("bytes")
+        {
+            self.advance();
+            return Ok(Expr::Bytes(
+                self.try_string().expect("peeked string").into_bytes(),
+            ));
+        }
+        if self.peek_keyword_followed_by_string("datetime") {
+            let token = self.peek().cloned().expect("peeked datetime keyword");
+            self.advance();
+            let literal = self.try_string().expect("peeked string");
+            return Ok(Expr::Datetime(parse_datetime_literal(
+                &literal,
+                token.line,
+                token.column,
+            )?));
         }
         if self.consume_token(TokenDiscriminant::LParen) {
             let expr = self.parse_expr()?;
@@ -1229,6 +1283,16 @@ impl Parser {
         )
     }
 
+    fn peek_keyword_followed_by_string(&self, keyword: &str) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.idx).map(|token| &token.kind),
+                self.tokens.get(self.idx + 1).map(|token| &token.kind),
+            ),
+            (Some(TokenKind::Identifier(value)), Some(TokenKind::String(_))) if value == keyword
+        )
+    }
+
     fn consume_token(&mut self, expected: TokenDiscriminant) -> bool {
         if self.check(expected) {
             self.advance();
@@ -1318,6 +1382,7 @@ enum TokenDiscriminant {
     Minus,
     Slash,
     Eq,
+    RegexEq,
     NotEq,
     Lt,
     Lte,
@@ -1326,6 +1391,7 @@ enum TokenDiscriminant {
     ArrowRight,
     ArrowLeft,
     Range,
+    Pipe,
 }
 
 impl TokenDiscriminant {
@@ -1347,6 +1413,7 @@ impl TokenDiscriminant {
                 | (Self::Minus, TokenKind::Minus)
                 | (Self::Slash, TokenKind::Slash)
                 | (Self::Eq, TokenKind::Eq)
+                | (Self::RegexEq, TokenKind::RegexEq)
                 | (Self::NotEq, TokenKind::NotEq)
                 | (Self::Lt, TokenKind::Lt)
                 | (Self::Lte, TokenKind::Lte)
@@ -1355,6 +1422,7 @@ impl TokenDiscriminant {
                 | (Self::ArrowRight, TokenKind::ArrowRight)
                 | (Self::ArrowLeft, TokenKind::ArrowLeft)
                 | (Self::Range, TokenKind::Range)
+                | (Self::Pipe, TokenKind::Pipe)
         )
     }
 
@@ -1375,6 +1443,7 @@ impl TokenDiscriminant {
             Self::Minus => "-",
             Self::Slash => "/",
             Self::Eq => "=",
+            Self::RegexEq => "=~",
             Self::NotEq => "!=",
             Self::Lt => "<",
             Self::Lte => "<=",
@@ -1383,6 +1452,7 @@ impl TokenDiscriminant {
             Self::ArrowRight => "->",
             Self::ArrowLeft => "<-",
             Self::Range => "..",
+            Self::Pipe => "|",
         }
     }
 }
@@ -1412,6 +1482,38 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
                 while idx < bytes.len() && bytes[idx] as char != '\n' {
                     idx += 1;
                     column += 1;
+                }
+            }
+            '/' if idx + 1 < bytes.len() && bytes[idx + 1] as char == '*' => {
+                let start_line = line;
+                let start_column = column;
+                idx += 2;
+                column += 2;
+                let mut closed = false;
+                while idx + 1 < bytes.len() {
+                    let current = bytes[idx] as char;
+                    if current == '*' && bytes[idx + 1] as char == '/' {
+                        idx += 2;
+                        column += 2;
+                        closed = true;
+                        break;
+                    }
+                    if current == '\n' {
+                        idx += 1;
+                        line += 1;
+                        column = 1;
+                    } else {
+                        idx += 1;
+                        column += 1;
+                    }
+                }
+                if !closed {
+                    return Err(QueryError::new(
+                        "parse_character",
+                        "unterminated block comment",
+                        start_line,
+                        start_column,
+                    ));
                 }
             }
             '(' => push_simple(
@@ -1527,6 +1629,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
                 &mut idx,
                 &mut column,
             ),
+            '=' if idx + 1 < bytes.len() && bytes[idx + 1] as char == '~' => {
+                tokens.push(Token {
+                    kind: TokenKind::RegexEq,
+                    line,
+                    column,
+                });
+                idx += 2;
+                column += 2;
+            }
             '=' => push_simple(
                 &mut tokens,
                 TokenKind::Eq,
@@ -1599,6 +1710,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
             '>' => push_simple(
                 &mut tokens,
                 TokenKind::Gt,
+                line,
+                column,
+                &mut idx,
+                &mut column,
+            ),
+            '|' => push_simple(
+                &mut tokens,
+                TokenKind::Pipe,
                 line,
                 column,
                 &mut idx,
@@ -1808,9 +1927,229 @@ fn push_simple(
     *current_column += 1;
 }
 
+fn parse_datetime_literal(
+    input: &str,
+    line: usize,
+    column: usize,
+) -> Result<SystemTime, QueryError> {
+    let (date, time) = input.split_once('T').ok_or_else(|| {
+        QueryError::new(
+            "parse_datetime",
+            "datetime literals must use RFC3339 syntax",
+            line,
+            column,
+        )
+    })?;
+    let (year, month, day) = parse_date(date, line, column)?;
+    let (hour, minute, second, nanos, offset_seconds) = parse_time(time, line, column)?;
+    let days = days_from_civil(year, month, day);
+    let total_seconds = days
+        .checked_mul(86_400)
+        .and_then(|value| value.checked_add(i64::from(hour) * 3_600))
+        .and_then(|value| value.checked_add(i64::from(minute) * 60))
+        .and_then(|value| value.checked_add(i64::from(second)))
+        .and_then(|value| value.checked_sub(i64::from(offset_seconds)))
+        .ok_or_else(|| {
+            QueryError::new(
+                "parse_datetime",
+                "datetime literal is out of range",
+                line,
+                column,
+            )
+        })?;
+    if total_seconds >= 0 {
+        return Ok(UNIX_EPOCH + Duration::new(total_seconds as u64, nanos));
+    }
+    if nanos == 0 {
+        return Ok(UNIX_EPOCH - Duration::new(total_seconds.unsigned_abs(), 0));
+    }
+    Ok(UNIX_EPOCH - Duration::new(total_seconds.unsigned_abs() - 1, 1_000_000_000 - nanos))
+}
+
+fn parse_date(input: &str, line: usize, column: usize) -> Result<(i32, u32, u32), QueryError> {
+    let year = parse_u32_component(component(input, 0, 4), "year", line, column)? as i32;
+    require_char(input, 4, '-', line, column)?;
+    let month = parse_u32_component(component(input, 5, 7), "month", line, column)?;
+    require_char(input, 7, '-', line, column)?;
+    let day = parse_u32_component(component(input, 8, 10), "day", line, column)?;
+    if input.len() != 10 || month == 0 || month > 12 {
+        return Err(QueryError::new(
+            "parse_datetime",
+            "datetime literal is invalid",
+            line,
+            column,
+        ));
+    }
+    let max_day = days_in_month(year, month);
+    if day == 0 || day > max_day {
+        return Err(QueryError::new(
+            "parse_datetime",
+            "datetime literal is invalid",
+            line,
+            column,
+        ));
+    }
+    Ok((year, month, day))
+}
+
+fn parse_time(
+    input: &str,
+    line: usize,
+    column: usize,
+) -> Result<(u32, u32, u32, u32, i32), QueryError> {
+    if input.len() < 9 {
+        return Err(QueryError::new(
+            "parse_datetime",
+            "datetime literal is invalid",
+            line,
+            column,
+        ));
+    }
+    let hour = parse_u32_component(component(input, 0, 2), "hour", line, column)?;
+    require_char(input, 2, ':', line, column)?;
+    let minute = parse_u32_component(component(input, 3, 5), "minute", line, column)?;
+    require_char(input, 5, ':', line, column)?;
+    let second = parse_u32_component(component(input, 6, 8), "second", line, column)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(QueryError::new(
+            "parse_datetime",
+            "datetime literal is invalid",
+            line,
+            column,
+        ));
+    }
+
+    let mut idx = 8;
+    let mut nanos = 0u32;
+    if input.as_bytes().get(idx).copied() == Some(b'.') {
+        idx += 1;
+        let fraction_start = idx;
+        while idx < input.len() && input.as_bytes()[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let fraction = &input[fraction_start..idx];
+        if fraction.is_empty() || fraction.len() > 9 {
+            return Err(QueryError::new(
+                "parse_datetime",
+                "datetime literal is invalid",
+                line,
+                column,
+            ));
+        }
+        let digits = parse_u32_component(Some(fraction), "fraction", line, column)?;
+        nanos = digits * 10u32.pow((9 - fraction.len()) as u32);
+    }
+
+    let offset = match input.as_bytes().get(idx).copied() {
+        Some(b'Z') if idx + 1 == input.len() => 0,
+        Some(b'+') | Some(b'-') => {
+            if idx + 6 != input.len() {
+                return Err(QueryError::new(
+                    "parse_datetime",
+                    "datetime literal is invalid",
+                    line,
+                    column,
+                ));
+            }
+            let sign = if input.as_bytes()[idx] == b'-' { -1 } else { 1 };
+            let offset_hour =
+                parse_u32_component(component(input, idx + 1, idx + 3), "offset", line, column)?;
+            require_char(input, idx + 3, ':', line, column)?;
+            let offset_minute =
+                parse_u32_component(component(input, idx + 4, idx + 6), "offset", line, column)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return Err(QueryError::new(
+                    "parse_datetime",
+                    "datetime literal is invalid",
+                    line,
+                    column,
+                ));
+            }
+            sign * ((offset_hour * 3_600 + offset_minute * 60) as i32)
+        }
+        _ => {
+            return Err(QueryError::new(
+                "parse_datetime",
+                "datetime literals must include a timezone",
+                line,
+                column,
+            ));
+        }
+    };
+
+    Ok((hour, minute, second, nanos, offset))
+}
+
+fn component(input: &str, start: usize, end: usize) -> Option<&str> {
+    input.get(start..end)
+}
+
+fn require_char(
+    input: &str,
+    index: usize,
+    expected: char,
+    line: usize,
+    column: usize,
+) -> Result<(), QueryError> {
+    if input.as_bytes().get(index).copied() == Some(expected as u8) {
+        Ok(())
+    } else {
+        Err(QueryError::new(
+            "parse_datetime",
+            "datetime literal is invalid",
+            line,
+            column,
+        ))
+    }
+}
+
+fn parse_u32_component(
+    input: Option<&str>,
+    _field: &str,
+    line: usize,
+    column: usize,
+) -> Result<u32, QueryError> {
+    input
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            QueryError::new(
+                "parse_datetime",
+                "datetime literal is invalid",
+                line,
+                column,
+            )
+        })
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era * 146_097 + doe - 719_468)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ConstraintSpec, Expr, PropertyTarget, Query, ShowKind, Statement, parse_script};
+    use super::{
+        BinaryOp, ConstraintSpec, Expr, PropertyTarget, Query, ShowKind, Statement, parse_script,
+    };
     use crate::engine::{PropertyType, SchemaTarget};
 
     #[test]
@@ -1922,7 +2261,8 @@ mod tests {
     #[test]
     fn supports_comments_and_trailing_commas() {
         let statements = parse_script(
-            "-- hello
+            "/* block */
+             -- hello
              MATCH (n {name: 'Ada',}) RETURN [1,2,], {a: 1,} AS payload",
         )
         .unwrap();
@@ -1935,5 +2275,61 @@ mod tests {
             query.return_clause[1].expr,
             Expr::Map(vec![("a".to_owned(), Expr::Int(1))])
         );
+    }
+
+    #[test]
+    fn parses_ergonomic_literals_and_edge_alternation() {
+        let statements = parse_script(
+            "MATCH (a)-[e:KNOWS|MENTORS]->(b)
+             WHERE b.name =~ '^(Grace|Lin)$' AND b.name ENDS WITH 'n'
+             RETURN ['Ada', 'Lin'][1], {name: b.name}['name'], bytes'abc', datetime'2024-01-02T03:04:05Z'",
+        )
+        .unwrap();
+
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            query.match_clause.as_ref().unwrap().segments[0]
+                .edge
+                .edge_types,
+            vec!["KNOWS".to_owned(), "MENTORS".to_owned()]
+        );
+        assert!(matches!(
+            query.where_clause,
+            Some(Expr::Binary {
+                op: BinaryOp::And,
+                ..
+            })
+        ));
+        assert_eq!(
+            query.return_clause[0].expr,
+            Expr::Index {
+                target: Box::new(Expr::List(vec![
+                    Expr::String("Ada".to_owned()),
+                    Expr::String("Lin".to_owned())
+                ])),
+                index: Box::new(Expr::Int(1)),
+            }
+        );
+        assert_eq!(
+            query.return_clause[1].expr,
+            Expr::Index {
+                target: Box::new(Expr::Map(vec![(
+                    "name".to_owned(),
+                    Expr::Property(Box::new(Expr::Variable("b".to_owned())), "name".to_owned()),
+                )])),
+                index: Box::new(Expr::String("name".to_owned())),
+            }
+        );
+        assert_eq!(query.return_clause[2].expr, Expr::Bytes(b"abc".to_vec()));
+        assert!(matches!(query.return_clause[3].expr, Expr::Datetime(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_datetime_literals() {
+        let err = parse_script("RETURN datetime'2024-13-40T03:04:05Z'").unwrap_err();
+
+        assert_eq!(err.code(), "parse_datetime");
     }
 }

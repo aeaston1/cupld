@@ -238,6 +238,109 @@ fn file_backed_transaction_commit_persists_after_reopen() {
 }
 
 #[test]
+fn query_ergonomics_support_literals_indexing_and_extended_membership() {
+    let db = TestDb::new("ergonomics_literals");
+    let mut session = db.open();
+
+    let result = run(
+        &mut session,
+        "RETURN ['Ada', 'Grace'][1],
+                {name: 'Ada'}['name'],
+                'ace' IN 'grace',
+                'name' IN {name: 'Ada'},
+                [1, 2, 3] CONTAINS 2,
+                {name: 'Ada'} CONTAINS 'name',
+                bytes'abc',
+                datetime'2024-01-02T03:04:05Z'",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::String("Grace".to_owned()),
+            RuntimeValue::String("Ada".to_owned()),
+            RuntimeValue::Bool(true),
+            RuntimeValue::Bool(true),
+            RuntimeValue::Bool(true),
+            RuntimeValue::Bool(true),
+            RuntimeValue::Bytes(b"abc".to_vec()),
+            result.rows[0][7].clone(),
+        ]]
+    );
+    assert!(matches!(result.rows[0][7], RuntimeValue::Datetime(_)));
+}
+
+#[test]
+fn query_ergonomics_support_edge_helpers_regex_and_alternation() {
+    let db = TestDb::new("ergonomics_match");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+
+    run(
+        &mut session,
+        "MATCH (ada:Person {name: 'Ada'})
+         CREATE (ada)-[:MENTORS {since: datetime'2024-01-02T03:04:05Z'}]->
+           (lin:Person {name: 'Lin', email: 'lin@example.com', age: 33, badge: bytes'gold'})",
+    );
+
+    let mentors = run(
+        &mut session,
+        "MATCH (a:Person)-[e:KNOWS|MENTORS]->(b:Person)
+         WHERE has_label(a, 'Person')
+           AND edge_type(e) =~ '^(KNOWS|MENTORS)$'
+           AND b.name ENDS WITH 'n'
+         RETURN a.name, edge_type(e), b.name
+         ORDER BY b.name",
+    );
+
+    assert_eq!(
+        mentors.rows,
+        vec![
+            vec![
+                RuntimeValue::String("Grace".to_owned()),
+                RuntimeValue::String("KNOWS".to_owned()),
+                RuntimeValue::String("Alan".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("Ada".to_owned()),
+                RuntimeValue::String("MENTORS".to_owned()),
+                RuntimeValue::String("Lin".to_owned()),
+            ],
+        ]
+    );
+
+    let typed_properties = run(
+        &mut session,
+        "MATCH (:Person)-[e:MENTORS]->(b:Person {name: 'Lin'})
+         RETURN b.badge, e.since",
+    );
+    assert_eq!(
+        typed_properties.rows[0][0],
+        RuntimeValue::Bytes(b"gold".to_vec())
+    );
+    assert!(matches!(
+        typed_properties.rows[0][1],
+        RuntimeValue::Datetime(_)
+    ));
+}
+
+#[test]
+fn query_ergonomics_report_stable_errors() {
+    let db = TestDb::new("ergonomics_errors");
+    let mut session = db.open();
+
+    let regex_error = session
+        .execute_script("RETURN 'Ada' =~ '('", &BTreeMap::new())
+        .unwrap_err();
+    assert_eq!(regex_error.code(), "regex_compile_error");
+
+    let index_error = session
+        .execute_script("RETURN [1]['bad']", &BTreeMap::new())
+        .unwrap_err();
+    assert_eq!(index_error.code(), "index_type_error");
+}
+
+#[test]
 fn file_backed_transaction_rollback_discards_changes() {
     let db = TestDb::new("rollback");
     let mut session = db.open();
