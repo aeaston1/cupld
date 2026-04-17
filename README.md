@@ -14,13 +14,21 @@ It provides interactive exploration, one-shot queries, compact context output fo
 
 ## Install
 
-From source:
+From package channels:
 
 ```bash
-cargo install --path .
+brew install aeaston1/tap/cupld
+cargo install cupld
 ```
 
-After GitHub releases are published:
+Manual from GitHub Releases:
+
+- Open the [latest release](https://github.com/aeaston1/cupld/releases/latest)
+- Select the asset for your OS and architecture
+- Extract the archive or run the installer
+- Move `cupld` onto your `PATH`
+
+Optional release installer scripts:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/aeaston1/cupld/releases/latest/download/cupld-installer.sh | sh
@@ -30,11 +38,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/aeaston1/cupld/releases
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/aeaston1/cupld/releases/latest/download/cupld-installer.ps1 | iex"
 ```
 
-After the corresponding channel publish:
+From a local checkout:
 
 ```bash
-brew install aeaston1/tap/cupld
-cargo install cupld
+cargo install --path .
 ```
 
 ## Quickstart
