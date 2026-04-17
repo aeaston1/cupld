@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::engine::{PropertyType, SchemaTarget};
+use crate::engine::{IndexStatus, PropertyType, SchemaTarget, TargetKind};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
@@ -13,43 +13,54 @@ pub enum Statement {
     RollbackToSavepoint(String),
     ReleaseSavepoint(String),
     CreateLabel {
-        name: String,
-        description: Option<String>,
+        name: ParamValue,
+        description: Option<ParamValue>,
         if_not_exists: bool,
+        or_replace: bool,
     },
     DropLabel {
-        name: String,
+        name: ParamValue,
         if_exists: bool,
     },
     CreateEdgeType {
-        name: String,
-        description: Option<String>,
+        name: ParamValue,
+        description: Option<ParamValue>,
         if_not_exists: bool,
+        or_replace: bool,
     },
     DropEdgeType {
-        name: String,
+        name: ParamValue,
         if_exists: bool,
     },
     CreateIndex {
-        name: Option<String>,
-        target: SchemaTarget,
-        property: String,
+        name: Option<ParamValue>,
+        target: SchemaTargetExpr,
+        property: ParamValue,
         if_not_exists: bool,
+        or_replace: bool,
     },
     DropIndex {
-        name: String,
+        name: ParamValue,
         if_exists: bool,
+    },
+    AlterIndex {
+        name: ParamValue,
+        status: IndexStatus,
     },
     CreateConstraint {
-        name: Option<String>,
-        target: SchemaTarget,
-        property: String,
+        name: Option<ParamValue>,
+        target: SchemaTargetExpr,
         constraint: ConstraintSpec,
         if_not_exists: bool,
+        or_replace: bool,
     },
     DropConstraint {
-        name: String,
+        name: ParamValue,
         if_exists: bool,
+    },
+    AlterConstraint {
+        name: ParamValue,
+        rename_to: ParamValue,
     },
     Show(ShowKind),
     Explain(Box<Statement>),
@@ -67,9 +78,53 @@ pub enum ShowKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConstraintSpec {
-    Unique,
-    Required,
-    Type(PropertyType),
+    Unique { property: ParamValue },
+    Required { property: ParamValue },
+    Type {
+        property: ParamValue,
+        value_type: PropertyType,
+    },
+    Endpoints {
+        from_label: ParamValue,
+        to_label: ParamValue,
+    },
+    MaxOutgoing(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParamValue {
+    Literal(String),
+    Parameter(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaTargetExpr {
+    kind: TargetKind,
+    name: ParamValue,
+}
+
+impl SchemaTargetExpr {
+    pub fn label(name: ParamValue) -> Self {
+        Self {
+            kind: TargetKind::Label,
+            name,
+        }
+    }
+
+    pub fn edge_type(name: ParamValue) -> Self {
+        Self {
+            kind: TargetKind::EdgeType,
+            name,
+        }
+    }
+
+    pub fn kind(&self) -> TargetKind {
+        self.kind
+    }
+
+    pub fn name(&self) -> &ParamValue {
+        &self.name
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +142,7 @@ pub struct Query {
     pub merge_clause: Option<Pattern>,
     pub create_clause: Option<Pattern>,
     pub set_clause: Vec<SetAssignment>,
-    pub remove_clause: Vec<PropertyTarget>,
+    pub remove_clause: Vec<RemoveTarget>,
     pub delete_clause: Vec<String>,
     pub return_all: bool,
     pub return_clause: Vec<ReturnItem>,
@@ -158,14 +213,37 @@ pub struct HopRange {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SetAssignment {
-    pub target: PropertyTarget,
+    pub target: SetTarget,
+    pub op: SetOperator,
     pub value: Expr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOperator {
+    Assign,
+    Merge,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SetTarget {
+    Property(PropertyTarget),
+    PropertyIndex {
+        target: PropertyTarget,
+        index: Expr,
+    },
+    Entity(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyTarget {
     pub variable: String,
     pub property: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoveTarget {
+    Property(PropertyTarget),
+    Label { variable: String, label: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -480,6 +558,9 @@ impl Parser {
         if self.consume_keyword("DROP")? {
             return self.parse_drop_statement();
         }
+        if self.consume_keyword("ALTER")? {
+            return self.parse_alter_statement();
+        }
 
         let query = self.parse_query()?;
         if query.is_empty() {
@@ -538,6 +619,12 @@ impl Parser {
     }
 
     fn parse_create_statement(&mut self) -> Result<Statement, QueryError> {
+        let or_replace = if self.consume_keyword("OR")? {
+            self.expect_keyword("REPLACE")?;
+            true
+        } else {
+            false
+        };
         let if_not_exists = if self.consume_keyword("IF")? {
             self.expect_keyword("NOT")?;
             self.expect_keyword("EXISTS")?;
@@ -545,56 +632,56 @@ impl Parser {
         } else {
             false
         };
+        if or_replace && if_not_exists {
+            return self.error_here(
+                "parse_create_statement",
+                "CREATE OR REPLACE cannot be combined with IF NOT EXISTS",
+            );
+        }
 
         if self.consume_keyword("LABEL")? {
             return Ok(Statement::CreateLabel {
-                name: self.expect_identifier()?,
+                name: self.expect_param_value()?,
                 description: self.parse_optional_description()?,
                 if_not_exists,
+                or_replace,
             });
         }
         if self.consume_keyword("EDGE")? {
             self.expect_keyword("TYPE")?;
             return Ok(Statement::CreateEdgeType {
-                name: self.expect_identifier()?,
+                name: self.expect_param_value()?,
                 description: self.parse_optional_description()?,
                 if_not_exists,
+                or_replace,
             });
         }
         if self.consume_keyword("INDEX")? {
             let name = self.parse_optional_identifier_before("ON")?;
             self.expect_keyword("ON")?;
-            let target = self.parse_schema_target()?;
+            let target = self.parse_schema_target_expr()?;
             self.expect_token(TokenDiscriminant::LParen)?;
-            let property = self.expect_identifier()?;
+            let property = self.expect_param_value()?;
             self.expect_token(TokenDiscriminant::RParen)?;
             return Ok(Statement::CreateIndex {
                 name,
                 target,
                 property,
                 if_not_exists,
+                or_replace,
             });
         }
         if self.consume_keyword("CONSTRAINT")? {
             let name = self.parse_optional_identifier_before("ON")?;
             self.expect_keyword("ON")?;
-            let target = self.parse_schema_target()?;
+            let target = self.parse_schema_target_expr()?;
             self.expect_keyword("REQUIRE")?;
-            let property = self.expect_identifier()?;
-            let constraint = if self.consume_keyword("UNIQUE")? {
-                ConstraintSpec::Unique
-            } else if self.consume_keyword("REQUIRED")? {
-                ConstraintSpec::Required
-            } else {
-                self.expect_keyword("TYPE")?;
-                ConstraintSpec::Type(self.parse_property_type()?)
-            };
             return Ok(Statement::CreateConstraint {
                 name,
                 target,
-                property,
-                constraint,
+                constraint: self.parse_constraint_spec()?,
                 if_not_exists,
+                or_replace,
             });
         }
         self.error_here(
@@ -612,32 +699,57 @@ impl Parser {
         };
         if self.consume_keyword("LABEL")? {
             return Ok(Statement::DropLabel {
-                name: self.expect_identifier()?,
+                name: self.expect_param_value()?,
                 if_exists,
             });
         }
         if self.consume_keyword("EDGE")? {
             self.expect_keyword("TYPE")?;
             return Ok(Statement::DropEdgeType {
-                name: self.expect_identifier()?,
+                name: self.expect_param_value()?,
                 if_exists,
             });
         }
         if self.consume_keyword("INDEX")? {
             return Ok(Statement::DropIndex {
-                name: self.expect_identifier()?,
+                name: self.expect_param_value()?,
                 if_exists,
             });
         }
         if self.consume_keyword("CONSTRAINT")? {
             return Ok(Statement::DropConstraint {
-                name: self.expect_identifier()?,
+                name: self.expect_param_value()?,
                 if_exists,
             });
         }
         self.error_here(
             "parse_drop_statement",
             "expected LABEL, EDGE TYPE, INDEX, or CONSTRAINT",
+        )
+    }
+
+    fn parse_alter_statement(&mut self) -> Result<Statement, QueryError> {
+        if self.consume_keyword("INDEX")? {
+            let name = self.expect_param_value()?;
+            self.expect_keyword("SET")?;
+            self.expect_keyword("STATUS")?;
+            return Ok(Statement::AlterIndex {
+                name,
+                status: self.parse_index_status()?,
+            });
+        }
+        if self.consume_keyword("CONSTRAINT")? {
+            let name = self.expect_param_value()?;
+            self.expect_keyword("RENAME")?;
+            self.expect_keyword("TO")?;
+            return Ok(Statement::AlterConstraint {
+                name,
+                rename_to: self.expect_param_value()?,
+            });
+        }
+        self.error_here(
+            "parse_alter_statement",
+            "expected INDEX or CONSTRAINT",
         )
     }
 
@@ -859,12 +971,24 @@ impl Parser {
     fn parse_set_clause(&mut self) -> Result<Vec<SetAssignment>, QueryError> {
         let mut assignments = Vec::new();
         loop {
+            let target = self.parse_set_target()?;
+            let op = if self.consume_token(TokenDiscriminant::Plus) {
+                self.expect_token(TokenDiscriminant::Eq)?;
+                SetOperator::Merge
+            } else {
+                self.expect_token(TokenDiscriminant::Eq)?;
+                SetOperator::Assign
+            };
+            if matches!(target, SetTarget::Entity(_)) && op != SetOperator::Merge {
+                return self.error_here(
+                    "parse_set_clause",
+                    "entity SET targets require += with a map payload",
+                );
+            }
             assignments.push(SetAssignment {
-                target: self.parse_property_target()?,
-                value: {
-                    self.expect_token(TokenDiscriminant::Eq)?;
-                    self.parse_expr()?
-                },
+                target,
+                op,
+                value: self.parse_expr()?,
             });
             if !self.consume_token(TokenDiscriminant::Comma) {
                 break;
@@ -873,10 +997,22 @@ impl Parser {
         Ok(assignments)
     }
 
-    fn parse_remove_clause(&mut self) -> Result<Vec<PropertyTarget>, QueryError> {
+    fn parse_remove_clause(&mut self) -> Result<Vec<RemoveTarget>, QueryError> {
         let mut targets = Vec::new();
         loop {
-            targets.push(self.parse_property_target()?);
+            let variable = self.expect_identifier()?;
+            if self.consume_token(TokenDiscriminant::Dot) {
+                targets.push(RemoveTarget::Property(PropertyTarget {
+                    variable,
+                    property: self.expect_identifier()?,
+                }));
+            } else {
+                self.expect_token(TokenDiscriminant::Colon)?;
+                targets.push(RemoveTarget::Label {
+                    variable,
+                    label: self.expect_identifier()?,
+                });
+            }
             if !self.consume_token(TokenDiscriminant::Comma) {
                 break;
             }
@@ -937,11 +1073,20 @@ impl Parser {
         Ok(items)
     }
 
-    fn parse_property_target(&mut self) -> Result<PropertyTarget, QueryError> {
+    fn parse_set_target(&mut self) -> Result<SetTarget, QueryError> {
         let variable = self.expect_identifier()?;
-        self.expect_token(TokenDiscriminant::Dot)?;
+        if !self.consume_token(TokenDiscriminant::Dot) {
+            return Ok(SetTarget::Entity(variable));
+        }
         let property = self.expect_identifier()?;
-        Ok(PropertyTarget { variable, property })
+        let target = PropertyTarget { variable, property };
+        if self.consume_token(TokenDiscriminant::LBracket) {
+            let index = self.parse_expr()?;
+            self.expect_token(TokenDiscriminant::RBracket)?;
+            Ok(SetTarget::PropertyIndex { target, index })
+        } else {
+            Ok(SetTarget::Property(target))
+        }
     }
 
     fn parse_expr(&mut self) -> Result<Expr, QueryError> {
@@ -1231,37 +1376,78 @@ impl Parser {
         Ok(SchemaTarget::edge_type(name))
     }
 
+    fn parse_schema_target_expr(&mut self) -> Result<SchemaTargetExpr, QueryError> {
+        if self.consume_token(TokenDiscriminant::Colon) {
+            return Ok(SchemaTargetExpr::label(self.expect_param_value()?));
+        }
+        self.expect_token(TokenDiscriminant::LBracket)?;
+        self.expect_token(TokenDiscriminant::Colon)?;
+        let name = self.expect_param_value()?;
+        self.expect_token(TokenDiscriminant::RBracket)?;
+        Ok(SchemaTargetExpr::edge_type(name))
+    }
+
     fn parse_optional_identifier_before(
         &mut self,
         sentinel_keyword: &str,
-    ) -> Result<Option<String>, QueryError> {
+    ) -> Result<Option<ParamValue>, QueryError> {
         if self.peek_keyword(sentinel_keyword) {
             Ok(None)
         } else {
-            Ok(Some(self.expect_identifier()?))
+            Ok(Some(self.expect_param_value()?))
         }
     }
 
-    fn parse_optional_description(&mut self) -> Result<Option<String>, QueryError> {
+    fn parse_optional_description(&mut self) -> Result<Option<ParamValue>, QueryError> {
         if self.consume_keyword("DESCRIPTION")? {
-            return self
-                .try_string()
-                .ok_or_else(|| {
-                    let token = self.peek().cloned().unwrap_or(Token {
-                        kind: TokenKind::Semicolon,
-                        line: 1,
-                        column: 1,
-                    });
-                    QueryError::new(
-                        "parse_string",
-                        "expected a string literal after DESCRIPTION",
-                        token.line,
-                        token.column,
-                    )
-                })
-                .map(Some);
+            return Ok(Some(self.expect_string_param_value()?));
         }
         Ok(None)
+    }
+
+    fn parse_constraint_spec(&mut self) -> Result<ConstraintSpec, QueryError> {
+        if self.consume_keyword("ENDPOINTS")? {
+            self.expect_token(TokenDiscriminant::Colon)?;
+            let from_label = self.expect_param_value()?;
+            self.expect_token(TokenDiscriminant::ArrowRight)?;
+            self.expect_token(TokenDiscriminant::Colon)?;
+            let to_label = self.expect_param_value()?;
+            return Ok(ConstraintSpec::Endpoints {
+                from_label,
+                to_label,
+            });
+        }
+        if self.consume_keyword("MAX")? {
+            self.expect_keyword("OUTGOING")?;
+            return Ok(ConstraintSpec::MaxOutgoing(
+                self.expect_limit_value()?,
+            ));
+        }
+
+        let property = self.expect_param_value()?;
+        if self.consume_keyword("UNIQUE")? {
+            return Ok(ConstraintSpec::Unique { property });
+        }
+        if self.consume_keyword("REQUIRED")? {
+            return Ok(ConstraintSpec::Required { property });
+        }
+        self.expect_keyword("TYPE")?;
+        Ok(ConstraintSpec::Type {
+            property,
+            value_type: self.parse_property_type()?,
+        })
+    }
+
+    fn parse_index_status(&mut self) -> Result<IndexStatus, QueryError> {
+        match self.expect_identifier()?.as_str() {
+            "READY" | "ready" => Ok(IndexStatus::Ready),
+            "BUILDING" | "building" => Ok(IndexStatus::Building),
+            "INVALID" | "invalid" => Ok(IndexStatus::Invalid),
+            _ => self.error_here(
+                "parse_index_status",
+                "expected READY, BUILDING, or INVALID",
+            ),
+        }
     }
 
     fn expect_limit_value(&mut self) -> Result<usize, QueryError> {
@@ -1321,6 +1507,50 @@ impl Parser {
                 token.line,
                 token.column,
             ))
+        }
+    }
+
+    fn expect_param_value(&mut self) -> Result<ParamValue, QueryError> {
+        let token = self.peek().cloned().ok_or_else(|| {
+            QueryError::new("parse_unexpected_eof", "unexpected end of input", 1, 1)
+        })?;
+        match token.kind {
+            TokenKind::Identifier(value) => {
+                self.advance();
+                Ok(ParamValue::Literal(value))
+            }
+            TokenKind::Parameter(value) => {
+                self.advance();
+                Ok(ParamValue::Parameter(value))
+            }
+            _ => Err(QueryError::new(
+                "parse_expected_identifier",
+                "expected an identifier or parameter",
+                token.line,
+                token.column,
+            )),
+        }
+    }
+
+    fn expect_string_param_value(&mut self) -> Result<ParamValue, QueryError> {
+        let token = self.peek().cloned().ok_or_else(|| {
+            QueryError::new("parse_unexpected_eof", "unexpected end of input", 1, 1)
+        })?;
+        match token.kind {
+            TokenKind::String(value) => {
+                self.advance();
+                Ok(ParamValue::Literal(value))
+            }
+            TokenKind::Parameter(value) => {
+                self.advance();
+                Ok(ParamValue::Parameter(value))
+            }
+            _ => Err(QueryError::new(
+                "parse_string",
+                "expected a string literal or parameter",
+                token.line,
+                token.column,
+            )),
         }
     }
 
@@ -2270,7 +2500,8 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryOp, ConstraintSpec, Expr, PropertyTarget, Query, ShowKind, Statement, parse_script,
+        BinaryOp, ConstraintSpec, Expr, ParamValue, PropertyTarget, Query, RemoveTarget,
+        SchemaTargetExpr, SetOperator, SetTarget, ShowKind, Statement, parse_script,
     };
     use crate::engine::{PropertyType, SchemaTarget};
 
@@ -2289,27 +2520,33 @@ mod tests {
             statements,
             vec![
                 Statement::CreateLabel {
-                    name: "Person".to_owned(),
+                    name: ParamValue::Literal("Person".to_owned()),
                     description: None,
                     if_not_exists: false,
+                    or_replace: false,
                 },
                 Statement::CreateEdgeType {
-                    name: "KNOWS".to_owned(),
+                    name: ParamValue::Literal("KNOWS".to_owned()),
                     description: None,
                     if_not_exists: false,
+                    or_replace: false,
                 },
                 Statement::CreateIndex {
                     name: None,
-                    target: SchemaTarget::label("Person"),
-                    property: "email".to_owned(),
+                    target: SchemaTargetExpr::label(ParamValue::Literal("Person".to_owned())),
+                    property: ParamValue::Literal("email".to_owned()),
                     if_not_exists: false,
+                    or_replace: false,
                 },
                 Statement::CreateConstraint {
                     name: None,
-                    target: SchemaTarget::label("Person"),
-                    property: "age".to_owned(),
-                    constraint: ConstraintSpec::Type(PropertyType::Int),
+                    target: SchemaTargetExpr::label(ParamValue::Literal("Person".to_owned())),
+                    constraint: ConstraintSpec::Type {
+                        property: ParamValue::Literal("age".to_owned()),
+                        value_type: PropertyType::Int,
+                    },
                     if_not_exists: false,
+                    or_replace: false,
                 },
                 Statement::Show(ShowKind::Indexes(None)),
             ]
@@ -2329,17 +2566,19 @@ mod tests {
         assert_eq!(
             statements[0],
             Statement::CreateLabel {
-                name: "Person".to_owned(),
-                description: Some("People".to_owned()),
+                name: ParamValue::Literal("Person".to_owned()),
+                description: Some(ParamValue::Literal("People".to_owned())),
                 if_not_exists: false,
+                or_replace: false,
             }
         );
         assert_eq!(
             statements[1],
             Statement::CreateEdgeType {
-                name: "KNOWS".to_owned(),
-                description: Some("Relationships".to_owned()),
+                name: ParamValue::Literal("KNOWS".to_owned()),
+                description: Some(ParamValue::Literal("Relationships".to_owned())),
                 if_not_exists: false,
+                or_replace: false,
             }
         );
         assert_eq!(
@@ -2402,12 +2641,20 @@ mod tests {
         assert!(query.create_clause.is_some());
         assert_eq!(
             query.set_clause[0].target,
-            PropertyTarget {
+            SetTarget::Property(PropertyTarget {
                 variable: "n".to_owned(),
                 property: "role".to_owned(),
-            }
+            })
         );
+        assert_eq!(query.set_clause[0].op, SetOperator::Assign);
         assert_eq!(query.remove_clause.len(), 1);
+        assert_eq!(
+            query.remove_clause[0],
+            RemoveTarget::Property(PropertyTarget {
+                variable: "n".to_owned(),
+                property: "old_field".to_owned(),
+            })
+        );
         assert_eq!(query.delete_clause, vec!["m"]);
     }
 

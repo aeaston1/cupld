@@ -11,8 +11,9 @@ use crate::engine::{
     Node, NodeId, PropertyMap, SchemaRow, SchemaTarget, Value,
 };
 use crate::query::{
-    BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, OrderItem, Pattern, PatternSegment,
-    PropertyTarget, Query, QueryError, ReturnItem, ShowKind, Statement, UnaryOp, parse_script,
+    BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, OrderItem, ParamValue, Pattern,
+    PatternSegment, PropertyTarget, Query, QueryError, RemoveTarget, ReturnItem, SetOperator,
+    SetTarget, ShowKind, Statement, UnaryOp, parse_script,
 };
 use crate::storage;
 
@@ -437,15 +438,21 @@ impl Session {
                 name,
                 description,
                 if_not_exists,
+                or_replace,
             } => {
                 self.engine
-                    .create_label(name, description.clone(), *if_not_exists)
+                    .create_label(
+                        &resolve_param_value(name, params, "schema name")?,
+                        resolve_optional_param_value(description.as_ref(), params, "description")?,
+                        *if_not_exists,
+                        *or_replace,
+                    )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
             Statement::DropLabel { name, if_exists } => {
                 self.engine
-                    .drop_label(name, *if_exists)
+                    .drop_label(&resolve_param_value(name, params, "schema name")?, *if_exists)
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -453,15 +460,21 @@ impl Session {
                 name,
                 description,
                 if_not_exists,
+                or_replace,
             } => {
                 self.engine
-                    .create_edge_type(name, description.clone(), *if_not_exists)
+                    .create_edge_type(
+                        &resolve_param_value(name, params, "schema name")?,
+                        resolve_optional_param_value(description.as_ref(), params, "description")?,
+                        *if_not_exists,
+                        *or_replace,
+                    )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
             Statement::DropEdgeType { name, if_exists } => {
                 self.engine
-                    .drop_edge_type(name, *if_exists)
+                    .drop_edge_type(&resolve_param_value(name, params, "schema name")?, *if_exists)
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -470,43 +483,72 @@ impl Session {
                 target,
                 property,
                 if_not_exists,
+                or_replace,
             } => {
+                let resolved_name = resolve_optional_param_value(name.as_ref(), params, "index name")?;
+                let resolved_target = resolve_schema_target(target, params)?;
+                let resolved_property = resolve_param_value(property, params, "property name")?;
                 self.engine
-                    .create_index(name.as_deref(), target.clone(), property, *if_not_exists)
+                    .create_index(
+                        resolved_name.as_deref(),
+                        resolved_target,
+                        &resolved_property,
+                        *if_not_exists,
+                        *or_replace,
+                    )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
             Statement::DropIndex { name, if_exists } => {
                 self.engine
-                    .drop_index(name, *if_exists)
+                    .drop_index(&resolve_param_value(name, params, "index name")?, *if_exists)
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::AlterIndex { name, status } => {
+                self.engine
+                    .alter_index_status(&resolve_param_value(name, params, "index name")?, *status)
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
             Statement::CreateConstraint {
                 name,
                 target,
-                property,
                 constraint,
                 if_not_exists,
+                or_replace,
             } => {
+                let resolved_name =
+                    resolve_optional_param_value(name.as_ref(), params, "constraint name")?;
+                let resolved_target = resolve_schema_target(target, params)?;
+                let (property, resolved_constraint) = resolve_constraint_spec(constraint, params)?;
                 self.engine
                     .create_constraint(
-                        name.as_deref(),
-                        target.clone(),
-                        property,
-                        match constraint {
-                            ConstraintSpec::Unique => ConstraintType::Unique,
-                            ConstraintSpec::Required => ConstraintType::Required,
-                            ConstraintSpec::Type(kind) => ConstraintType::Type(*kind),
-                        },
+                        resolved_name.as_deref(),
+                        resolved_target,
+                        &property,
+                        resolved_constraint,
                         *if_not_exists,
+                        *or_replace,
                     )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
             Statement::DropConstraint { name, if_exists } => {
                 self.engine
-                    .drop_constraint(name, *if_exists)
+                    .drop_constraint(
+                        &resolve_param_value(name, params, "constraint name")?,
+                        *if_exists,
+                    )
+                    .map_err(ExecutionError::from)?;
+                Ok(empty_result())
+            }
+            Statement::AlterConstraint { name, rename_to } => {
+                self.engine
+                    .rename_constraint(
+                        &resolve_param_value(name, params, "constraint name")?,
+                        &resolve_param_value(rename_to, params, "constraint name")?,
+                    )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -1376,30 +1418,22 @@ impl Session {
         for row in rows {
             for assignment in assignments {
                 let value = self.eval_expr(&assignment.value, row, params)?;
-                let graph_value = value.to_graph_value()?;
-                match row.get(&assignment.target.variable) {
-                    Some(RuntimeValue::Node(node_id)) => {
-                        self.engine
-                            .set_node_property(
-                                *node_id,
-                                assignment.target.property.clone(),
-                                graph_value,
-                            )
-                            .map_err(ExecutionError::from)?;
+                match (&assignment.target, assignment.op) {
+                    (SetTarget::Property(target), SetOperator::Assign) => {
+                        let graph_value = value.to_graph_value()?;
+                        self.apply_property_set(row, target, graph_value)?;
                     }
-                    Some(RuntimeValue::Edge(edge_id)) => {
-                        self.engine
-                            .set_edge_property(
-                                *edge_id,
-                                assignment.target.property.clone(),
-                                graph_value,
-                            )
-                            .map_err(ExecutionError::from)?;
+                    (SetTarget::PropertyIndex { target, index }, SetOperator::Assign) => {
+                        let patch_index = self.eval_expr(index, row, params)?;
+                        self.apply_indexed_property_set(row, target, &patch_index, value)?;
+                    }
+                    (SetTarget::Entity(variable), SetOperator::Merge) => {
+                        self.apply_entity_merge(row, variable, value)?;
                     }
                     _ => {
                         return Err(ExecutionError::new(
                             "set_target",
-                            "SET targets must resolve to a node or edge variable",
+                            "unsupported SET target or operator",
                         ));
                     }
                 }
@@ -1411,28 +1445,203 @@ impl Session {
     fn apply_remove_clause(
         &mut self,
         rows: &[Row],
-        targets: &[PropertyTarget],
+        targets: &[RemoveTarget],
     ) -> Result<(), ExecutionError> {
         for row in rows {
             for target in targets {
-                match row.get(&target.variable) {
-                    Some(RuntimeValue::Node(node_id)) => {
-                        self.engine
-                            .remove_node_property(*node_id, &target.property)
-                            .map_err(ExecutionError::from)?;
-                    }
-                    Some(RuntimeValue::Edge(edge_id)) => {
-                        self.engine
-                            .remove_edge_property(*edge_id, &target.property)
-                            .map_err(ExecutionError::from)?;
-                    }
-                    _ => {
-                        return Err(ExecutionError::new(
-                            "remove_target",
-                            "REMOVE targets must resolve to a node or edge variable",
-                        ));
+                match target {
+                    RemoveTarget::Property(target) => match row.get(&target.variable) {
+                        Some(RuntimeValue::Node(node_id)) => {
+                            self.engine
+                                .remove_node_property(*node_id, &target.property)
+                                .map_err(ExecutionError::from)?;
+                        }
+                        Some(RuntimeValue::Edge(edge_id)) => {
+                            self.engine
+                                .remove_edge_property(*edge_id, &target.property)
+                                .map_err(ExecutionError::from)?;
+                        }
+                        _ => {
+                            return Err(ExecutionError::new(
+                                "remove_target",
+                                "REMOVE targets must resolve to a node or edge variable",
+                            ));
+                        }
+                    },
+                    RemoveTarget::Label { variable, label } => match row.get(variable) {
+                        Some(RuntimeValue::Node(node_id)) => {
+                            self.engine
+                                .remove_node_label(*node_id, label)
+                                .map_err(ExecutionError::from)?;
+                        }
+                        _ => {
+                            return Err(ExecutionError::new(
+                                "remove_target",
+                                "REMOVE label targets must resolve to a node variable",
+                            ));
+                        }
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_property_set(
+        &mut self,
+        row: &Row,
+        target: &PropertyTarget,
+        graph_value: Value,
+    ) -> Result<(), ExecutionError> {
+        match row.get(&target.variable) {
+            Some(RuntimeValue::Node(node_id)) => {
+                self.engine
+                    .set_node_property(*node_id, target.property.clone(), graph_value)
+                    .map_err(ExecutionError::from)?;
+            }
+            Some(RuntimeValue::Edge(edge_id)) => {
+                self.engine
+                    .set_edge_property(*edge_id, target.property.clone(), graph_value)
+                    .map_err(ExecutionError::from)?;
+            }
+            _ => {
+                return Err(ExecutionError::new(
+                    "set_target",
+                    "SET targets must resolve to a node or edge variable",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_indexed_property_set(
+        &mut self,
+        row: &Row,
+        target: &PropertyTarget,
+        patch_index: &RuntimeValue,
+        value: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        let index = match patch_index {
+            RuntimeValue::Int(value) if *value >= 0 => *value as usize,
+            _ => {
+                return Err(ExecutionError::new(
+                    "index_type_error",
+                    "list patch indexes must be non-negative integers",
+                ));
+            }
+        };
+        match row.get(&target.variable) {
+            Some(RuntimeValue::Node(node_id)) => {
+                let mut list = match self
+                    .engine
+                    .node(*node_id)
+                    .and_then(|node| node.property(&target.property))
+                {
+                    Some(Value::List(values)) => values.clone(),
+                    Some(Value::Null) | None => Vec::new(),
+                    Some(_) => {
+                        return Err(ExecutionError::new(
+                            "set_target",
+                            "indexed SET targets require a list property",
+                        ));
+                    }
+                };
+                if index >= list.len() {
+                    return Err(ExecutionError::new(
+                        "index_type_error",
+                        "list patch index is out of bounds",
+                    ));
+                }
+                list[index] = value.to_graph_value()?;
+                self.engine
+                    .set_node_property(*node_id, target.property.clone(), Value::List(list))
+                    .map_err(ExecutionError::from)?;
+            }
+            Some(RuntimeValue::Edge(edge_id)) => {
+                let mut list = match self
+                    .engine
+                    .edge(*edge_id)
+                    .and_then(|edge| edge.property(&target.property))
+                {
+                    Some(Value::List(values)) => values.clone(),
+                    Some(Value::Null) | None => Vec::new(),
+                    Some(_) => {
+                        return Err(ExecutionError::new(
+                            "set_target",
+                            "indexed SET targets require a list property",
+                        ));
+                    }
+                };
+                if index >= list.len() {
+                    return Err(ExecutionError::new(
+                        "index_type_error",
+                        "list patch index is out of bounds",
+                    ));
+                }
+                list[index] = value.to_graph_value()?;
+                self.engine
+                    .set_edge_property(*edge_id, target.property.clone(), Value::List(list))
+                    .map_err(ExecutionError::from)?;
+            }
+            _ => {
+                return Err(ExecutionError::new(
+                    "set_target",
+                    "SET targets must resolve to a node or edge variable",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_entity_merge(
+        &mut self,
+        row: &Row,
+        variable: &str,
+        value: RuntimeValue,
+    ) -> Result<(), ExecutionError> {
+        let RuntimeValue::Map(entries) = value else {
+            return Err(ExecutionError::new(
+                "graph_value_conversion",
+                "SET += requires a map payload",
+            ));
+        };
+        let patch = runtime_entries_to_property_map(&entries)?;
+        match row.get(variable) {
+            Some(RuntimeValue::Node(node_id)) => {
+                let mut properties = self
+                    .engine
+                    .node(*node_id)
+                    .map(|node| node.properties().clone())
+                    .ok_or_else(|| {
+                        ExecutionError::new("set_target", "SET targets must resolve to a node")
+                    })?;
+                for (key, value) in patch {
+                    properties.insert(key, value);
+                }
+                self.engine
+                    .replace_node_properties(*node_id, properties)
+                    .map_err(ExecutionError::from)?;
+            }
+            Some(RuntimeValue::Edge(edge_id)) => {
+                let mut properties = self
+                    .engine
+                    .edge(*edge_id)
+                    .map(|edge| edge.properties().clone())
+                    .ok_or_else(|| {
+                        ExecutionError::new("set_target", "SET targets must resolve to an edge")
+                    })?;
+                for (key, value) in patch {
+                    properties.insert(key, value);
+                }
+                self.engine
+                    .replace_edge_properties(*edge_id, properties)
+                    .map_err(ExecutionError::from)?;
+            }
+            _ => {
+                return Err(ExecutionError::new(
+                    "set_target",
+                    "SET += targets must resolve to a node or edge variable",
+                ));
             }
         }
         Ok(())
@@ -1931,6 +2140,22 @@ impl Session {
                 values.push(value.clone());
                 Ok(RuntimeValue::List(values))
             }
+            ("insert", [RuntimeValue::Null, RuntimeValue::Int(index), value]) if *index == 0 => {
+                Ok(RuntimeValue::List(vec![value.clone()]))
+            }
+            ("insert", [RuntimeValue::List(values), RuntimeValue::Int(index), value])
+                if *index >= 0 && (*index as usize) <= values.len() =>
+            {
+                let mut values = values.clone();
+                values.insert(*index as usize, value.clone());
+                Ok(RuntimeValue::List(values))
+            }
+            ("insert", [RuntimeValue::List(_), RuntimeValue::Int(_), _]) => {
+                Err(ExecutionError::new(
+                    "index_type_error",
+                    "insert indexes must fall within the list bounds",
+                ))
+            }
             ("remove", [RuntimeValue::Null, _]) => Ok(RuntimeValue::Null),
             ("remove", [RuntimeValue::List(values), value]) => Ok(RuntimeValue::List(
                 values
@@ -2061,8 +2286,10 @@ impl Statement {
             | Self::CreateEdgeType { .. }
             | Self::DropEdgeType { .. }
             | Self::CreateIndex { .. }
+            | Self::AlterIndex { .. }
             | Self::DropIndex { .. }
             | Self::CreateConstraint { .. }
+            | Self::AlterConstraint { .. }
             | Self::DropConstraint { .. } => true,
             Self::Query(query) => {
                 query.merge_clause.is_some()
@@ -2401,6 +2628,88 @@ fn eval_property_map(
     Ok(map)
 }
 
+fn runtime_entries_to_property_map(entries: &[(String, RuntimeValue)]) -> Result<PropertyMap, ExecutionError> {
+    let mut map = PropertyMap::new();
+    for (key, value) in entries {
+        map.insert(key.clone(), value.to_graph_value()?);
+    }
+    Ok(map)
+}
+
+fn resolve_param_value(
+    value: &ParamValue,
+    params: &BTreeMap<String, Value>,
+    role: &str,
+) -> Result<String, ExecutionError> {
+    match value {
+        ParamValue::Literal(value) => Ok(value.clone()),
+        ParamValue::Parameter(name) => match params.get(name) {
+            Some(Value::String(value)) => Ok(value.clone()),
+            Some(_) => Err(ExecutionError::new(
+                "graph_value_conversion",
+                format!("{role} parameters must resolve to strings"),
+            )),
+            None => Err(ExecutionError::new(
+                "unknown_variable",
+                format!("missing parameter ${name}"),
+            )),
+        },
+    }
+}
+
+fn resolve_optional_param_value(
+    value: Option<&ParamValue>,
+    params: &BTreeMap<String, Value>,
+    role: &str,
+) -> Result<Option<String>, ExecutionError> {
+    value.map(|value| resolve_param_value(value, params, role)).transpose()
+}
+
+fn resolve_schema_target(
+    target: &crate::query::SchemaTargetExpr,
+    params: &BTreeMap<String, Value>,
+) -> Result<SchemaTarget, ExecutionError> {
+    let name = resolve_param_value(target.name(), params, "schema target")?;
+    Ok(match target.kind() {
+        crate::engine::TargetKind::Label => SchemaTarget::label(name),
+        crate::engine::TargetKind::EdgeType => SchemaTarget::edge_type(name),
+    })
+}
+
+fn resolve_constraint_spec(
+    spec: &ConstraintSpec,
+    params: &BTreeMap<String, Value>,
+) -> Result<(String, ConstraintType), ExecutionError> {
+    Ok(match spec {
+        ConstraintSpec::Unique { property } => (
+            resolve_param_value(property, params, "property name")?,
+            ConstraintType::Unique,
+        ),
+        ConstraintSpec::Required { property } => (
+            resolve_param_value(property, params, "property name")?,
+            ConstraintType::Required,
+        ),
+        ConstraintSpec::Type {
+            property,
+            value_type,
+        } => (
+            resolve_param_value(property, params, "property name")?,
+            ConstraintType::Type(*value_type),
+        ),
+        ConstraintSpec::Endpoints {
+            from_label,
+            to_label,
+        } => (
+            String::new(),
+            ConstraintType::Endpoints {
+                from_label: resolve_param_value(from_label, params, "label name")?,
+                to_label: resolve_param_value(to_label, params, "label name")?,
+            },
+        ),
+        ConstraintSpec::MaxOutgoing(limit) => (String::new(), ConstraintType::MaxOutgoing(*limit)),
+    })
+}
+
 fn runtime_from_value(value: &Value) -> RuntimeValue {
     match value {
         Value::Null => RuntimeValue::Null,
@@ -2635,14 +2944,28 @@ fn build_explain_rows(
     let (operator, detail) = match statement {
         Statement::Show(kind) => ("Show", show_kind_detail(kind)),
         Statement::Explain(_) => ("Explain", String::new()),
-        Statement::CreateLabel { name, .. } => ("CreateLabel", name.clone()),
-        Statement::DropLabel { name, .. } => ("DropLabel", name.clone()),
-        Statement::CreateEdgeType { name, .. } => ("CreateEdgeType", name.clone()),
-        Statement::DropEdgeType { name, .. } => ("DropEdgeType", name.clone()),
-        Statement::CreateIndex { property, .. } => ("CreateIndex", property.clone()),
-        Statement::DropIndex { name, .. } => ("DropIndex", name.clone()),
-        Statement::CreateConstraint { property, .. } => ("CreateConstraint", property.clone()),
-        Statement::DropConstraint { name, .. } => ("DropConstraint", name.clone()),
+        Statement::CreateLabel { name, .. } => ("CreateLabel", param_value_detail(name)),
+        Statement::DropLabel { name, .. } => ("DropLabel", param_value_detail(name)),
+        Statement::CreateEdgeType { name, .. } => ("CreateEdgeType", param_value_detail(name)),
+        Statement::DropEdgeType { name, .. } => ("DropEdgeType", param_value_detail(name)),
+        Statement::CreateIndex { property, .. } => ("CreateIndex", param_value_detail(property)),
+        Statement::AlterIndex { name, status } => (
+            "AlterIndex",
+            format!("{} {}", param_value_detail(name), status.as_str()),
+        ),
+        Statement::DropIndex { name, .. } => ("DropIndex", param_value_detail(name)),
+        Statement::CreateConstraint { constraint, .. } => {
+            ("CreateConstraint", constraint_spec_detail(constraint))
+        }
+        Statement::AlterConstraint { name, rename_to } => (
+            "AlterConstraint",
+            format!(
+                "{} -> {}",
+                param_value_detail(name),
+                param_value_detail(rename_to)
+            ),
+        ),
+        Statement::DropConstraint { name, .. } => ("DropConstraint", param_value_detail(name)),
         Statement::Begin => ("Begin", String::new()),
         Statement::Commit => ("Commit", String::new()),
         Statement::Rollback => ("Rollback", String::new()),
@@ -2730,6 +3053,35 @@ fn add_explain_child(
         RuntimeValue::String(operator.to_owned()),
         RuntimeValue::String(detail.to_owned()),
     ]);
+}
+
+fn param_value_detail(value: &ParamValue) -> String {
+    match value {
+        ParamValue::Literal(value) => value.clone(),
+        ParamValue::Parameter(name) => format!("${name}"),
+    }
+}
+
+fn constraint_spec_detail(spec: &ConstraintSpec) -> String {
+    match spec {
+        ConstraintSpec::Unique { property } => format!("{} UNIQUE", param_value_detail(property)),
+        ConstraintSpec::Required { property } => {
+            format!("{} REQUIRED", param_value_detail(property))
+        }
+        ConstraintSpec::Type {
+            property,
+            value_type,
+        } => format!("{} TYPE {}", param_value_detail(property), value_type),
+        ConstraintSpec::Endpoints {
+            from_label,
+            to_label,
+        } => format!(
+            "ENDPOINTS :{} -> :{}",
+            param_value_detail(from_label),
+            param_value_detail(to_label)
+        ),
+        ConstraintSpec::MaxOutgoing(limit) => format!("MAX OUTGOING {limit}"),
+    }
 }
 
 #[derive(Default)]

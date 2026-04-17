@@ -2,7 +2,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use cupld::{RuntimeValue, Session, Value};
+use cupld::{PropertyMap, RuntimeValue, Session, Value};
 
 use support::{TestDb, run, run_with_params, seed_person_graph, sorted_debug_rows, string_cell};
 
@@ -650,4 +650,157 @@ fn file_backed_queries_accept_named_parameters() {
         &params,
     );
     assert_eq!(string_cell(&reopened_result, 0, 0), "ada@example.com");
+}
+
+#[test]
+fn wave5_update_semantics_cover_list_patches_merges_and_label_removal() {
+    let db = TestDb::new("wave5_updates");
+    let mut session = db.open();
+
+    run(
+        &mut session,
+        "CREATE (:Person {name: 'Ada', tags: ['rust', 'cli'], old_field: 'legacy'})",
+    );
+
+    let result = run(
+        &mut session,
+        "MATCH (n:Person {name: 'Ada'})
+         SET n.tags = insert(n.tags, 1, 'graph'),
+             n.tags[0] = 'systems',
+             n += {role: 'engineer'}
+         REMOVE n:Person, n.old_field
+         RETURN n.tags, n.role, has_label(n, 'Person'), has_prop(n, 'old_field')",
+    );
+
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::List(vec![
+                RuntimeValue::String("systems".to_owned()),
+                RuntimeValue::String("graph".to_owned()),
+                RuntimeValue::String("cli".to_owned()),
+            ]),
+            RuntimeValue::String("engineer".to_owned()),
+            RuntimeValue::Bool(false),
+            RuntimeValue::Bool(false),
+        ]]
+    );
+}
+
+#[test]
+fn wave5_schema_evolution_and_parameterized_ddl_work_end_to_end() {
+    let db = TestDb::new("wave5_schema");
+    let mut session = db.open();
+    let mut params = BTreeMap::new();
+    params.insert("label".to_owned(), Value::from("Person"));
+    params.insert("edge".to_owned(), Value::from("KNOWS"));
+    params.insert("property".to_owned(), Value::from("email"));
+    params.insert("description".to_owned(), Value::from("People"));
+    params.insert("constraint".to_owned(), Value::from("person_email_required"));
+    params.insert("renamed".to_owned(), Value::from("person_email_presence"));
+
+    run_with_params(
+        &mut session,
+        "CREATE OR REPLACE LABEL $label DESCRIPTION $description",
+        &params,
+    );
+    run_with_params(
+        &mut session,
+        "CREATE OR REPLACE EDGE TYPE $edge",
+        &params,
+    );
+    run_with_params(
+        &mut session,
+        "CREATE INDEX idx_person_lookup ON :$label($property)",
+        &params,
+    );
+
+    params.insert("property".to_owned(), Value::from("age"));
+    run_with_params(
+        &mut session,
+        "CREATE OR REPLACE INDEX idx_person_lookup ON :$label($property)",
+        &params,
+    );
+    run(
+        &mut session,
+        "ALTER INDEX idx_person_lookup SET STATUS INVALID",
+    );
+
+    params.insert("property".to_owned(), Value::from("email"));
+    run_with_params(
+        &mut session,
+        "CREATE CONSTRAINT $constraint ON :$label REQUIRE $property REQUIRED",
+        &params,
+    );
+    run_with_params(
+        &mut session,
+        "ALTER CONSTRAINT $constraint RENAME TO $renamed",
+        &params,
+    );
+
+    let schema = run(&mut session, "SHOW SCHEMA");
+    assert!(schema.rows.iter().any(|row| {
+        row[0] == RuntimeValue::String("label".to_owned())
+            && row[1] == RuntimeValue::String("Person".to_owned())
+            && row[2] == RuntimeValue::String("People".to_owned())
+    }));
+
+    let indexes = run(&mut session, "SHOW INDEXES ON :Person");
+    assert!(indexes.rows.iter().any(|row| {
+        row[0] == RuntimeValue::String("idx_person_lookup".to_owned())
+            && row[3] == RuntimeValue::String("age".to_owned())
+            && row[5] == RuntimeValue::String("invalid".to_owned())
+    }));
+
+    let constraints = run(&mut session, "SHOW CONSTRAINTS ON :Person");
+    assert!(constraints.rows.iter().any(|row| {
+        row[0] == RuntimeValue::String("person_email_presence".to_owned())
+            && row[3] == RuntimeValue::String("email".to_owned())
+    }));
+}
+
+#[test]
+fn wave5_edge_endpoint_and_cardinality_constraints_validate_existing_data() {
+    let db = TestDb::new("wave5_edge_constraints");
+    let mut session = db.open();
+
+    run(
+        &mut session,
+        "CREATE (:Service {name: 'api'})-[:KNOWS]->(:Person {name: 'Ada'})",
+    );
+    let endpoint_error = session
+        .execute_script(
+            "CREATE CONSTRAINT ON [:KNOWS] REQUIRE ENDPOINTS :Person -> :Person",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+    assert_eq!(endpoint_error.code(), "constraint_endpoint_violation");
+
+    let mut engine = session.engine().clone();
+    let grace = engine
+        .create_node(["Person"], PropertyMap::from_pairs([("name", Value::from("Grace"))]))
+        .unwrap();
+    let lin = engine
+        .create_node(["Person"], PropertyMap::from_pairs([("name", Value::from("Lin"))]))
+        .unwrap();
+    let barbara = engine
+        .create_node(
+            ["Person"],
+            PropertyMap::from_pairs([("name", Value::from("Barbara"))]),
+        )
+        .unwrap();
+    engine
+        .create_edge(grace, lin, "MENTORS", PropertyMap::new())
+        .unwrap();
+    engine
+        .create_edge(grace, barbara, "MENTORS", PropertyMap::new())
+        .unwrap();
+    session.replace_engine(engine).unwrap();
+    let cardinality_error = session
+        .execute_script(
+            "CREATE CONSTRAINT ON [:MENTORS] REQUIRE MAX OUTGOING 1",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+    assert_eq!(cardinality_error.code(), "constraint_cardinality_violation");
 }

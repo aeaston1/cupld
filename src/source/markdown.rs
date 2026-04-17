@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::engine::{CupldEngine, GraphError, NodeId, PropertyMap, Value};
 
@@ -34,6 +36,35 @@ pub struct MarkdownSyncReport {
     pub upserted_documents: usize,
     pub tombstoned_documents: usize,
     pub link_edges: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownWatchOptions {
+    pub poll_interval: Duration,
+    pub debounce: Duration,
+    pub max_batch_window: Duration,
+    pub idle_timeout: Option<Duration>,
+    pub max_runs: Option<usize>,
+}
+
+impl Default for MarkdownWatchOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(100),
+            debounce: Duration::from_millis(200),
+            max_batch_window: Duration::from_secs(2),
+            idle_timeout: None,
+            max_runs: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownWatchReport {
+    pub root: PathBuf,
+    pub sync_runs: usize,
+    pub events_seen: usize,
+    pub last_report: Option<MarkdownSyncReport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +184,61 @@ pub fn sync_markdown_root(
         tombstoned_documents,
         link_edges,
     })
+}
+
+pub fn watch_markdown_root(
+    engine: &mut CupldEngine,
+    root: &Path,
+    options: &MarkdownWatchOptions,
+) -> Result<MarkdownWatchReport, SourceError> {
+    let root = normalize_root_path(root)?;
+    let mut last_report = Some(sync_markdown_root(engine, &root)?);
+    let mut report = MarkdownWatchReport {
+        root: root.clone(),
+        sync_runs: 1,
+        events_seen: 0,
+        last_report: last_report.clone(),
+    };
+    if options.max_runs == Some(1) {
+        return Ok(report);
+    }
+
+    let mut snapshot = snapshot_markdown_root(&root)?;
+    let mut batcher = WatchBatcher::default();
+    let mut last_idle = Instant::now();
+
+    loop {
+        if let Some(idle_timeout) = options.idle_timeout
+            && batcher.is_idle()
+            && last_idle.elapsed() >= idle_timeout
+        {
+            report.last_report = last_report;
+            return Ok(report);
+        }
+
+        thread::sleep(options.poll_interval);
+        let current = snapshot_markdown_root(&root)?;
+        let now = Instant::now();
+        if current != snapshot {
+            batcher.record_change(now);
+            report.events_seen += 1;
+            snapshot = current;
+            last_idle = now;
+        }
+
+        if batcher.should_flush(now, options) {
+            let sync_report = sync_markdown_root(engine, &root)?;
+            report.sync_runs += 1;
+            last_report = Some(sync_report.clone());
+            batcher.flush();
+            last_idle = now;
+            snapshot = snapshot_markdown_root(&root)?;
+            if options.max_runs.is_some_and(|max_runs| report.sync_runs >= max_runs) {
+                report.last_report = last_report;
+                return Ok(report);
+            }
+        }
+    }
 }
 
 fn collect_existing_documents(engine: &CupldEngine, root: &str) -> BTreeMap<String, NodeId> {
@@ -378,6 +464,68 @@ fn collect_markdown_files(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MarkdownRootSnapshot {
+    entries: BTreeMap<String, (u64, u128)>,
+}
+
+fn snapshot_markdown_root(root: &Path) -> Result<MarkdownRootSnapshot, SourceError> {
+    if !root.exists() {
+        return Ok(MarkdownRootSnapshot::default());
+    }
+    let root = root.canonicalize()?;
+    let mut files = Vec::new();
+    collect_markdown_files(&root, &root, &mut files)?;
+    files.sort();
+
+    let mut entries = BTreeMap::new();
+    for relative in files {
+        let absolute = root.join(&relative);
+        let metadata = fs::metadata(&absolute)?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        entries.insert(path_to_string(&relative), (metadata.len(), modified));
+    }
+    Ok(MarkdownRootSnapshot { entries })
+}
+
+#[derive(Clone, Debug, Default)]
+struct WatchBatcher {
+    pending_since: Option<Instant>,
+    last_change: Option<Instant>,
+}
+
+impl WatchBatcher {
+    fn record_change(&mut self, now: Instant) {
+        self.pending_since.get_or_insert(now);
+        self.last_change = Some(now);
+    }
+
+    fn should_flush(&self, now: Instant, options: &MarkdownWatchOptions) -> bool {
+        let Some(last_change) = self.last_change else {
+            return false;
+        };
+        let Some(pending_since) = self.pending_since else {
+            return false;
+        };
+        now.duration_since(last_change) >= options.debounce
+            || now.duration_since(pending_since) >= options.max_batch_window
+    }
+
+    fn flush(&mut self) {
+        self.pending_since = None;
+        self.last_change = None;
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending_since.is_none()
+    }
 }
 
 fn read_markdown_document(root: &Path, relative: &Path) -> Result<MarkdownDocument, SourceError> {

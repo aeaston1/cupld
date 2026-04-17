@@ -566,6 +566,18 @@ fn encode_schema_state(output: &mut Vec<u8>, state: &SchemaState) {
                 push_u8(output, 2);
                 push_property_type(output, *kind);
             }
+            crate::engine::ConstraintType::Endpoints {
+                from_label,
+                to_label,
+            } => {
+                push_u8(output, 3);
+                push_string(output, from_label);
+                push_string(output, to_label);
+            }
+            crate::engine::ConstraintType::MaxOutgoing(limit) => {
+                push_u8(output, 4);
+                push_u32(output, *limit as u32);
+            }
         }
     }
 }
@@ -618,6 +630,11 @@ fn decode_schema_state(
             0 => crate::engine::ConstraintType::Unique,
             1 => crate::engine::ConstraintType::Required,
             2 => crate::engine::ConstraintType::Type(read_property_type(bytes, cursor)?),
+            3 => crate::engine::ConstraintType::Endpoints {
+                from_label: read_string(bytes, cursor)?,
+                to_label: read_string(bytes, cursor)?,
+            },
+            4 => crate::engine::ConstraintType::MaxOutgoing(read_u32(bytes, cursor)? as usize),
             _ => {
                 return Err(StorageError::new(
                     "constraint_type",

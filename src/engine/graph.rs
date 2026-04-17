@@ -131,6 +131,7 @@ pub enum GraphError {
     SchemaObjectNotFound(String),
     LabelInUse(String),
     EdgeTypeInUse(String),
+    InvalidSchemaOperation(String),
     BackingIndexOwned {
         index: String,
         constraint: String,
@@ -161,6 +162,7 @@ impl GraphError {
             Self::SchemaObjectNotFound(_) => "schema_object_not_found",
             Self::LabelInUse(_) => "label_in_use",
             Self::EdgeTypeInUse(_) => "edge_type_in_use",
+            Self::InvalidSchemaOperation(_) => "invalid_schema_operation",
             Self::BackingIndexOwned { .. } => "backing_index_owned",
             Self::ConstraintViolation { code, .. } => code,
         }
@@ -194,6 +196,7 @@ impl fmt::Display for GraphError {
             }
             Self::LabelInUse(name) => write!(f, "label {} is still in use", name),
             Self::EdgeTypeInUse(name) => write!(f, "edge type {} is still in use", name),
+            Self::InvalidSchemaOperation(detail) => write!(f, "{detail}"),
             Self::BackingIndexOwned { index, constraint } => {
                 write!(f, "index {} is owned by constraint {}", index, constraint)
             }
@@ -489,8 +492,15 @@ impl CupldEngine {
         name: &str,
         description: Option<String>,
         if_not_exists: bool,
+        or_replace: bool,
     ) -> Result<(), GraphError> {
-        self.create_schema_object(SchemaObjectKind::Label, name, description, if_not_exists)
+        self.create_schema_object(
+            SchemaObjectKind::Label,
+            name,
+            description,
+            if_not_exists,
+            or_replace,
+        )
     }
 
     pub fn create_edge_type(
@@ -498,8 +508,15 @@ impl CupldEngine {
         name: &str,
         description: Option<String>,
         if_not_exists: bool,
+        or_replace: bool,
     ) -> Result<(), GraphError> {
-        self.create_schema_object(SchemaObjectKind::EdgeType, name, description, if_not_exists)
+        self.create_schema_object(
+            SchemaObjectKind::EdgeType,
+            name,
+            description,
+            if_not_exists,
+            or_replace,
+        )
     }
 
     pub fn drop_label(&mut self, name: &str, if_exists: bool) -> Result<(), GraphError> {
@@ -516,6 +533,7 @@ impl CupldEngine {
         target: SchemaTarget,
         property: &str,
         if_not_exists: bool,
+        or_replace: bool,
     ) -> Result<String, GraphError> {
         ensure_property_name(property)?;
         ensure_target_exists(&self.working.schema, &target)?;
@@ -528,10 +546,23 @@ impl CupldEngine {
             if if_not_exists {
                 return Ok(requested_name);
             }
-            return Err(GraphError::SchemaObjectExists(requested_name));
+            if !or_replace {
+                return Err(GraphError::SchemaObjectExists(requested_name));
+            }
+            if let Some(existing) = self.working.schema.index(&requested_name)
+                && existing.owned_by_constraint().is_some()
+            {
+                return Err(GraphError::BackingIndexOwned {
+                    index: requested_name,
+                    constraint: existing.owned_by_constraint().unwrap().to_owned(),
+                });
+            }
         }
 
         let mut schema = self.working.schema.clone();
+        if or_replace {
+            schema.drop_index(&requested_name);
+        }
         let created_name = schema.create_index(
             Some(requested_name.clone()),
             target,
@@ -542,6 +573,17 @@ impl CupldEngine {
         validate_schema_rules(&schema, &self.working)?;
         self.working.schema = schema;
         Ok(created_name)
+    }
+
+    pub fn alter_index_status(
+        &mut self,
+        name: &str,
+        status: super::IndexStatus,
+    ) -> Result<(), GraphError> {
+        if !self.working.schema.set_index_status(name, status) {
+            return Err(GraphError::SchemaObjectNotFound(name.to_owned()));
+        }
+        Ok(())
     }
 
     pub fn drop_index(&mut self, name: &str, if_exists: bool) -> Result<(), GraphError> {
@@ -569,16 +611,27 @@ impl CupldEngine {
         property: &str,
         constraint_type: ConstraintType,
         if_not_exists: bool,
+        or_replace: bool,
     ) -> Result<String, GraphError> {
-        ensure_property_name(property)?;
         ensure_target_exists(&self.working.schema, &target)?;
+        if matches!(
+            constraint_type,
+            ConstraintType::Unique | ConstraintType::Required | ConstraintType::Type(_)
+        ) {
+            ensure_property_name(property)?;
+        } else if target.kind() != TargetKind::EdgeType {
+            return Err(GraphError::InvalidSchemaOperation(
+                "edge endpoint and cardinality constraints require an edge type target"
+                    .to_owned(),
+            ));
+        }
 
         let requested_name = name.map(ToOwned::to_owned).unwrap_or_else(|| {
             generated_name(
                 "constraint",
                 target.kind(),
                 target.name(),
-                property,
+                constraint_subject_key(property, &constraint_type),
                 Some(&constraint_type.generated_suffix()),
             )
         });
@@ -586,10 +639,23 @@ impl CupldEngine {
             if if_not_exists {
                 return Ok(requested_name);
             }
-            return Err(GraphError::SchemaObjectExists(requested_name));
+            if !or_replace {
+                return Err(GraphError::SchemaObjectExists(requested_name));
+            }
         }
 
         let mut schema = self.working.schema.clone();
+        if or_replace {
+            schema.drop_constraint(&requested_name);
+            let backing_indexes = schema
+                .indexes()
+                .filter(|index| index.owned_by_constraint() == Some(&requested_name))
+                .map(|index| index.name().to_owned())
+                .collect::<Vec<_>>();
+            for index_name in backing_indexes {
+                schema.drop_index(&index_name);
+            }
+        }
         let created_name = schema.create_constraint(
             Some(requested_name.clone()),
             target.clone(),
@@ -605,8 +671,11 @@ impl CupldEngine {
                 property,
                 Some("unique"),
             );
-            if schema.object_exists(&backing_name) {
+            if schema.object_exists(&backing_name) && !or_replace {
                 return Err(GraphError::SchemaObjectExists(backing_name));
+            }
+            if or_replace {
+                schema.drop_index(&backing_name);
             }
             schema.create_index(
                 Some(backing_name),
@@ -620,6 +689,16 @@ impl CupldEngine {
         validate_schema_rules(&schema, &self.working)?;
         self.working.schema = schema;
         Ok(created_name)
+    }
+
+    pub fn rename_constraint(&mut self, name: &str, rename_to: &str) -> Result<(), GraphError> {
+        if self.working.schema.object_exists(rename_to) {
+            return Err(GraphError::SchemaObjectExists(rename_to.to_owned()));
+        }
+        if !self.working.schema.rename_constraint(name, rename_to) {
+            return Err(GraphError::SchemaObjectNotFound(name.to_owned()));
+        }
+        Ok(())
     }
 
     pub fn drop_constraint(&mut self, name: &str, if_exists: bool) -> Result<(), GraphError> {
@@ -741,6 +820,19 @@ impl CupldEngine {
             .ok_or(GraphError::NodeNotFound(node_id))?;
         let previous = std::mem::replace(&mut node.properties, properties);
         Ok(previous)
+    }
+
+    pub fn remove_node_label(&mut self, node_id: NodeId, label: &str) -> Result<bool, GraphError> {
+        let removed = {
+            let node = self
+                .working
+                .nodes
+                .get_mut(&node_id)
+                .ok_or(GraphError::NodeNotFound(node_id))?;
+            node.labels.remove(label)
+        };
+        validate_schema_rules(&self.working.schema, &self.working)?;
+        Ok(removed)
     }
 
     pub fn set_edge_property<K>(
@@ -866,6 +958,7 @@ impl CupldEngine {
         name: &str,
         description: Option<String>,
         if_not_exists: bool,
+        or_replace: bool,
     ) -> Result<(), GraphError> {
         if name.is_empty() {
             return Err(kind.empty_error());
@@ -878,7 +971,18 @@ impl CupldEngine {
             if if_not_exists {
                 return Ok(());
             }
-            return Err(kind.exists_error(name.to_owned()));
+            if !or_replace {
+                return Err(kind.exists_error(name.to_owned()));
+            }
+            match kind {
+                SchemaObjectKind::Label => {
+                    self.working.schema.create_label(name, description);
+                }
+                SchemaObjectKind::EdgeType => {
+                    self.working.schema.create_edge_type(name, description);
+                }
+            }
+            return Ok(());
         }
 
         match kind {
@@ -1114,13 +1218,25 @@ fn property_value_for<'a>(
     }
 }
 
+fn constraint_subject_key<'a>(property: &'a str, constraint_type: &ConstraintType) -> &'a str {
+    if !property.is_empty() {
+        return property;
+    }
+    match constraint_type {
+        ConstraintType::Endpoints { .. } => "endpoints",
+        ConstraintType::MaxOutgoing(_) => "max_outgoing",
+        ConstraintType::Unique | ConstraintType::Required | ConstraintType::Type(_) => property,
+    }
+}
+
 fn validate_schema_rules(schema: &SchemaCatalog, data: &GraphData) -> Result<(), GraphError> {
     for constraint in schema.constraints() {
         let refs = node_refs_for_target(data, constraint.target());
         match constraint.constraint_type() {
             ConstraintType::Required => {
                 for entity in refs {
-                    let value = property_value_for(data, &entity, constraint.property());
+                    let value =
+                        property_value_for(data, &entity, constraint.property().unwrap_or(""));
                     match value {
                         Some(Value::Null) | None => {
                             return Err(GraphError::ConstraintViolation {
@@ -1129,7 +1245,7 @@ fn validate_schema_rules(schema: &SchemaCatalog, data: &GraphData) -> Result<(),
                                 detail: format!(
                                     "constraint {} requires property {} to exist and be non-null",
                                     constraint.name(),
-                                    constraint.property()
+                                    constraint.property().unwrap_or("")
                                 ),
                             });
                         }
@@ -1139,7 +1255,8 @@ fn validate_schema_rules(schema: &SchemaCatalog, data: &GraphData) -> Result<(),
             }
             ConstraintType::Type(expected) => {
                 for entity in refs {
-                    if let Some(value) = property_value_for(data, &entity, constraint.property())
+                    if let Some(value) =
+                        property_value_for(data, &entity, constraint.property().unwrap_or(""))
                         && *expected != property_type_of(value)
                     {
                         return Err(GraphError::ConstraintViolation {
@@ -1148,8 +1265,67 @@ fn validate_schema_rules(schema: &SchemaCatalog, data: &GraphData) -> Result<(),
                             detail: format!(
                                 "constraint {} requires property {} to be {}",
                                 constraint.name(),
-                                constraint.property(),
+                                constraint.property().unwrap_or(""),
                                 expected.as_str()
+                            ),
+                        });
+                    }
+                }
+            }
+            ConstraintType::Endpoints {
+                from_label,
+                to_label,
+            } => {
+                for entity in refs {
+                    let EntityRef::Edge(edge_id) = entity else {
+                        continue;
+                    };
+                    let Some(edge) = data.edges.get(&edge_id) else {
+                        continue;
+                    };
+                    let source_ok = data
+                        .nodes
+                        .get(&edge.from())
+                        .map(|node| node.labels().contains(from_label))
+                        .unwrap_or(false);
+                    let target_ok = data
+                        .nodes
+                        .get(&edge.to())
+                        .map(|node| node.labels().contains(to_label))
+                        .unwrap_or(false);
+                    if !source_ok || !target_ok {
+                        return Err(GraphError::ConstraintViolation {
+                            code: "constraint_endpoint_violation",
+                            name: constraint.name().to_owned(),
+                            detail: format!(
+                                "constraint {} requires :{} -> :{} endpoints",
+                                constraint.name(),
+                                from_label,
+                                to_label
+                            ),
+                        });
+                    }
+                }
+            }
+            ConstraintType::MaxOutgoing(limit) => {
+                let mut counts = BTreeMap::<NodeId, usize>::new();
+                for entity in refs {
+                    let EntityRef::Edge(edge_id) = entity else {
+                        continue;
+                    };
+                    let Some(edge) = data.edges.get(&edge_id) else {
+                        continue;
+                    };
+                    let count = counts.entry(edge.from()).or_default();
+                    *count += 1;
+                    if *count > *limit {
+                        return Err(GraphError::ConstraintViolation {
+                            code: "constraint_cardinality_violation",
+                            name: constraint.name().to_owned(),
+                            detail: format!(
+                                "constraint {} requires at most {} outgoing edges per source",
+                                constraint.name(),
+                                limit
                             ),
                         });
                     }
@@ -1320,8 +1496,8 @@ mod tests {
     #[test]
     fn explicit_and_implicit_schema_targets_share_the_catalog() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", None, false).unwrap();
-        engine.create_edge_type("KNOWS", None, false).unwrap();
+        engine.create_label("Person", None, false, false).unwrap();
+        engine.create_edge_type("KNOWS", None, false, false).unwrap();
         let left = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         let right = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine
@@ -1336,9 +1512,9 @@ mod tests {
     #[test]
     fn generated_schema_names_are_deterministic_and_visible_in_show_schema() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", None, false).unwrap();
+        engine.create_label("Person", None, false, false).unwrap();
         let index_name = engine
-            .create_index(None, SchemaTarget::label("Person"), "email", false)
+            .create_index(None, SchemaTarget::label("Person"), "email", false, false)
             .unwrap();
         let constraint_name = engine
             .create_constraint(
@@ -1346,6 +1522,7 @@ mod tests {
                 SchemaTarget::label("Person"),
                 "email",
                 ConstraintType::Required,
+                false,
                 false,
             )
             .unwrap();
@@ -1365,13 +1542,14 @@ mod tests {
     #[test]
     fn unique_constraints_allow_missing_values_but_reject_duplicate_non_null_values() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", None, false).unwrap();
+        engine.create_label("Person", None, false, false).unwrap();
         engine
             .create_constraint(
                 None,
                 SchemaTarget::label("Person"),
                 "email",
                 ConstraintType::Unique,
+                false,
                 false,
             )
             .unwrap();
@@ -1392,7 +1570,7 @@ mod tests {
     #[test]
     fn required_and_type_constraints_validate_existing_data_immediately() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", None, false).unwrap();
+        engine.create_label("Person", None, false, false).unwrap();
         let node = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine
             .set_node_property(node, "age", Value::from("wrong"))
@@ -1404,12 +1582,14 @@ mod tests {
             "name",
             ConstraintType::Required,
             false,
+            false,
         );
         let typed = engine.create_constraint(
             None,
             SchemaTarget::label("Person"),
             "age",
             ConstraintType::Type(PropertyType::Int),
+            false,
             false,
         );
 
@@ -1423,15 +1603,15 @@ mod tests {
     #[test]
     fn dropping_labels_or_edge_types_is_blocked_when_data_or_schema_depends_on_them() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", None, false).unwrap();
-        engine.create_edge_type("KNOWS", None, false).unwrap();
+        engine.create_label("Person", None, false, false).unwrap();
+        engine.create_edge_type("KNOWS", None, false, false).unwrap();
         let left = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         let right = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine
             .create_edge(left, right, "KNOWS", PropertyMap::new())
             .unwrap();
         engine
-            .create_index(None, SchemaTarget::label("Person"), "email", false)
+            .create_index(None, SchemaTarget::label("Person"), "email", false, false)
             .unwrap();
 
         assert_eq!(
@@ -1447,13 +1627,14 @@ mod tests {
     #[test]
     fn unique_constraints_create_backing_indexes_that_cannot_be_dropped_directly() {
         let mut engine = CupldEngine::default();
-        engine.create_label("Person", None, false).unwrap();
+        engine.create_label("Person", None, false, false).unwrap();
         let constraint_name = engine
             .create_constraint(
                 None,
                 SchemaTarget::label("Person"),
                 "email",
                 ConstraintType::Unique,
+                false,
                 false,
             )
             .unwrap();

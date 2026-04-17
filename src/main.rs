@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Duration;
 
 use cupld::{
-    QueryResult, RuntimeValue, Session, Value,
+    MarkdownSyncReport, QueryResult, RuntimeValue, Session, Value,
     automation::{
         AutomationError, AutomationPolicy, build_context_response, context_as_json,
         context_as_ndjson, format_error_json as machine_error_json,
@@ -15,7 +16,7 @@ use cupld::{
     },
     configured_markdown_root,
     package::WorkspacePackage,
-    set_markdown_root, sync_markdown_root,
+    set_markdown_root, sync_markdown_root, watch_markdown_root, MarkdownWatchOptions,
 };
 use skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
 
@@ -179,7 +180,22 @@ fn run() -> Result<(), String> {
         CliCommand::SyncMarkdown {
             db_path,
             root_override,
-        } => run_sync_markdown(db_path, root_override),
+            watch,
+            poll_interval,
+            debounce,
+            batch_window,
+            idle_timeout,
+            max_runs,
+        } => run_sync_markdown(
+            db_path,
+            root_override,
+            watch,
+            poll_interval,
+            debounce,
+            batch_window,
+            idle_timeout,
+            max_runs,
+        ),
         CliCommand::SourceSetRoot { db_path, root } => run_source_set_root(db_path, root),
         CliCommand::Install(command) => skill_install::install(command),
     }
@@ -221,6 +237,12 @@ enum CliCommand {
     SyncMarkdown {
         db_path: PathBuf,
         root_override: Option<PathBuf>,
+        watch: bool,
+        poll_interval: Duration,
+        debounce: Duration,
+        batch_window: Duration,
+        idle_timeout: Option<Duration>,
+        max_runs: Option<usize>,
     },
     SourceSetRoot {
         db_path: PathBuf,
@@ -467,7 +489,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
         Some("markdown") => {}
         _ => {
             return Err(format!(
-                "error: expected `sync markdown --db <path.cupld> [--root <path>]`\n\n{}",
+                "error: expected `sync markdown --db <path.cupld> [--root <path>] [--watch]`\n\n{}",
                 cli_usage_text()
             ));
         }
@@ -475,6 +497,12 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
 
     let mut db_path = None;
     let mut root_override = None;
+    let mut watch = false;
+    let mut poll_interval = Duration::from_millis(100);
+    let mut debounce = Duration::from_millis(200);
+    let mut batch_window = Duration::from_secs(2);
+    let mut idle_timeout = None;
+    let mut max_runs = None;
     let mut index = 1;
 
     while index < args.len() {
@@ -502,6 +530,67 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
                 root_override = Some(PathBuf::from(path));
                 index += 2;
             }
+            "--watch" => {
+                watch = true;
+                index += 1;
+            }
+            "--poll-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --poll-ms <n> for `sync markdown` command".to_owned());
+                };
+                poll_interval = Duration::from_millis(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "expected --poll-ms <n> for `sync markdown` command".to_owned())?,
+                );
+                index += 2;
+            }
+            "--debounce-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(
+                        "expected --debounce-ms <n> for `sync markdown` command".to_owned()
+                    );
+                };
+                debounce = Duration::from_millis(
+                    value.parse::<u64>().map_err(|_| {
+                        "expected --debounce-ms <n> for `sync markdown` command".to_owned()
+                    })?,
+                );
+                index += 2;
+            }
+            "--batch-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --batch-ms <n> for `sync markdown` command".to_owned());
+                };
+                batch_window = Duration::from_millis(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "expected --batch-ms <n> for `sync markdown` command".to_owned())?,
+                );
+                index += 2;
+            }
+            "--idle-ms" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --idle-ms <n> for `sync markdown` command".to_owned());
+                };
+                idle_timeout = Some(Duration::from_millis(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "expected --idle-ms <n> for `sync markdown` command".to_owned())?,
+                ));
+                index += 2;
+            }
+            "--max-runs" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --max-runs <n> for `sync markdown` command".to_owned());
+                };
+                max_runs = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "expected --max-runs <n> for `sync markdown` command".to_owned())?,
+                );
+                index += 2;
+            }
             value => {
                 return Err(format!(
                     "error: unexpected argument `{value}`\n\n{}",
@@ -518,6 +607,12 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
     Ok(CliCommand::SyncMarkdown {
         db_path,
         root_override,
+        watch,
+        poll_interval,
+        debounce,
+        batch_window,
+        idle_timeout,
+        max_runs,
     })
 }
 
@@ -789,7 +884,7 @@ Usage:
   cupld schema --db <path.cupld>
   cupld compact --db <path.cupld>
   cupld check --db <path.cupld>
-  cupld sync markdown --db <path.cupld> [--root <path>]
+  cupld sync markdown --db <path.cupld> [--root <path>] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
   cupld source set-root --db <path.cupld> <path>
   cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld>] [--root <path>] [--force] [--yes]
   cupld -h
@@ -806,6 +901,12 @@ Commands:
   context                 Build compact context rows (top-k nodes) for agent prompts.
   --with-markdown         Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
+  --watch                 Keep polling markdown for changes after the initial sync.
+  --poll-ms               Poll interval for `sync markdown --watch`.
+  --debounce-ms           Stable-change debounce window for `sync markdown --watch`.
+  --batch-ms              Max coalescing window before a forced watched sync.
+  --idle-ms               Exit watched sync after this long with no pending changes.
+  --max-runs              Stop watched sync after this many sync runs, including the initial run.
   --output                Select output mode for query/context: table, json, ndjson.
   --params-json           Provide named query parameters as a JSON object.
   --params-file           Read named query parameters from a JSON file.
@@ -813,7 +914,7 @@ Commands:
   schema                  Print SHOW SCHEMA for --db.
   compact                 Rewrite --db and reset its WAL.
   check                   Validate --db and print recovery metadata.
-  sync markdown           Materialize markdown documents into --db and persist them.
+  sync markdown           Materialize markdown documents into --db and optionally watch for changes.
   source set-root         Persist the default markdown root in --db.
   install                 Install the bundled cupld-md-memory SKILL.md and bootstrap local cupld memory.
   -h, --help, help        Show this help text.
@@ -832,6 +933,7 @@ Examples:
   echo 'MATCH (n) RETURN n' | cupld query --db .cupld/default.cupld
   cupld schema --db .cupld/default.cupld
   cupld sync markdown --db .cupld/default.cupld
+  cupld sync markdown --db .cupld/default.cupld --watch --idle-ms 500 --max-runs 2
   cupld source set-root --db .cupld/default.cupld notes
   cupld install
   cupld install --target codex --scope home --db .cupld/default.cupld
@@ -1045,11 +1147,45 @@ fn run_check(db_path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn run_sync_markdown(db_path: PathBuf, root_override: Option<PathBuf>) -> Result<(), String> {
+fn run_sync_markdown(
+    db_path: PathBuf,
+    root_override: Option<PathBuf>,
+    watch: bool,
+    poll_interval: Duration,
+    debounce: Duration,
+    batch_window: Duration,
+    idle_timeout: Option<Duration>,
+    max_runs: Option<usize>,
+) -> Result<(), String> {
     let mut session = open_initial_session(Some(db_path.clone()))?;
     let root = resolve_markdown_root(root_override.as_deref(), Some(&session))?;
     let mut engine = session.engine().clone();
-    let report = sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?;
+    let report = if watch {
+        let options = MarkdownWatchOptions {
+            poll_interval,
+            debounce,
+            max_batch_window: batch_window,
+            idle_timeout,
+            max_runs,
+        };
+        let report = watch_markdown_root(&mut engine, &root, &options)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "watch root={} runs={} events={}",
+            report.root.display(),
+            report.sync_runs,
+            report.events_seen
+        );
+        report.last_report.unwrap_or(MarkdownSyncReport {
+            root: root.clone(),
+            scanned_documents: 0,
+            upserted_documents: 0,
+            tombstoned_documents: 0,
+            link_edges: 0,
+        })
+    } else {
+        sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?
+    };
     engine.commit().map_err(|error| error.to_string())?;
     session
         .replace_engine(engine)

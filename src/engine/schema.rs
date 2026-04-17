@@ -116,6 +116,11 @@ pub enum ConstraintType {
     Unique,
     Required,
     Type(PropertyType),
+    Endpoints {
+        from_label: String,
+        to_label: String,
+    },
+    MaxOutgoing(usize),
 }
 
 impl ConstraintType {
@@ -124,6 +129,8 @@ impl ConstraintType {
             Self::Unique => "UNIQUE",
             Self::Required => "REQUIRED",
             Self::Type(_) => "TYPE",
+            Self::Endpoints { .. } => "ENDPOINTS",
+            Self::MaxOutgoing(_) => "MAX_OUTGOING",
         }
     }
 
@@ -132,6 +139,11 @@ impl ConstraintType {
             Self::Unique => "unique".to_owned(),
             Self::Required => "required".to_owned(),
             Self::Type(property_type) => format!("type_{}", property_type.as_str()),
+            Self::Endpoints {
+                from_label,
+                to_label,
+            } => format!("endpoints_{}_{}", sanitize(from_label), sanitize(to_label)),
+            Self::MaxOutgoing(limit) => format!("max_outgoing_{limit}"),
         }
     }
 
@@ -140,6 +152,11 @@ impl ConstraintType {
             Self::Unique => "unique".to_owned(),
             Self::Required => "required".to_owned(),
             Self::Type(property_type) => format!("type={}", property_type.as_str()),
+            Self::Endpoints {
+                from_label,
+                to_label,
+            } => format!("endpoints=:{}->:{}", from_label, to_label),
+            Self::MaxOutgoing(limit) => format!("max_outgoing={limit}"),
         }
     }
 }
@@ -255,8 +272,8 @@ impl ConstraintDefinition {
         &self.target
     }
 
-    pub fn property(&self) -> &str {
-        &self.property
+    pub fn property(&self) -> Option<&str> {
+        (!self.property.is_empty()).then_some(self.property.as_str())
     }
 
     pub fn constraint_type(&self) -> &ConstraintType {
@@ -283,6 +300,22 @@ impl ConstraintDefinition {
                 self.target.display_target(),
                 self.property,
                 property_type
+            ),
+            ConstraintType::Endpoints {
+                from_label,
+                to_label,
+            } => format!(
+                "CREATE CONSTRAINT {} ON {} REQUIRE ENDPOINTS :{} -> :{}",
+                self.name,
+                self.target.display_target(),
+                from_label,
+                to_label
+            ),
+            ConstraintType::MaxOutgoing(limit) => format!(
+                "CREATE CONSTRAINT {} ON {} REQUIRE MAX OUTGOING {}",
+                self.name,
+                self.target.display_target(),
+                limit
             ),
         }
     }
@@ -431,8 +464,38 @@ impl SchemaCatalog {
         self.indexes.remove(name)
     }
 
+    pub fn index_mut(&mut self, name: &str) -> Option<&mut IndexDefinition> {
+        self.indexes.get_mut(name)
+    }
+
+    pub fn set_index_status(&mut self, name: &str, status: IndexStatus) -> bool {
+        let Some(index) = self.indexes.get_mut(name) else {
+            return false;
+        };
+        index.status = status;
+        true
+    }
+
     pub fn drop_constraint(&mut self, name: &str) -> Option<ConstraintDefinition> {
         self.constraints.remove(name)
+    }
+
+    pub fn constraint_mut(&mut self, name: &str) -> Option<&mut ConstraintDefinition> {
+        self.constraints.get_mut(name)
+    }
+
+    pub fn rename_constraint(&mut self, name: &str, rename_to: &str) -> bool {
+        let Some(mut constraint) = self.constraints.remove(name) else {
+            return false;
+        };
+        constraint.name = rename_to.to_owned();
+        self.constraints.insert(rename_to.to_owned(), constraint);
+        for index in self.indexes.values_mut() {
+            if index.owned_by_constraint.as_deref() == Some(name) {
+                index.owned_by_constraint = Some(rename_to.to_owned());
+            }
+        }
+        true
     }
 
     pub fn index(&self, name: &str) -> Option<&IndexDefinition> {
@@ -535,7 +598,7 @@ impl SchemaCatalog {
                 name: constraint.name.clone(),
                 target_kind: constraint.target.kind.as_str().to_owned(),
                 target_name: constraint.target.name.clone(),
-                property: constraint.property.clone(),
+                property: constraint.property().unwrap_or_default().to_owned(),
                 constraint_type: constraint.constraint_type.as_str().to_owned(),
                 details: constraint.constraint_type.detail_string(),
             })
