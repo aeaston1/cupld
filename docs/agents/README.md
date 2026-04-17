@@ -140,7 +140,7 @@ Available dot-commands:
 REPL notes:
 
 - `.output json` and `.output ndjson` are the current machine-friendly output modes.
-- `cupld query` supports table, JSON, and NDJSON output (`--output`).
+- `cupld query` and `cupld context` support table, JSON, and NDJSON output (`--output`).
 - Table output may truncate long values. JSON and NDJSON are safer for machine parsing.
 - `.save` only works after the session has a file path.
 - `.saveas <path.cupld>` persists an in-memory database.
@@ -174,6 +174,36 @@ Automation guidance:
 - Prefer `--output json` or `--output ndjson` for machine consumption.
 - Always add explicit `ORDER BY` plus explicit `LIMIT` for deterministic context windows.
 - Use named parameters with `--params-json` or `--params-file`.
+
+## Automation Contracts
+
+`query` and `context` now expose a stable machine contract when `--output json` or `--output ndjson` is selected.
+
+- `cupld query --output json` writes one JSON envelope to stdout:
+  - `ok`
+  - `command`
+  - `policy`
+  - `results`
+- `cupld query --output ndjson` writes one `query_meta` line, one `query_result` line per result set, and one `query_row` line per returned row.
+- `cupld context --output json` writes one JSON envelope to stdout:
+  - `ok`
+  - `command`
+  - `policy`
+  - `retrieval_usage`
+  - `provenance`
+  - `items`
+- `cupld context --output ndjson` writes one `context_meta` line plus one `context_item` line per item.
+- `query` and `context` failures in JSON or NDJSON mode write a machine error envelope to stderr:
+  - `ok: false`
+  - `error.code`
+  - `error.message`
+
+Current automation controls:
+
+- `CUPLD_QUERY_MAX_ROWS` sets the default `query --max-rows` cap.
+- `CUPLD_NO_INSTALL_PROMPT=1` disables the interactive bootstrap prompt on REPL startup.
+- `cupld query --with-markdown` overlays markdown into a temporary session and does not persist the sync.
+- `cupld sync markdown` is the explicit persisted sync boundary.
 
 ## Further Docs
 

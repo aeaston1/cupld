@@ -1,3 +1,4 @@
+pub mod automation;
 pub mod engine;
 pub mod query;
 pub mod runtime;

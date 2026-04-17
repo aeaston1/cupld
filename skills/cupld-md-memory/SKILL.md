@@ -16,7 +16,9 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
 - `cupld query --with-markdown` overlays markdown into a temporary query session and does not persist the imported notes.
 - `cupld sync markdown` persists markdown documents and markdown link edges into the `.cupld` database.
 - `cupld query --db ...` requires an existing database file. If the DB is missing, create it first with `cupld <path.cupld>`.
-- `cupld query` supports `--output table|json|ndjson` for machine-readable output without using the REPL.
+- `cupld query` and `cupld context` support `--output table|json|ndjson` without using the REPL.
+- In JSON or NDJSON mode, `query` and `context` emit stable machine envelopes instead of raw table text.
+- `CUPLD_QUERY_MAX_ROWS` sets the default non-interactive row cap. `CUPLD_NO_INSTALL_PROMPT=1` disables the one-time REPL bootstrap prompt.
 - Dot-commands are REPL-only. They do not work with `cupld query`.
 
 ## Recommended Workflow

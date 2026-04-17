@@ -7,8 +7,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use cupld::{
-    PropertyMap, QueryResult, RuntimeValue, Session, Value, configured_markdown_root,
-    set_markdown_root, sync_markdown_root,
+    QueryResult, RuntimeValue, Session, Value,
+    automation::{
+        AutomationError, AutomationPolicy, build_context_response, context_as_json,
+        context_as_ndjson, format_error_json as machine_error_json,
+        parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
+    },
+    configured_markdown_root, set_markdown_root, sync_markdown_root,
 };
 use skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
 
@@ -858,17 +863,37 @@ fn run_query(config: QueryRunConfig<'_>) -> Result<(), String> {
         query_args,
     } = config;
     let (db_path, query) = parse_query(db_path, query_args)?;
-    let params = load_params(params_json, params_file)?;
+    let params = load_params(params_json, params_file)
+        .map_err(|error| format_command_error(output, &error))?;
     let mut session = if with_markdown {
-        open_query_session_with_markdown(&db_path, root_override.as_deref())?
+        open_query_session_with_markdown(&db_path, root_override.as_deref())
+            .map_err(|error| format_command_error(output, &error))?
     } else {
-        Session::open(&db_path).map_err(|error| error.to_string())?
+        Session::open(&db_path)
+            .map_err(AutomationError::from)
+            .map_err(|error| format_command_error(output, &error))?
     };
     let results = session
         .execute_script(&query, &params)
-        .map_err(|error| format_error_json(error.code(), error.message()))?;
-    let limited = cap_results(&results, max_rows);
-    print_results(&limited, output);
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    match output {
+        OutputFormat::Table => {
+            let limited = cap_results(&results, max_rows);
+            print_results(&limited, output);
+        }
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                query_as_json(&results, AutomationPolicy::query(max_rows))
+            );
+        }
+        OutputFormat::Ndjson => {
+            for line in query_as_ndjson(&results, AutomationPolicy::query(max_rows)) {
+                println!("{line}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -876,11 +901,38 @@ fn run_context(db_path: PathBuf, output: OutputFormat, top_k: usize) -> Result<(
     let query = format!(
         "MATCH (n) RETURN id(n) AS node_id, labels(n) AS labels, n.name AS name, n.title AS title ORDER BY id(n) LIMIT {top_k}"
     );
-    let mut session = Session::open(db_path).map_err(|error| error.to_string())?;
+    let mut session = Session::open(&db_path)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
     let results = session
         .execute_script(&query, &BTreeMap::new())
-        .map_err(|error| format_error_json(error.code(), error.message()))?;
-    print_results(&results, output);
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    match output {
+        OutputFormat::Table => print_results(&results, output),
+        OutputFormat::Json | OutputFormat::Ndjson => {
+            let Some(result) = results.first() else {
+                return Err(format_command_error(
+                    output,
+                    &AutomationError::new(
+                        "context_contract",
+                        "context query returned no result set",
+                    ),
+                ));
+            };
+            let envelope = build_context_response(&db_path, top_k, result)
+                .map_err(|error| format_command_error(output, &error))?;
+            match output {
+                OutputFormat::Json => println!("{}", context_as_json(&envelope)),
+                OutputFormat::Ndjson => {
+                    for line in context_as_ndjson(&envelope) {
+                        println!("{line}");
+                    }
+                }
+                OutputFormat::Table => unreachable!(),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -895,233 +947,45 @@ fn cap_results(results: &[QueryResult], max_rows: usize) -> Vec<QueryResult> {
 }
 
 fn format_error_json(code: &str, message: &str) -> String {
-    format!(
-        "{{\"error\":{{\"code\":\"{}\",\"message\":\"{}\"}}}}",
-        escape_json(code),
-        escape_json(message)
-    )
+    machine_error_json(code, message)
+}
+
+fn format_command_error(output: OutputFormat, error: &AutomationError) -> String {
+    match output {
+        OutputFormat::Table => error.to_string(),
+        OutputFormat::Json | OutputFormat::Ndjson => {
+            format_error_json(error.code(), error.message())
+        }
+    }
 }
 
 fn load_params(
     params_json: Option<&str>,
     params_file: Option<&Path>,
-) -> Result<BTreeMap<String, Value>, String> {
+) -> Result<BTreeMap<String, Value>, AutomationError> {
     if params_json.is_some() && params_file.is_some() {
-        return Err("`query` accepts either --params-json or --params-file, not both".to_owned());
+        return Err(AutomationError::new(
+            "params_json_conflict",
+            "`query` accepts either --params-json or --params-file, not both",
+        ));
     }
     if let Some(json) = params_json {
         return parse_params_json(json);
     }
     if let Some(path) = params_file {
-        let input = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let input = std::fs::read_to_string(path).map_err(|error| {
+            AutomationError::new(
+                "params_file_read",
+                format!("failed to read params file {}: {error}", path.display()),
+            )
+        })?;
         return parse_params_json(&input);
     }
     Ok(BTreeMap::new())
 }
 
-fn parse_params_json(input: &str) -> Result<BTreeMap<String, Value>, String> {
-    let mut parser = JsonParamParser::new(input);
-    let value = parser.parse_value()?;
-    parser.consume_whitespace();
-    if !parser.is_done() {
-        return Err("invalid params json: trailing characters".to_owned());
-    }
-    match value {
-        Value::Map(map) => Ok(map.into_iter().collect()),
-        _ => Err("params json must be an object mapping parameter names to values".to_owned()),
-    }
-}
-
-struct JsonParamParser<'a> {
-    input: &'a [u8],
-    index: usize,
-}
-
-impl<'a> JsonParamParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            input: input.as_bytes(),
-            index: 0,
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.index >= self.input.len()
-    }
-
-    fn consume_whitespace(&mut self) {
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_whitespace() {
-                self.index += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.input.get(self.index).map(|byte| *byte as char)
-    }
-
-    fn next(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.index += 1;
-        Some(ch)
-    }
-
-    fn expect(&mut self, expected: char) -> Result<(), String> {
-        match self.next() {
-            Some(ch) if ch == expected => Ok(()),
-            Some(ch) => Err(format!(
-                "invalid params json: expected `{expected}`, found `{ch}`"
-            )),
-            None => Err(format!(
-                "invalid params json: expected `{expected}`, found EOF"
-            )),
-        }
-    }
-
-    fn parse_value(&mut self) -> Result<Value, String> {
-        self.consume_whitespace();
-        match self.peek() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
-            Some('"') => self.parse_string().map(Value::String),
-            Some('t') => self.parse_keyword("true", Value::Bool(true)),
-            Some('f') => self.parse_keyword("false", Value::Bool(false)),
-            Some('n') => self.parse_keyword("null", Value::Null),
-            Some('-' | '0'..='9') => self.parse_number(),
-            Some(ch) => Err(format!("invalid params json: unexpected `{ch}`")),
-            None => Err("invalid params json: unexpected EOF".to_owned()),
-        }
-    }
-
-    fn parse_keyword(&mut self, keyword: &str, value: Value) -> Result<Value, String> {
-        for expected in keyword.chars() {
-            self.expect(expected)?;
-        }
-        Ok(value)
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        self.expect('"')?;
-        let mut output = String::new();
-        loop {
-            let Some(ch) = self.next() else {
-                return Err("invalid params json: unterminated string".to_owned());
-            };
-            match ch {
-                '"' => return Ok(output),
-                '\\' => {
-                    let Some(escaped) = self.next() else {
-                        return Err("invalid params json: incomplete escape".to_owned());
-                    };
-                    match escaped {
-                        '"' | '\\' | '/' => output.push(escaped),
-                        'b' => output.push('\u{0008}'),
-                        'f' => output.push('\u{000C}'),
-                        'n' => output.push('\n'),
-                        'r' => output.push('\r'),
-                        't' => output.push('\t'),
-                        _ => {
-                            return Err(format!(
-                                "invalid params json: unsupported escape `\\{escaped}`"
-                            ));
-                        }
-                    }
-                }
-                other => output.push(other),
-            }
-        }
-    }
-
-    fn parse_array(&mut self) -> Result<Value, String> {
-        self.expect('[')?;
-        self.consume_whitespace();
-        let mut values = Vec::new();
-        if matches!(self.peek(), Some(']')) {
-            self.next();
-            return Ok(Value::List(values));
-        }
-        loop {
-            values.push(self.parse_value()?);
-            self.consume_whitespace();
-            match self.next() {
-                Some(',') => {
-                    self.consume_whitespace();
-                }
-                Some(']') => return Ok(Value::List(values)),
-                Some(ch) => {
-                    return Err(format!(
-                        "invalid params json: expected `,` or `]`, found `{ch}`"
-                    ));
-                }
-                None => return Err("invalid params json: unterminated array".to_owned()),
-            }
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<Value, String> {
-        self.expect('{')?;
-        self.consume_whitespace();
-        let mut map = Vec::new();
-        if matches!(self.peek(), Some('}')) {
-            self.next();
-            return Ok(Value::from(PropertyMap::from_pairs(map)));
-        }
-        loop {
-            self.consume_whitespace();
-            let key = self.parse_string()?;
-            self.consume_whitespace();
-            self.expect(':')?;
-            let value = self.parse_value()?;
-            map.push((key, value));
-            self.consume_whitespace();
-            match self.next() {
-                Some(',') => {
-                    self.consume_whitespace();
-                }
-                Some('}') => return Ok(Value::from(PropertyMap::from_pairs(map))),
-                Some(ch) => {
-                    return Err(format!(
-                        "invalid params json: expected `,` or `}}`, found `{ch}`"
-                    ));
-                }
-                None => return Err("invalid params json: unterminated object".to_owned()),
-            }
-        }
-    }
-
-    fn parse_number(&mut self) -> Result<Value, String> {
-        let start = self.index;
-        if matches!(self.peek(), Some('-')) {
-            self.index += 1;
-        }
-        while matches!(self.peek(), Some('0'..='9')) {
-            self.index += 1;
-        }
-        let mut is_float = false;
-        if matches!(self.peek(), Some('.')) {
-            is_float = true;
-            self.index += 1;
-            while matches!(self.peek(), Some('0'..='9')) {
-                self.index += 1;
-            }
-        }
-        let slice = std::str::from_utf8(&self.input[start..self.index])
-            .map_err(|_| "invalid params json: invalid number".to_owned())?;
-        if is_float {
-            slice
-                .parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| format!("invalid params json: invalid float `{slice}`"))
-        } else {
-            slice
-                .parse::<i64>()
-                .map(Value::Int)
-                .map_err(|_| format!("invalid params json: invalid integer `{slice}`"))
-        }
-    }
+fn parse_params_json(input: &str) -> Result<BTreeMap<String, Value>, AutomationError> {
+    parse_params_json_impl(input)
 }
 
 fn parse_non_negative_usize(input: &str) -> Option<usize> {
@@ -1217,12 +1081,43 @@ fn run_source_set_root(db_path: PathBuf, root: PathBuf) -> Result<(), String> {
 fn open_query_session_with_markdown(
     db_path: &Path,
     root_override: Option<&Path>,
-) -> Result<Session, String> {
-    let session = Session::open(db_path).map_err(|error| error.to_string())?;
-    let root = resolve_markdown_root(root_override, Some(&session))?;
+) -> Result<Session, AutomationError> {
+    let session = Session::open(db_path).map_err(AutomationError::from)?;
+    let root = resolve_markdown_root_for_automation(root_override, Some(&session))?;
     let mut engine = session.engine().clone();
-    sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?;
+    sync_markdown_root(&mut engine, &root).map_err(AutomationError::from)?;
     Ok(Session::from_engine(engine))
+}
+
+fn resolve_markdown_root_for_automation(
+    root_override: Option<&Path>,
+    session: Option<&Session>,
+) -> Result<PathBuf, AutomationError> {
+    if let Some(root) = root_override {
+        return absolutize_path_for_automation(root);
+    }
+    if let Some(session) = session
+        && let Some(root) = configured_markdown_root(session.engine())
+    {
+        return Ok(root);
+    }
+    absolutize_path_for_automation(Path::new(".cupld/data"))
+}
+
+fn absolutize_path_for_automation(path: &Path) -> Result<PathBuf, AutomationError> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|error| AutomationError::new("path_resolution", error.to_string()))?
+            .join(path)
+    };
+    if path.exists() {
+        path.canonicalize()
+            .map_err(|error| AutomationError::new("path_resolution", error.to_string()))
+    } else {
+        Ok(path)
+    }
 }
 
 fn resolve_markdown_root(
@@ -1564,14 +1459,7 @@ fn missing_top_level_query(option: &str) -> String {
 fn is_registered_command(input: &str) -> bool {
     matches!(
         input,
-        "query"
-            | "context"
-            | "schema"
-            | "compact"
-            | "check"
-            | "sync"
-            | "source"
-            | "install"
+        "query" | "context" | "schema" | "compact" | "check" | "sync" | "source" | "install"
     )
 }
 
@@ -1951,7 +1839,7 @@ mod tests {
     fn formats_machine_error_json() {
         assert_eq!(
             format_error_json("constraint_unique_violation", "duplicate \"email\""),
-            "{\"error\":{\"code\":\"constraint_unique_violation\",\"message\":\"duplicate \\\"email\\\"\"}}"
+            "{\"ok\":false,\"error\":{\"code\":\"constraint_unique_violation\",\"message\":\"duplicate \\\"email\\\"\"}}"
         );
     }
 

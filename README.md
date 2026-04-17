@@ -9,6 +9,7 @@ It provides interactive exploration, one-shot queries, compact context output fo
 - Local-first graph database with file-backed `.cupld` stores
 - Pure Rust binary with no external runtime dependencies
 - Interactive REPL plus scriptable `query`, `context`, `schema`, and `check` commands
+- Stable JSON and NDJSON envelopes for `query` and `context` automation
 - Markdown sync and bundled `cupld-md-memory` skill bootstrap
 - Visual graph viewer for inspecting a database
 
@@ -62,6 +63,12 @@ Run a one-shot query:
 
 ```bash
 cupld query --db .cupld/default.cupld 'MATCH (n) RETURN n LIMIT 10'
+```
+
+Run the same query with the machine envelope:
+
+```bash
+cupld query --db .cupld/default.cupld --output json 'MATCH (n) RETURN n LIMIT 10'
 ```
 
 Build compact context rows for agent prompts:
