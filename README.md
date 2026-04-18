@@ -56,39 +56,39 @@ cupld
 Open or create a file-backed database:
 
 ```bash
-cupld .cupld/default.cupld
+cupld mydb.cupld
 ```
 
 Run a one-shot query:
 
 ```bash
-cupld query --db .cupld/default.cupld 'MATCH (n) RETURN n LIMIT 10'
+cupld query --db default 'MATCH (n) RETURN n LIMIT 10'
 ```
 
 Run the same query with the machine envelope:
 
 ```bash
-cupld query --db .cupld/default.cupld --output json 'MATCH (n) RETURN n LIMIT 10'
+cupld query --db default --output json 'MATCH (n) RETURN n LIMIT 10'
 ```
 
 Build compact context rows for agent prompts:
 
 ```bash
-cupld context --db .cupld/default.cupld --top-k 25
+cupld context --db default --top-k 25
 ```
 
 Inspect, validate, and compact a database:
 
 ```bash
-cupld schema --db .cupld/default.cupld
-cupld check --db .cupld/default.cupld
-cupld compact --db .cupld/default.cupld
+cupld schema --db default
+cupld check --db default
+cupld compact --db default
 ```
 
 Open the viewer:
 
 ```bash
-cupld --visualise .cupld/default.cupld
+cupld --db default --visualise
 ```
 
 ## Markdown Memory
@@ -99,22 +99,22 @@ Bootstrap the bundled `cupld-md-memory` skill and a local `.cupld` memory DB:
 cupld install
 ```
 
-By default, `install` uses `.cupld/default.cupld` for the database file and `.cupld/data` for the markdown root.
+By default, `install` uses `.cupld/default.cupld` for the database file and `.cupld/data` for the markdown root. `--db default` is a shortcut for that database path.
 
 Sync markdown into a database and override the root:
 
 ```bash
-cupld sync markdown --db .cupld/default.cupld --root notes
-cupld source set-root --db .cupld/default.cupld notes
+cupld sync markdown --db default --root notes
+cupld source set-root --db default notes
 ```
 
 Install into a provider-specific skills directory or a custom path:
 
 ```bash
-cupld install --target codex --scope home --db .cupld/default.cupld
-cupld install --target claude --scope cwd --db .cupld/default.cupld --root notes
-cupld install --target opencode --scope home --db .cupld/default.cupld
-cupld install --path /custom/skills --db .cupld/default.cupld --yes
+cupld install --target codex --scope home --db default
+cupld install --target claude --scope cwd --db default --root notes
+cupld install --target opencode --scope home --db default
+cupld install --path /custom/skills --db default --yes
 ```
 
 The interactive installer asks for a skill location, DB path, and markdown root. Interactive REPL launches can also offer the same bootstrap flow once.

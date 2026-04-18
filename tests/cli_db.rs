@@ -112,6 +112,19 @@ fn run_cli_with_input_in_dir(
     child.wait_with_output().unwrap()
 }
 
+fn workspace_default_db_path(workspace: &Path) -> PathBuf {
+    workspace.join(".cupld").join("default.cupld")
+}
+
+fn seed_workspace_default_db(workspace: &Path) -> PathBuf {
+    let db_path = workspace_default_db_path(workspace);
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+    session.save_as(&db_path).unwrap();
+    db_path
+}
+
 #[test]
 fn cli_repl_creates_a_new_db_when_path_is_missing() {
     let db = TempPath::new("cli_new_db");
@@ -147,6 +160,27 @@ fn cli_query_reads_from_generated_db() {
     assert!(stdout.contains("Ada"));
     assert!(stdout.contains("Alan"));
     assert!(stdout.contains("Bob"));
+    assert!(stdout.contains("Grace"));
+}
+
+#[test]
+fn cli_query_reads_from_default_db_alias() {
+    let workspace = TempDir::new("cli_query_default_alias");
+    seed_workspace_default_db(workspace.path());
+
+    let output = run_cli_in_dir(
+        &[
+            "query",
+            "--db",
+            "default",
+            "MATCH (n:Person) RETURN n.name ORDER BY n.name",
+        ],
+        workspace.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Ada"));
     assert!(stdout.contains("Grace"));
 }
 
@@ -272,6 +306,19 @@ fn cli_schema_prints_generated_schema() {
 }
 
 #[test]
+fn cli_schema_reads_from_default_db_alias() {
+    let workspace = TempDir::new("cli_schema_default_alias");
+    seed_workspace_default_db(workspace.path());
+
+    let output = run_cli_in_dir(&["schema", "--db", "default"], workspace.path());
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("CREATE LABEL Person"));
+    assert!(stdout.contains("CREATE EDGE TYPE KNOWS"));
+}
+
+#[test]
 fn cli_check_reports_generated_db_integrity() {
     let db = TestDb::new("cli_check");
     let mut session = db.open();
@@ -311,6 +358,18 @@ fn cli_visualise_requires_interactive_terminal() {
     drop(session);
 
     let output = run_cli(&["--visualise", "--db", db.path().to_str().unwrap()]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("requires an interactive terminal"));
+}
+
+#[test]
+fn cli_visualise_default_alias_still_requires_interactive_terminal() {
+    let workspace = TempDir::new("cli_visualise_default_alias");
+    seed_workspace_default_db(workspace.path());
+
+    let output = run_cli_in_dir(&["--visualise", "--db", "default"], workspace.path());
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -390,6 +449,49 @@ fn cli_source_set_root_persists_default_markdown_root() {
             "MATCH (d:MarkdownDocument) RETURN d.`src.path`, d.`md.title`",
         ],
         unrelated_cwd.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("configured.md"));
+    assert!(stdout.contains("Configured Root Note"));
+}
+
+#[test]
+fn cli_source_set_root_works_with_default_db_alias() {
+    let workspace = TempDir::new("cli_markdown_set_root_default_alias");
+    let configured_root = TempDir::new("cli_markdown_set_root_default_alias_root");
+    seed_workspace_default_db(workspace.path());
+    fs::write(
+        configured_root.path().join("configured.md"),
+        "# Configured Root Note",
+    )
+    .unwrap();
+
+    let set_root = run_cli_in_dir(
+        &[
+            "source",
+            "set-root",
+            "--db",
+            "default",
+            configured_root.path().to_str().unwrap(),
+        ],
+        workspace.path(),
+    );
+    assert!(set_root.status.success());
+
+    let db_path = workspace_default_db_path(workspace.path());
+    assert!(db_path.exists());
+
+    let output = run_cli_in_dir(
+        &[
+            "query",
+            "--db",
+            "default",
+            "--with-markdown",
+            "MATCH (d:MarkdownDocument) RETURN d.`src.path`, d.`md.title`",
+        ],
+        workspace.path(),
     );
 
     assert!(output.status.success());

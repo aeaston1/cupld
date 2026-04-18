@@ -78,7 +78,8 @@ fn cli_install_skill_writes_bundled_skill_and_records_state() {
     assert!(skill_path.exists());
     let contents = fs::read_to_string(&skill_path).unwrap();
     assert!(contents.contains("name: cupld-md-memory"));
-    assert!(contents.contains("cupld query --with-markdown"));
+    assert!(contents.contains("cupld query --db default --with-markdown"));
+    assert!(contents.contains("cupld sync markdown --db default"));
     assert!(contents.contains("./.cupld/default.cupld"));
     assert!(contents.contains("./.cupld/data/"));
     assert!(db_path.exists());

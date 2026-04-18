@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use cupld::{
-    MarkdownSyncReport, QueryResult, RuntimeValue, Session, Value,
+    MarkdownSyncReport, MarkdownWatchOptions, QueryResult, RuntimeValue, Session, Value,
     automation::{
         AutomationError, AutomationPolicy, build_context_response, context_as_json,
         context_as_ndjson, format_error_json as machine_error_json,
@@ -16,7 +16,7 @@ use cupld::{
     },
     configured_markdown_root,
     package::WorkspacePackage,
-    set_markdown_root, sync_markdown_root, watch_markdown_root, MarkdownWatchOptions,
+    set_markdown_root, sync_markdown_root, watch_markdown_root,
 };
 use skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
 
@@ -308,6 +308,19 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
     }
 }
 
+fn resolve_default_db_alias() -> Result<PathBuf, String> {
+    WorkspacePackage::discover_current()
+        .map(|package| package.default_db_path())
+        .map_err(|error| error.to_string())
+}
+
+fn parse_db_flag_value(value: &str) -> Result<PathBuf, String> {
+    match value {
+        "default" => resolve_default_db_alias(),
+        _ => Ok(PathBuf::from(value)),
+    }
+}
+
 fn parse_query_command(args: &[String]) -> Result<CliCommand, String> {
     ensure_subcommand_has_no_option(args, "query", "--visualise")?;
     ensure_subcommand_has_no_option(args, "query", "--query")?;
@@ -326,14 +339,15 @@ fn parse_query_command(args: &[String]) -> Result<CliCommand, String> {
         match args[index].as_str() {
             "--db" => {
                 let Some(path) = args.get(index + 1) else {
-                    return Err("expected --db <path.cupld> for `query` command".to_owned());
+                    return Err("expected --db <path.cupld|default> for `query` command".to_owned());
                 };
                 if db_path.is_some() {
                     return Err(
-                        "expected exactly one --db <path.cupld> for `query` command".to_owned()
+                        "expected exactly one --db <path.cupld|default> for `query` command"
+                            .to_owned(),
                     );
                 }
-                db_path = Some(PathBuf::from(path));
+                db_path = Some(parse_db_flag_value(path)?);
                 index += 2;
             }
             "--with-markdown" => {
@@ -405,7 +419,7 @@ fn parse_query_command(args: &[String]) -> Result<CliCommand, String> {
     }
 
     let Some(db_path) = db_path else {
-        return Err("expected --db <path.cupld> for `query` command".to_owned());
+        return Err("expected --db <path.cupld|default> for `query` command".to_owned());
     };
 
     Ok(CliCommand::Query {
@@ -430,9 +444,11 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
         match args[index].as_str() {
             "--db" => {
                 let Some(path) = args.get(index + 1) else {
-                    return Err("expected --db <path.cupld> for `context` command".to_owned());
+                    return Err(
+                        "expected --db <path.cupld|default> for `context` command".to_owned()
+                    );
                 };
-                db_path = Some(PathBuf::from(path));
+                db_path = Some(parse_db_flag_value(path)?);
                 index += 2;
             }
             "--output" => {
@@ -463,7 +479,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
     }
 
     let Some(db_path) = db_path else {
-        return Err("expected --db <path.cupld> for `context` command".to_owned());
+        return Err("expected --db <path.cupld|default> for `context` command".to_owned());
     };
     Ok(CliCommand::Context {
         db_path,
@@ -489,7 +505,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
         Some("markdown") => {}
         _ => {
             return Err(format!(
-                "error: expected `sync markdown --db <path.cupld> [--root <path>] [--watch]`\n\n{}",
+                "error: expected `sync markdown --db <path.cupld|default> [--root <path>] [--watch]`\n\n{}",
                 cli_usage_text()
             ));
         }
@@ -509,15 +525,17 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
         match args[index].as_str() {
             "--db" => {
                 let Some(path) = args.get(index + 1) else {
-                    return Err("expected --db <path.cupld> for `sync markdown` command".to_owned());
+                    return Err(
+                        "expected --db <path.cupld|default> for `sync markdown` command".to_owned(),
+                    );
                 };
                 if db_path.is_some() {
                     return Err(
-                        "expected exactly one --db <path.cupld> for `sync markdown` command"
+                        "expected exactly one --db <path.cupld|default> for `sync markdown` command"
                             .to_owned(),
                     );
                 }
-                db_path = Some(PathBuf::from(path));
+                db_path = Some(parse_db_flag_value(path)?);
                 index += 2;
             }
             "--root" => {
@@ -538,57 +556,45 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
                 let Some(value) = args.get(index + 1) else {
                     return Err("expected --poll-ms <n> for `sync markdown` command".to_owned());
                 };
-                poll_interval = Duration::from_millis(
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| "expected --poll-ms <n> for `sync markdown` command".to_owned())?,
-                );
+                poll_interval = Duration::from_millis(value.parse::<u64>().map_err(|_| {
+                    "expected --poll-ms <n> for `sync markdown` command".to_owned()
+                })?);
                 index += 2;
             }
             "--debounce-ms" => {
                 let Some(value) = args.get(index + 1) else {
-                    return Err(
-                        "expected --debounce-ms <n> for `sync markdown` command".to_owned()
-                    );
+                    return Err("expected --debounce-ms <n> for `sync markdown` command".to_owned());
                 };
-                debounce = Duration::from_millis(
-                    value.parse::<u64>().map_err(|_| {
-                        "expected --debounce-ms <n> for `sync markdown` command".to_owned()
-                    })?,
-                );
+                debounce = Duration::from_millis(value.parse::<u64>().map_err(|_| {
+                    "expected --debounce-ms <n> for `sync markdown` command".to_owned()
+                })?);
                 index += 2;
             }
             "--batch-ms" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err("expected --batch-ms <n> for `sync markdown` command".to_owned());
                 };
-                batch_window = Duration::from_millis(
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| "expected --batch-ms <n> for `sync markdown` command".to_owned())?,
-                );
+                batch_window = Duration::from_millis(value.parse::<u64>().map_err(|_| {
+                    "expected --batch-ms <n> for `sync markdown` command".to_owned()
+                })?);
                 index += 2;
             }
             "--idle-ms" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err("expected --idle-ms <n> for `sync markdown` command".to_owned());
                 };
-                idle_timeout = Some(Duration::from_millis(
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| "expected --idle-ms <n> for `sync markdown` command".to_owned())?,
-                ));
+                idle_timeout = Some(Duration::from_millis(value.parse::<u64>().map_err(
+                    |_| "expected --idle-ms <n> for `sync markdown` command".to_owned(),
+                )?));
                 index += 2;
             }
             "--max-runs" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err("expected --max-runs <n> for `sync markdown` command".to_owned());
                 };
-                max_runs = Some(
-                    value
-                        .parse::<usize>()
-                        .map_err(|_| "expected --max-runs <n> for `sync markdown` command".to_owned())?,
-                );
+                max_runs = Some(value.parse::<usize>().map_err(|_| {
+                    "expected --max-runs <n> for `sync markdown` command".to_owned()
+                })?);
                 index += 2;
             }
             value => {
@@ -601,7 +607,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
     }
 
     let Some(db_path) = db_path else {
-        return Err("expected --db <path.cupld> for `sync markdown` command".to_owned());
+        return Err("expected --db <path.cupld|default> for `sync markdown` command".to_owned());
     };
 
     Ok(CliCommand::SyncMarkdown {
@@ -624,7 +630,7 @@ fn parse_source_command(args: &[String]) -> Result<CliCommand, String> {
         Some("set-root") => {}
         _ => {
             return Err(format!(
-                "error: expected `source set-root --db <path.cupld> <path>`\n\n{}",
+                "error: expected `source set-root --db <path.cupld|default> <path>`\n\n{}",
                 cli_usage_text()
             ));
         }
@@ -639,16 +645,17 @@ fn parse_source_command(args: &[String]) -> Result<CliCommand, String> {
             "--db" => {
                 let Some(path) = args.get(index + 1) else {
                     return Err(
-                        "expected --db <path.cupld> for `source set-root` command".to_owned()
+                        "expected --db <path.cupld|default> for `source set-root` command"
+                            .to_owned(),
                     );
                 };
                 if db_path.is_some() {
                     return Err(
-                        "expected exactly one --db <path.cupld> for `source set-root` command"
-                            .to_owned(),
+                        "expected exactly one --db <path.cupld|default> for `source set-root` command"
+                            .to_owned()
                     );
                 }
-                db_path = Some(PathBuf::from(path));
+                db_path = Some(parse_db_flag_value(path)?);
                 index += 2;
             }
             value if value.starts_with('-') => {
@@ -671,7 +678,7 @@ fn parse_source_command(args: &[String]) -> Result<CliCommand, String> {
     }
 
     let Some(db_path) = db_path else {
-        return Err("expected --db <path.cupld> for `source set-root` command".to_owned());
+        return Err("expected --db <path.cupld|default> for `source set-root` command".to_owned());
     };
     let Some(root) = root else {
         return Err("expected a root path for `source set-root`".to_owned());
@@ -734,12 +741,12 @@ fn parse_install_command(args: &[String]) -> Result<CliCommand, String> {
             }
             "--db" => {
                 let Some(value) = args.get(index + 1) else {
-                    return Err("expected --db <path.cupld> for `install`".to_owned());
+                    return Err("expected --db <path.cupld|default> for `install`".to_owned());
                 };
                 if db_path.is_some() {
                     return Err("duplicate option `--db`".to_owned());
                 }
-                db_path = Some(PathBuf::from(value));
+                db_path = Some(parse_db_flag_value(value)?);
                 index += 2;
             }
             "--root" => {
@@ -819,7 +826,7 @@ fn parse_top_level_command(args: &[String]) -> Result<CliCommand, String> {
                 if db_path.is_some() || positional_db_path.is_some() {
                     return Err(duplicate_top_level_db_path());
                 }
-                db_path = Some(PathBuf::from(path));
+                db_path = Some(parse_db_flag_value(path)?);
                 index += 2;
             }
             "-h" | "--help" | "help" => return Ok(CliCommand::Help),
@@ -873,20 +880,20 @@ fn cli_usage_text() -> &'static str {
 Usage:
   cupld
   cupld <path.cupld>
-  cupld --db <path.cupld>
+  cupld --db <path.cupld|default>
   cupld --visualise <path.cupld>
   cupld <path.cupld> --visualise
-  cupld --visualise --db <path.cupld>
-  cupld --db <path.cupld> --visualise
-  cupld --visualise --db <path.cupld> --query 'MATCH (n) RETURN n LIMIT 10'
-  cupld query --db <path.cupld> [--with-markdown] [--root <path>] [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
-  cupld context --db <path.cupld> [--top-k <n>] [--output <table|json|ndjson>]
-  cupld schema --db <path.cupld>
-  cupld compact --db <path.cupld>
-  cupld check --db <path.cupld>
-  cupld sync markdown --db <path.cupld> [--root <path>] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
-  cupld source set-root --db <path.cupld> <path>
-  cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld>] [--root <path>] [--force] [--yes]
+  cupld --visualise --db <path.cupld|default>
+  cupld --db <path.cupld|default> --visualise
+  cupld --visualise --db <path.cupld|default> --query 'MATCH (n) RETURN n LIMIT 10'
+  cupld query --db <path.cupld|default> [--with-markdown] [--root <path>] [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
+  cupld context --db <path.cupld|default> [--top-k <n>] [--output <table|json|ndjson>]
+  cupld schema --db <path.cupld|default>
+  cupld compact --db <path.cupld|default>
+  cupld check --db <path.cupld|default>
+  cupld sync markdown --db <path.cupld|default> [--root <path>] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
+  cupld source set-root --db <path.cupld|default> <path>
+  cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld|default>] [--root <path>] [--force] [--yes]
   cupld -h
   cupld --help
   cupld help
@@ -894,7 +901,7 @@ Usage:
 Commands:
   cupld                   Start an in-memory REPL session.
   cupld <path.cupld>      Open or create a file-backed REPL session.
-  cupld --db <path>       Open a file-backed REPL session via a global flag.
+  cupld --db <path|default> Open a file-backed REPL session; `default` maps to `./.cupld/default.cupld`.
   --visualise             Open the interactive scene viewer for --db.
   --query                 Seed the scene with one read-only RETURN query.
   query                   Run a query against --db using inline text or stdin.
@@ -921,24 +928,24 @@ Commands:
 
 Examples:
   cupld
-  cupld .cupld/default.cupld
-  cupld --db .cupld/default.cupld
-  cupld --visualise .cupld/default.cupld
-  cupld --visualise --db .cupld/default.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
-  cupld --db .cupld/default.cupld --visualise
-  cupld query --db .cupld/default.cupld --output json 'MATCH (n) RETURN n'
-  cupld query --db .cupld/default.cupld --params-json '{\"name\":\"Ada\"}' 'MATCH (n:Person {name: $name}) RETURN n'
-  cupld query --db .cupld/default.cupld --with-markdown --root notes 'MATCH (n) RETURN n'
-  cupld context --db .cupld/default.cupld --top-k 25
-  echo 'MATCH (n) RETURN n' | cupld query --db .cupld/default.cupld
-  cupld schema --db .cupld/default.cupld
-  cupld sync markdown --db .cupld/default.cupld
-  cupld sync markdown --db .cupld/default.cupld --watch --idle-ms 500 --max-runs 2
-  cupld source set-root --db .cupld/default.cupld notes
+  cupld sample.cupld
+  cupld --db default
+  cupld --visualise sample.cupld
+  cupld --visualise --db default --query 'MATCH (n:Person) RETURN n LIMIT 10'
+  cupld --db default --visualise
+  cupld query --db default --output json 'MATCH (n) RETURN n'
+  cupld query --db default --params-json '{\"name\":\"Ada\"}' 'MATCH (n:Person {name: $name}) RETURN n'
+  cupld query --db default --with-markdown --root notes 'MATCH (n) RETURN n'
+  cupld context --db default --top-k 25
+  echo 'MATCH (n) RETURN n' | cupld query --db default
+  cupld schema --db default
+  cupld sync markdown --db default
+  cupld sync markdown --db default --watch --idle-ms 500 --max-runs 2
+  cupld source set-root --db default notes
   cupld install
-  cupld install --target codex --scope home --db .cupld/default.cupld
-  cupld install --target claude --scope cwd --db .cupld/default.cupld --root notes
-  cupld install --path ~/.claude/skills --db .cupld/default.cupld --yes
+  cupld install --target codex --scope home --db default
+  cupld install --target claude --scope cwd --db default --root notes
+  cupld install --path ~/.claude/skills --db default --yes
 
 REPL:
   Run .help inside the REPL for interactive commands."
@@ -1168,8 +1175,8 @@ fn run_sync_markdown(
             idle_timeout,
             max_runs,
         };
-        let report = watch_markdown_root(&mut engine, &root, &options)
-            .map_err(|error| error.to_string())?;
+        let report =
+            watch_markdown_root(&mut engine, &root, &options).map_err(|error| error.to_string())?;
         println!(
             "watch root={} runs={} events={}",
             report.root.display(),
@@ -1491,27 +1498,27 @@ fn parse_db_path(
 ) -> Result<PathBuf, String> {
     if args.is_empty() {
         return Err(format!(
-            "expected --db <path.cupld> for `{command}` command"
+            "expected --db <path.cupld|default> for `{command}` command"
         ));
     }
     if args[0] != "--db" {
         return Err(format!(
-            "expected --db <path.cupld> for `{command}` command"
+            "expected --db <path.cupld|default> for `{command}` command"
         ));
     }
     if args.len() < 2 {
         return Err(format!(
-            "expected --db <path.cupld> for `{command}` command"
+            "expected --db <path.cupld|default> for `{command}` command"
         ));
     }
     if !allow_additional_args && args.len() > 2 {
         return Err(format!(
-            "`{command}` accepts only --db <path.cupld>\n\n{}",
+            "`{command}` accepts only --db <path.cupld|default>\n\n{}",
             cli_usage_text()
         ));
     }
 
-    Ok(PathBuf::from(&args[1]))
+    parse_db_flag_value(&args[1])
 }
 
 fn parse_query(db_path: PathBuf, query_args: &[String]) -> Result<(PathBuf, String), String> {
@@ -1522,7 +1529,8 @@ fn parse_query(db_path: PathBuf, query_args: &[String]) -> Result<(PathBuf, Stri
             .map_err(|error| error.to_string())?;
         if input.trim().is_empty() {
             return Err(
-                "expected query text, e.g. `cupld query --db <path.cupld> MATCH ...`".to_owned(),
+                "expected query text, e.g. `cupld query --db <path.cupld|default> MATCH ...`"
+                    .to_owned(),
             );
         }
         return Ok((db_path, input));
@@ -1562,7 +1570,7 @@ fn duplicate_top_level_option(option: &str) -> String {
 
 fn duplicate_top_level_db_path() -> String {
     format!(
-        "error: provide exactly one database path via `<path.cupld>` or `--db <path.cupld>`\n\n{}",
+        "error: provide exactly one database path via `<path.cupld>` or `--db <path.cupld|default>`\n\n{}",
         cli_usage_text()
     )
 }
@@ -1773,6 +1781,13 @@ mod tests {
     use cupld::{QueryResult, RuntimeValue, Value};
     use std::path::PathBuf;
 
+    fn default_alias_db_path() -> PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join(".cupld")
+            .join("default.cupld")
+    }
+
     #[test]
     fn repl_input_drains_pasted_lines_into_pending_queue() {
         let mut input = ReplInput::from_events(
@@ -1858,6 +1873,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_query_with_default_db_alias() {
+        let args = vec![
+            "query".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "MATCH".to_owned(),
+            "(n)".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::Query {
+                db_path: default_alias_db_path(),
+                with_markdown: false,
+                root_override: None,
+                output: OutputFormat::Table,
+                params_json: None,
+                params_file: None,
+                max_rows: 1_000,
+                query_args: vec!["MATCH".into(), "(n)".into()],
+            })
+        );
+    }
+
+    #[test]
     fn parses_query_with_machine_options() {
         let args = vec![
             "query".to_owned(),
@@ -1923,6 +1962,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_context_command_with_default_db_alias() {
+        assert_eq!(
+            parse_cli_command(&[
+                "context".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+            ]),
+            Ok(CliCommand::Context {
+                db_path: default_alias_db_path(),
+                output: OutputFormat::Json,
+                top_k: 20,
+            })
+        );
+    }
+
+    #[test]
     fn parses_params_json_into_runtime_values() {
         let params = parse_params_json(
             "{\"name\":\"Ada\",\"age\":36,\"active\":true,\"tags\":[\"a\",\"b\"],\"meta\":{\"team\":\"graph\"}}",
@@ -1975,7 +2030,18 @@ mod tests {
         let args = vec!["query".to_owned(), "db.cupld".to_owned()];
         assert_eq!(
             parse_cli_command(&args),
-            Err("expected --db <path.cupld> for `query` command".to_owned())
+            Err("expected --db <path.cupld|default> for `query` command".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_schema_with_default_db_alias() {
+        let args = vec!["schema".to_owned(), "--db".to_owned(), "default".to_owned()];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::Schema {
+                db_path: default_alias_db_path(),
+            })
         );
     }
 
@@ -1997,6 +2063,31 @@ mod tests {
                 scope: Some(InstallScope::Cwd),
                 path: None,
                 db_path: Some(PathBuf::from("db.cupld")),
+                root: None,
+                force: false,
+                yes: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_install_with_default_db_alias() {
+        let args = vec![
+            "install".to_owned(),
+            "--target".to_owned(),
+            "codex".to_owned(),
+            "--scope".to_owned(),
+            "cwd".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::Install(InstallCommand {
+                target: Some(SkillInstallTarget::Codex),
+                scope: Some(InstallScope::Cwd),
+                path: None,
+                db_path: Some(default_alias_db_path()),
                 root: None,
                 force: false,
                 yes: false,
@@ -2037,6 +2128,15 @@ mod tests {
         assert_eq!(
             parse_cli_command(&args),
             Ok(CliCommand::ReplWithDb(PathBuf::from("db.cupld")))
+        );
+    }
+
+    #[test]
+    fn parses_top_level_default_db_alias() {
+        let args = vec!["--db".to_owned(), "default".to_owned()];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::ReplWithDb(default_alias_db_path()))
         );
     }
 
@@ -2107,6 +2207,63 @@ mod tests {
             Ok(CliCommand::Visualise {
                 db_path: PathBuf::from("db.cupld"),
                 query: Some("MATCH (n) RETURN n LIMIT 5".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_top_level_visualise_with_default_db_alias() {
+        let args = vec![
+            "--visualise".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::Visualise {
+                db_path: default_alias_db_path(),
+                query: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_sync_markdown_with_default_db_alias() {
+        let args = vec![
+            "sync".to_owned(),
+            "markdown".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::SyncMarkdown {
+                db_path: default_alias_db_path(),
+                root_override: None,
+                watch: false,
+                poll_interval: std::time::Duration::from_millis(100),
+                debounce: std::time::Duration::from_millis(200),
+                batch_window: std::time::Duration::from_secs(2),
+                idle_timeout: None,
+                max_runs: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_source_set_root_with_default_db_alias() {
+        let args = vec![
+            "source".to_owned(),
+            "set-root".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "notes".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::SourceSetRoot {
+                db_path: default_alias_db_path(),
+                root: PathBuf::from("notes"),
             })
         );
     }
@@ -2190,18 +2347,18 @@ mod tests {
         assert!(help.contains("Commands:"));
         assert!(help.contains("Examples:"));
         assert!(help.contains("REPL:"));
-        assert!(help.contains("cupld --db <path.cupld>"));
+        assert!(help.contains("cupld --db <path.cupld|default>"));
         assert!(help.contains("cupld --visualise <path.cupld>"));
-        assert!(help.contains("cupld --db <path.cupld> --visualise"));
-        assert!(help.contains("cupld --visualise --db <path.cupld> --query"));
-        assert!(help.contains("cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld>] [--root <path>] [--force] [--yes]"));
-        assert!(help.contains("Open the interactive scene viewer for --db."));
+        assert!(help.contains("cupld --db <path.cupld|default> --visualise"));
+        assert!(help.contains("cupld --visualise --db <path.cupld|default> --query"));
+        assert!(help.contains("cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld|default>] [--root <path>] [--force] [--yes]"));
+        assert!(help.contains("`default` maps to `./.cupld/default.cupld`."));
         assert!(help.contains(
             "Install the bundled cupld-md-memory SKILL.md and bootstrap local cupld memory."
         ));
         assert!(help.contains("Seed the scene with one read-only RETURN query."));
         assert!(help.contains("Run a query against --db using inline text or stdin."));
-        assert!(help.contains("echo 'MATCH (n) RETURN n' | cupld query --db .cupld/default.cupld"));
+        assert!(help.contains("echo 'MATCH (n) RETURN n' | cupld query --db default"));
         assert!(help.contains("Run .help inside the REPL for interactive commands."));
     }
 
@@ -2228,7 +2385,7 @@ mod tests {
         let args = vec!["schema".to_owned()];
         assert_eq!(
             parse_cli_command(&args),
-            Err("expected --db <path.cupld> for `schema` command".to_owned())
+            Err("expected --db <path.cupld|default> for `schema` command".to_owned())
         );
     }
 

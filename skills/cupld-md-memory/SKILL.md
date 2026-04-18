@@ -12,6 +12,7 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
 - Edit markdown with normal filesystem tools. `cupld` reads and syncs markdown; it does not write notes back for you.
 - Root resolution order is: explicit `--root`, then `.cupld/config.toml`, then the DB root set by `cupld source set-root`, then `./.cupld/data/` under the current working directory.
 - `cupld install` bootstraps `./.cupld/default.cupld` by default for local markdown memory work.
+- `--db default` is an alias for `./.cupld/default.cupld`.
 - `cupld install` and `source set-root` keep repo-local defaults in `.cupld/config.toml`.
 - The skill install location (`.agents/skills`, `.claude/skills`, or a custom path) is separate from the DB path and markdown root. Installing the skill elsewhere does not move `./.cupld/default.cupld` or `./.cupld/data/`.
 - `cupld query --with-markdown` overlays markdown into a temporary query session and does not persist the imported notes.
@@ -30,27 +31,27 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
    ```
 2. If the markdown root should stay stable across working directories, persist or update it once.
    ```bash
-   cupld source set-root --db .cupld/default.cupld /absolute/path/to/notes
+   cupld source set-root --db default /absolute/path/to/notes
    ```
 3. For a one-off root override, pass `--root` directly.
    ```bash
-   cupld query --db .cupld/default.cupld --with-markdown --root /absolute/path/to/notes \
+   cupld query --db default --with-markdown --root /absolute/path/to/notes \
      "MATCH (d:MarkdownDocument) RETURN d.\`src.path\`, d.\`md.title\` ORDER BY d.\`src.path\`"
    ```
 4. After editing notes, use overlay queries for transient reads.
    ```bash
-   cupld query --db .cupld/default.cupld --with-markdown \
+   cupld query --db default --with-markdown \
      "MATCH (d:MarkdownDocument) RETURN d.\`src.path\`, d.\`md.title\` ORDER BY d.\`src.path\`"
    ```
 5. Persist markdown when you want later plain queries to see it.
    ```bash
-   cupld sync markdown --db .cupld/default.cupld
+   cupld sync markdown --db default
    ```
 6. Use maintenance commands before making assumptions about a DB.
    ```bash
-   cupld check --db .cupld/default.cupld
-   cupld schema --db .cupld/default.cupld
-   cupld compact --db .cupld/default.cupld
+   cupld check --db default
+   cupld schema --db default
+   cupld compact --db default
    ```
 
 ## Markdown Graph Model
@@ -98,7 +99,7 @@ Do not assume:
 List markdown docs:
 
 ```bash
-cupld query --db .cupld/default.cupld --with-markdown \
+cupld query --db default --with-markdown \
   "MATCH (d:MarkdownDocument)
    RETURN d.\`src.path\`, d.\`md.title\`, d.\`src.status\`
    ORDER BY d.\`src.path\`"
@@ -107,7 +108,7 @@ cupld query --db .cupld/default.cupld --with-markdown \
 Look up one note by path:
 
 ```bash
-cupld query --db .cupld/default.cupld --with-markdown \
+cupld query --db default --with-markdown \
   "MATCH (d:MarkdownDocument { \`src.path\`: 'projects/cupld-rollout.md' })
    RETURN d.\`md.title\`, d.\`md.tags\`, d.\`md.headings\`, d.\`md.body\`"
 ```
@@ -115,7 +116,7 @@ cupld query --db .cupld/default.cupld --with-markdown \
 Traverse outlinks:
 
 ```bash
-cupld query --db .cupld/default.cupld --with-markdown \
+cupld query --db default --with-markdown \
   "MATCH (a:MarkdownDocument)-[e:MD_LINKS_TO]->(b:MarkdownDocument)
    RETURN a.\`src.path\`, e.\`md.link_target\`, b.\`src.path\`
    ORDER BY a.\`src.path\`, b.\`src.path\`"
@@ -124,7 +125,7 @@ cupld query --db .cupld/default.cupld --with-markdown \
 Traverse backlinks:
 
 ```bash
-cupld query --db .cupld/default.cupld --with-markdown \
+cupld query --db default --with-markdown \
   "MATCH (a:MarkdownDocument)-[:MD_LINKS_TO]->(b:MarkdownDocument { \`src.path\`: 'notes/schema-notes.md' })
    RETURN a.\`src.path\`
    ORDER BY a.\`src.path\`"
@@ -133,7 +134,7 @@ cupld query --db .cupld/default.cupld --with-markdown \
 Join native graph data to markdown notes:
 
 ```bash
-cupld query --db .cupld/default.cupld --with-markdown \
+cupld query --db default --with-markdown \
   "MATCH (topic)-[:REFERENCES]->(d:MarkdownDocument)
    RETURN topic.name, d.\`src.path\`, d.\`md.title\`, d.\`src.status\`"
 ```
@@ -141,7 +142,7 @@ cupld query --db .cupld/default.cupld --with-markdown \
 Find tombstoned markdown docs:
 
 ```bash
-cupld query --db .cupld/default.cupld \
+cupld query --db default \
   "MATCH (d:MarkdownDocument)
    WHERE d.\`src.status\` = 'missing'
    RETURN d.\`src.path\`, d.\`md.title\`"
@@ -150,7 +151,7 @@ cupld query --db .cupld/default.cupld \
 Create native graph edges pointing at markdown docs:
 
 ```bash
-cat <<'EOF' | cupld query --db .cupld/default.cupld --with-markdown
+cat <<'EOF' | cupld query --db default --with-markdown
 BEGIN;
 MATCH (d:MarkdownDocument {`src.path`: 'projects/cupld-rollout.md'})
 CREATE (:Topic {name: 'Rollout'})-[:REFERENCES]->(d);
@@ -162,7 +163,7 @@ After `cupld sync markdown`, use the REPL for NDJSON output:
 
 ```bash
 printf '.output ndjson\nMATCH (d:MarkdownDocument) RETURN d.`src.path`, d.`md.title` LIMIT 5\n.quit\n' \
-  | cupld .cupld/default.cupld
+  | cupld --db default
 ```
 
 ## REPL Commands

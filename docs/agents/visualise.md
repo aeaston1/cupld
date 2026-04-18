@@ -5,16 +5,17 @@
 ## Current behavior
 
 - `cupld --visualise <path.cupld>` opens the interactive scene viewer for that database.
-- `cupld --visualise --db <path.cupld>` and `cupld --db <path.cupld> --visualise` are equivalent forms.
+- `cupld --visualise --db <path.cupld|default>` and `cupld --db <path.cupld|default> --visualise` are equivalent forms.
+- `--db default` is an alias for `./.cupld/default.cupld`.
 - `--query` is only valid with `--visualise`.
 - `--query` is intended to seed the viewer with one read-only `RETURN` query.
 
 ## Examples
 
 ```bash
-cupld --visualise .cupld/default.cupld
-cupld --db .cupld/default.cupld --visualise
-cupld --visualise --db .cupld/default.cupld --query 'MATCH (n:Person) RETURN n LIMIT 10'
+cupld --visualise mydb.cupld
+cupld --db default --visualise
+cupld --visualise --db default --query 'MATCH (n:Person) RETURN n LIMIT 10'
 ```
 
 ## Notes
