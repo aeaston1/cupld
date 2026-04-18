@@ -17,6 +17,7 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
 - The skill install location (`.agents/skills`, `.claude/skills`, or a custom path) is separate from the DB path and markdown root. Installing the skill elsewhere does not move `./.cupld/default.cupld` or `./.cupld/data/`.
 - `cupld query --with-markdown` overlays markdown into a temporary query session and does not persist the imported notes.
 - `cupld sync markdown` persists markdown documents and markdown link edges into the `.cupld` database.
+- `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes with `--poll-ms`, `--debounce-ms`, `--batch-ms`, `--idle-ms`, and `--max-runs`.
 - `cupld query --db ...` requires an existing database file. If the DB is missing, create it first with `cupld <path.cupld>`.
 - `cupld query` and `cupld context` support `--output table|json|ndjson` without using the REPL.
 - In JSON or NDJSON mode, `query` and `context` emit stable machine envelopes instead of raw table text.
@@ -47,7 +48,11 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
    ```bash
    cupld sync markdown --db default
    ```
-6. Use maintenance commands before making assumptions about a DB.
+6. For bounded continuous persisted sync, use watch mode after the initial sync.
+   ```bash
+   cupld sync markdown --db default --watch --idle-ms 500 --max-runs 2
+   ```
+7. Use maintenance commands before making assumptions about a DB.
    ```bash
    cupld check --db default
    cupld schema --db default
@@ -85,14 +90,17 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
 
 Use the normal `cupld` query language. The current useful surface here is:
 
-- Reads: `MATCH`, `WHERE`, `RETURN`, `ORDER BY`, `LIMIT`, `SHOW`, `EXPLAIN`
-- Writes: `CREATE`, `SET`, `REMOVE`, `DELETE`
+- Reads: `MATCH`, `WHERE`, `WITH`, `RETURN`, `ORDER BY`, `LIMIT`, `SHOW`, `EXPLAIN`
+- Writes: `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`
 - Transactions: `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`
+- Useful expressions and helpers: `IN`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `=~`, `edge_type`, `has_label`, `insert`, list indexing, dynamic map-key access, bytes literals, and datetime literals
+- Machine automation: prefer `--output json` or `--output ndjson` for downstream parsing
 
 Do not assume:
 
-- full-text search
 - automatic markdown write-back
+
+For persisted markdown-heavy workloads, the same schema surface supports optional list and full-text indexes. Follow current shipped DDL syntax from the agent guide instead of inventing custom markdown-only conventions.
 
 ## Snippets
 

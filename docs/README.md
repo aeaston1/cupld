@@ -8,6 +8,7 @@ This directory contains the public documentation for `cupld`.
 - [`agents/README.md`](./agents/README.md) is also the canonical automation-contract reference for machine output and agent workflows.
 - Use this file as the public docs map.
 - The repo root [`README.md`](../README.md) is the short project overview.
+- Treat `internal/` docs as historical planning and status material, not as the current CLI contract.
 
 ## Structure
 

@@ -10,7 +10,7 @@ It provides interactive exploration, one-shot queries, compact context output fo
 - Pure Rust binary with no external runtime dependencies
 - Interactive REPL plus scriptable `query`, `context`, `schema`, and `check` commands
 - Stable JSON and NDJSON envelopes for `query` and `context` automation
-- Markdown sync and bundled `cupld-md-memory` skill bootstrap
+- Markdown sync, optional watch mode, and bundled `cupld-md-memory` skill bootstrap
 - Visual graph viewer for inspecting a database
 
 ## Install
@@ -108,6 +108,14 @@ cupld sync markdown --db default --root notes
 cupld source set-root --db default notes
 ```
 
+Watch markdown after the initial persisted sync:
+
+```bash
+cupld sync markdown --db default --root notes --watch --idle-ms 500 --max-runs 2
+```
+
+Use `cupld query --with-markdown` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state.
+
 Install into a provider-specific skills directory or a custom path:
 
 ```bash
@@ -124,7 +132,7 @@ Repo-local package settings live in `.cupld/config.toml`. `install` and markdown
 ## Documentation
 
 - Docs index: [`docs/README.md`](./docs/README.md)
-- Agent guide: [`docs/agents/README.md`](./docs/agents/README.md)
+- Agent guide: [`docs/agents/README.md`](./docs/agents/README.md) for the full current CLI and automation contract
 - Viewer notes: [`docs/agents/visualise.md`](./docs/agents/visualise.md)
 - Security policy: [`SECURITY.md`](./SECURITY.md)
 - Code of conduct: [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
