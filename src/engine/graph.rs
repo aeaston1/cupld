@@ -415,17 +415,16 @@ impl CupldEngine {
             let labels = node.labels.into_iter().collect::<BTreeSet<_>>();
             data.outgoing.entry(node_id).or_default();
             data.incoming.entry(node_id).or_default();
-            data.nodes
-                .insert(
+            data.nodes.insert(
+                node_id,
+                Node::new(
                     node_id,
-                    Node::new(
-                        node_id,
-                        labels,
-                        node.properties,
-                        node.valid_from,
-                        node.valid_to,
-                    ),
-                );
+                    labels,
+                    node.properties,
+                    node.valid_from,
+                    node.valid_to,
+                ),
+            );
         }
         for edge in state.edges {
             let edge_id = EdgeId::new(edge.id);
@@ -488,7 +487,13 @@ impl CupldEngine {
         }
 
         let node_id = self.working.allocate_node_id();
-        let node = Node::new(node_id, label_set, properties, Some(SystemTime::now()), None);
+        let node = Node::new(
+            node_id,
+            label_set,
+            properties,
+            Some(SystemTime::now()),
+            None,
+        );
         self.working.nodes.insert(node_id, node);
         self.working.outgoing.entry(node_id).or_default();
         self.working.incoming.entry(node_id).or_default();
@@ -601,7 +606,13 @@ impl CupldEngine {
         ensure_target_exists(&self.working.schema, &target)?;
 
         let requested_name = name.map(ToOwned::to_owned).unwrap_or_else(|| {
-            generated_name("idx", target.kind(), target.name(), property, Some(kind.as_str()))
+            generated_name(
+                "idx",
+                target.kind(),
+                target.name(),
+                property,
+                Some(kind.as_str()),
+            )
         });
 
         if self.working.schema.object_exists(&requested_name) {
@@ -684,8 +695,7 @@ impl CupldEngine {
             ensure_property_name(property)?;
         } else if target.kind() != TargetKind::EdgeType {
             return Err(GraphError::InvalidSchemaOperation(
-                "edge endpoint and cardinality constraints require an edge type target"
-                    .to_owned(),
+                "edge endpoint and cardinality constraints require an edge type target".to_owned(),
             ));
         }
 
@@ -1562,7 +1572,9 @@ mod tests {
     fn explicit_and_implicit_schema_targets_share_the_catalog() {
         let mut engine = CupldEngine::default();
         engine.create_label("Person", None, false, false).unwrap();
-        engine.create_edge_type("KNOWS", None, false, false).unwrap();
+        engine
+            .create_edge_type("KNOWS", None, false, false)
+            .unwrap();
         let left = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         let right = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine
@@ -1676,7 +1688,9 @@ mod tests {
     fn dropping_labels_or_edge_types_is_blocked_when_data_or_schema_depends_on_them() {
         let mut engine = CupldEngine::default();
         engine.create_label("Person", None, false, false).unwrap();
-        engine.create_edge_type("KNOWS", None, false, false).unwrap();
+        engine
+            .create_edge_type("KNOWS", None, false, false)
+            .unwrap();
         let left = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         let right = engine.create_node(["Person"], PropertyMap::new()).unwrap();
         engine

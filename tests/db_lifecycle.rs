@@ -697,7 +697,10 @@ fn wave5_schema_evolution_and_parameterized_ddl_work_end_to_end() {
     params.insert("edge".to_owned(), Value::from("KNOWS"));
     params.insert("property".to_owned(), Value::from("email"));
     params.insert("description".to_owned(), Value::from("People"));
-    params.insert("constraint".to_owned(), Value::from("person_email_required"));
+    params.insert(
+        "constraint".to_owned(),
+        Value::from("person_email_required"),
+    );
     params.insert("renamed".to_owned(), Value::from("person_email_presence"));
 
     run_with_params(
@@ -705,11 +708,7 @@ fn wave5_schema_evolution_and_parameterized_ddl_work_end_to_end() {
         "CREATE OR REPLACE LABEL $label DESCRIPTION $description",
         &params,
     );
-    run_with_params(
-        &mut session,
-        "CREATE OR REPLACE EDGE TYPE $edge",
-        &params,
-    );
+    run_with_params(&mut session, "CREATE OR REPLACE EDGE TYPE $edge", &params);
     run_with_params(
         &mut session,
         "CREATE INDEX idx_person_lookup ON :$label($property)",
@@ -779,10 +778,16 @@ fn wave5_edge_endpoint_and_cardinality_constraints_validate_existing_data() {
 
     let mut engine = session.engine().clone();
     let grace = engine
-        .create_node(["Person"], PropertyMap::from_pairs([("name", Value::from("Grace"))]))
+        .create_node(
+            ["Person"],
+            PropertyMap::from_pairs([("name", Value::from("Grace"))]),
+        )
         .unwrap();
     let lin = engine
-        .create_node(["Person"], PropertyMap::from_pairs([("name", Value::from("Lin"))]))
+        .create_node(
+            ["Person"],
+            PropertyMap::from_pairs([("name", Value::from("Lin"))]),
+        )
         .unwrap();
     let barbara = engine
         .create_node(
@@ -829,7 +834,10 @@ fn wave6_index_kinds_and_temporal_fields_survive_reopen() {
             body: 'Query planners and storage indexes'
         })",
     );
-    run(&mut session, "CREATE INDEX ON :Article(published) KIND RANGE");
+    run(
+        &mut session,
+        "CREATE INDEX ON :Article(published) KIND RANGE",
+    );
     run(&mut session, "CREATE INDEX ON :Article(tags) KIND LIST");
     run(&mut session, "CREATE INDEX ON :Article(body) KIND FULLTEXT");
 
@@ -888,7 +896,10 @@ fn wave6_index_kinds_and_temporal_fields_survive_reopen() {
         &mut reopened,
         "MATCH (a:Article {title: 'Rust Systems'}) RETURN a.valid_from, a.valid_to",
     );
-    assert!(matches!(reopened_temporal.rows[0][0], RuntimeValue::Datetime(_)));
+    assert!(matches!(
+        reopened_temporal.rows[0][0],
+        RuntimeValue::Datetime(_)
+    ));
     assert_eq!(reopened_temporal.rows[0][1], RuntimeValue::Null);
 }
 

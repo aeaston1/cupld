@@ -464,7 +464,10 @@ impl Session {
             }
             Statement::DropLabel { name, if_exists } => {
                 self.engine
-                    .drop_label(&resolve_param_value(name, params, "schema name")?, *if_exists)
+                    .drop_label(
+                        &resolve_param_value(name, params, "schema name")?,
+                        *if_exists,
+                    )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -486,7 +489,10 @@ impl Session {
             }
             Statement::DropEdgeType { name, if_exists } => {
                 self.engine
-                    .drop_edge_type(&resolve_param_value(name, params, "schema name")?, *if_exists)
+                    .drop_edge_type(
+                        &resolve_param_value(name, params, "schema name")?,
+                        *if_exists,
+                    )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -498,7 +504,8 @@ impl Session {
                 if_not_exists,
                 or_replace,
             } => {
-                let resolved_name = resolve_optional_param_value(name.as_ref(), params, "index name")?;
+                let resolved_name =
+                    resolve_optional_param_value(name.as_ref(), params, "index name")?;
                 let resolved_target = resolve_schema_target(target, params)?;
                 let resolved_property = resolve_param_value(property, params, "property name")?;
                 self.engine
@@ -515,7 +522,10 @@ impl Session {
             }
             Statement::DropIndex { name, if_exists } => {
                 self.engine
-                    .drop_index(&resolve_param_value(name, params, "index name")?, *if_exists)
+                    .drop_index(
+                        &resolve_param_value(name, params, "index name")?,
+                        *if_exists,
+                    )
                     .map_err(ExecutionError::from)?;
                 Ok(empty_result())
             }
@@ -665,7 +675,11 @@ impl Session {
             for constraint in &equality_constraints {
                 if constraint.kind == ConstraintKind::Eq
                     && schema
-                        .find_index(&target, &constraint.property, crate::engine::IndexKind::Equality)
+                        .find_index(
+                            &target,
+                            &constraint.property,
+                            crate::engine::IndexKind::Equality,
+                        )
                         .is_some()
                 {
                     let start_candidates = self.index_seek_candidates(
@@ -1641,7 +1655,7 @@ impl Session {
                                 "REMOVE label targets must resolve to a node variable",
                             ));
                         }
-                    }
+                    },
                 }
             }
         }
@@ -2815,7 +2829,9 @@ fn eval_property_map(
     Ok(map)
 }
 
-fn runtime_entries_to_property_map(entries: &[(String, RuntimeValue)]) -> Result<PropertyMap, ExecutionError> {
+fn runtime_entries_to_property_map(
+    entries: &[(String, RuntimeValue)],
+) -> Result<PropertyMap, ExecutionError> {
     let mut map = PropertyMap::new();
     for (key, value) in entries {
         map.insert(key.clone(), value.to_graph_value()?);
@@ -2849,7 +2865,9 @@ fn resolve_optional_param_value(
     params: &BTreeMap<String, Value>,
     role: &str,
 ) -> Result<Option<String>, ExecutionError> {
-    value.map(|value| resolve_param_value(value, params, role)).transpose()
+    value
+        .map(|value| resolve_param_value(value, params, role))
+        .transpose()
 }
 
 fn resolve_schema_target(
@@ -3427,12 +3445,22 @@ fn match_plan_detail(plan: &MatchPlan) -> String {
             target,
             property,
             value,
-        } => format!("{}({}) contains {:?}", target.display_target(), property, value),
+        } => format!(
+            "{}({}) contains {:?}",
+            target.display_target(),
+            property,
+            value
+        ),
         MatchAccessPath::NodeFullTextIndexScan {
             target,
             property,
             term,
-        } => format!("{}({}) fulltext {:?}", target.display_target(), property, term),
+        } => format!(
+            "{}({}) fulltext {:?}",
+            target.display_target(),
+            property,
+            term
+        ),
     }
 }
 

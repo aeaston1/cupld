@@ -465,7 +465,13 @@ impl SchemaCatalog {
         owned_by_constraint: Option<String>,
     ) -> String {
         let name = name.unwrap_or_else(|| {
-            generated_name("idx", target.kind(), target.name(), &property, Some(kind.as_str()))
+            generated_name(
+                "idx",
+                target.kind(),
+                target.name(),
+                &property,
+                Some(kind.as_str()),
+            )
         });
         let definition = IndexDefinition::new(
             name.clone(),

@@ -1062,10 +1062,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        COMPAT_VERSION, FileHeader, FORMAT_VERSION, HEADER_SIZE, IndexStatus, StorageError,
+        COMPAT_VERSION, FORMAT_VERSION, FileHeader, HEADER_SIZE, IndexStatus, StorageError,
         append_commit, assemble_file, check, checksum, compact, encode_property_map, file_uuid,
         load, push_bool, push_optional_string, push_property_type, push_schema_target, push_string,
-        push_strings, push_u32, push_u64, push_u8, save_compacted,
+        push_strings, push_u8, push_u32, push_u64, save_compacted,
     };
     use crate::engine::{EngineState, IndexKind};
     use crate::runtime::Session;
@@ -1241,7 +1241,10 @@ mod tests {
         let path = temp_path("cupld_storage_v2_defaults");
         let mut session = Session::new_in_memory();
         session
-            .execute_script("CREATE (:Doc {title: 'Legacy', published: 2024})", &BTreeMap::new())
+            .execute_script(
+                "CREATE (:Doc {title: 'Legacy', published: 2024})",
+                &BTreeMap::new(),
+            )
             .unwrap();
         session
             .execute_script("CREATE INDEX ON :Doc(published)", &BTreeMap::new())

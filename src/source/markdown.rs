@@ -233,7 +233,10 @@ pub fn watch_markdown_root(
             batcher.flush();
             last_idle = now;
             snapshot = snapshot_markdown_root(&root)?;
-            if options.max_runs.is_some_and(|max_runs| report.sync_runs >= max_runs) {
+            if options
+                .max_runs
+                .is_some_and(|max_runs| report.sync_runs >= max_runs)
+            {
                 report.last_report = last_report;
                 return Ok(report);
             }

@@ -79,8 +79,12 @@ pub enum ShowKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConstraintSpec {
-    Unique { property: ParamValue },
-    Required { property: ParamValue },
+    Unique {
+        property: ParamValue,
+    },
+    Required {
+        property: ParamValue,
+    },
     Type {
         property: ParamValue,
         value_type: PropertyType,
@@ -228,10 +232,7 @@ pub enum SetOperator {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SetTarget {
     Property(PropertyTarget),
-    PropertyIndex {
-        target: PropertyTarget,
-        index: Expr,
-    },
+    PropertyIndex { target: PropertyTarget, index: Expr },
     Entity(String),
 }
 
@@ -754,10 +755,7 @@ impl Parser {
                 rename_to: self.expect_param_value()?,
             });
         }
-        self.error_here(
-            "parse_alter_statement",
-            "expected INDEX or CONSTRAINT",
-        )
+        self.error_here("parse_alter_statement", "expected INDEX or CONSTRAINT")
     }
 
     fn parse_query(&mut self) -> Result<Query, QueryError> {
@@ -1426,9 +1424,7 @@ impl Parser {
         }
         if self.consume_keyword("MAX")? {
             self.expect_keyword("OUTGOING")?;
-            return Ok(ConstraintSpec::MaxOutgoing(
-                self.expect_limit_value()?,
-            ));
+            return Ok(ConstraintSpec::MaxOutgoing(self.expect_limit_value()?));
         }
 
         let property = self.expect_param_value()?;
@@ -1450,10 +1446,7 @@ impl Parser {
             "READY" | "ready" => Ok(IndexStatus::Ready),
             "BUILDING" | "building" => Ok(IndexStatus::Building),
             "INVALID" | "invalid" => Ok(IndexStatus::Invalid),
-            _ => self.error_here(
-                "parse_index_status",
-                "expected READY, BUILDING, or INVALID",
-            ),
+            _ => self.error_here("parse_index_status", "expected READY, BUILDING, or INVALID"),
         }
     }
 
@@ -1463,10 +1456,7 @@ impl Parser {
             "RANGE" | "range" => Ok(IndexKind::Range),
             "LIST" | "list" => Ok(IndexKind::ListMembership),
             "FULLTEXT" | "fulltext" => Ok(IndexKind::FullText),
-            _ => self.error_here(
-                "parse_index_kind",
-                "expected EQ, RANGE, LIST, or FULLTEXT",
-            ),
+            _ => self.error_here("parse_index_kind", "expected EQ, RANGE, LIST, or FULLTEXT"),
         }
     }
 
