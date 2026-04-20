@@ -1,6 +1,7 @@
 /target
 .DS_Store
 *.cupld
+!tests/fixtures/*.cupld
 /.cupld
 /sample-data
 /.agents

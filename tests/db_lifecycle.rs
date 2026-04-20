@@ -1,11 +1,39 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cupld::{PropertyMap, RuntimeValue, Session, Value};
 
 use support::{TestDb, run, run_with_params, seed_person_graph, sorted_debug_rows, string_cell};
+
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+fn copy_fixture(name: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "cupld_fixture_{name}_{}_{}.cupld",
+        std::process::id(),
+        timestamp
+    ));
+    fs::copy(fixture_path(name), &path).unwrap();
+    path
+}
+
+fn header_version(path: &Path) -> u32 {
+    let bytes = fs::read(path).unwrap();
+    u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+}
 
 #[test]
 fn file_backed_db_lifecycle_create_query_compact_and_spin_down() {
@@ -239,6 +267,71 @@ fn file_backed_transaction_commit_persists_after_reopen() {
             RuntimeValue::Int(42),
         ]]
     );
+}
+
+#[test]
+fn real_v0_1_0_fixture_opens_and_migrates_in_place() {
+    let path = copy_fixture("person_v0_1_0.cupld");
+    assert_eq!(header_version(&path), 1);
+
+    let mut session = Session::open(&path).unwrap();
+    let people = run(
+        &mut session,
+        "MATCH (n:Person) RETURN n.name, n.age ORDER BY n.name",
+    );
+    assert_eq!(
+        people.rows,
+        vec![
+            vec![
+                RuntimeValue::String("Ada".to_owned()),
+                RuntimeValue::Int(36),
+            ],
+            vec![
+                RuntimeValue::String("Alan".to_owned()),
+                RuntimeValue::Int(41),
+            ],
+            vec![
+                RuntimeValue::String("Bob".to_owned()),
+                RuntimeValue::Int(29),
+            ],
+            vec![
+                RuntimeValue::String("Grace".to_owned()),
+                RuntimeValue::Int(37),
+            ],
+        ]
+    );
+    drop(session);
+
+    assert!(header_version(&path) > 1);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn real_v0_1_0_fixture_check_migrates_in_place() {
+    let path = copy_fixture("person_v0_1_0.cupld");
+    assert_eq!(header_version(&path), 1);
+
+    let report = Session::check(&path).unwrap();
+    assert_eq!(report.wal_records, 8);
+    assert!(header_version(&path) > 1);
+
+    let mut session = Session::open(&path).unwrap();
+    let schema = run(&mut session, "SHOW SCHEMA");
+    assert!(
+        schema
+            .rows
+            .iter()
+            .any(|row| { row[3] == RuntimeValue::String("CREATE LABEL Person".to_owned()) })
+    );
+    assert!(schema.rows.iter().any(|row| {
+        row[3]
+            == RuntimeValue::String(
+                "CREATE CONSTRAINT constraint_label_Person_email_unique ON :Person REQUIRE email UNIQUE"
+                    .to_owned(),
+            )
+    }));
+
+    let _ = fs::remove_file(path);
 }
 
 #[test]

@@ -4,7 +4,7 @@ All notable changes to `cupld` will be documented in this file.
 
 ## Unreleased
 
-- None yet.  Use this section for the next version.
+- Opening or checking a `.cupld` file from an older release now upgrades it in place to the current on-disk format. During beta, treat `.cupld` files as forward-only if rollback matters.
 
 ## [0.1.0] - 2026-04-01
 

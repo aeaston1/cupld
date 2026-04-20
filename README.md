@@ -85,6 +85,8 @@ cupld check --db default
 cupld compact --db default
 ```
 
+Beta note: opening or checking a `.cupld` created by an older `cupld` release upgrades it in place to the current on-disk format. Treat `.cupld` files as forward-only during beta if you may need rollback.
+
 Open the viewer:
 
 ```bash

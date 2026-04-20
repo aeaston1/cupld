@@ -14,6 +14,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `cupld query --db ... --with-markdown` for transient markdown overlay reads.
 - Use `cupld sync markdown --db ...` to persist markdown and `cupld sync markdown --db ... --watch` to keep syncing after the initial run.
 - Use `cupld schema --db ...` and `cupld check --db ...` before making automation assumptions about a database.
+- Opening or checking a database from an older `cupld` release may upgrade the `.cupld` file in place. Treat on-disk databases as forward-only during beta if rollback matters.
 - Use `--output json` or `--output ndjson` for machine consumption.
 
 ## CLI Shape
@@ -43,6 +44,7 @@ Important constraints:
 - `--query` is a top-level option and only works with `--visualise`.
 - Dot-commands are REPL-only. They do not work with `cupld query`.
 - Passing a missing `path.cupld` to the REPL creates a new database file.
+- Opening or checking an older `.cupld` file may upgrade it in place to the current on-disk format.
 - Repo-local package defaults live in `.cupld/config.toml`.
 - `--db default` is an alias for `./.cupld/default.cupld`.
 
