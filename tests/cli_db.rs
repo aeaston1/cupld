@@ -7,8 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cupld::Session;
-use serde_json::Value as JsonValue;
+use cupld::{Session, json};
 
 use support::{TestDb, seed_person_graph};
 
@@ -204,21 +203,59 @@ fn cli_query_json_outputs_machine_envelope() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let parsed: JsonValue = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(parsed["ok"], JsonValue::Bool(true));
-    assert_eq!(parsed["command"], JsonValue::String("query".to_owned()));
+    let parsed = json::parse(&stdout).unwrap();
     assert_eq!(
-        parsed["policy"]["execution_mode"],
-        JsonValue::String("automation_read_write".to_owned())
+        parsed.get("ok").and_then(json::JsonValue::as_bool),
+        Some(true)
     );
-    assert_eq!(parsed["policy"]["max_rows"], JsonValue::Number(2.into()));
     assert_eq!(
-        parsed["results"][0]["row_count"],
-        JsonValue::Number(2.into())
+        parsed.get("command").and_then(json::JsonValue::as_str),
+        Some("query")
     );
-    assert_eq!(parsed["results"][0]["truncated"], JsonValue::Bool(true));
-    assert_eq!(parsed["results"][0]["rows"][0]["col_1"], "Ada");
-    assert_eq!(parsed["results"][0]["rows"][1]["col_1"], "Alan");
+    assert_eq!(
+        parsed
+            .get("policy")
+            .and_then(|policy| policy.get("execution_mode"))
+            .and_then(json::JsonValue::as_str),
+        Some("automation_read_write")
+    );
+    assert_eq!(
+        parsed
+            .get("policy")
+            .and_then(|policy| policy.get("max_rows"))
+            .and_then(json::JsonValue::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        parsed
+            .get("results")
+            .and_then(json::JsonValue::as_array)
+            .and_then(|results| results[0].get("row_count"))
+            .and_then(json::JsonValue::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        parsed
+            .get("results")
+            .and_then(json::JsonValue::as_array)
+            .and_then(|results| results[0].get("truncated"))
+            .and_then(json::JsonValue::as_bool),
+        Some(true)
+    );
+    let rows = parsed
+        .get("results")
+        .and_then(json::JsonValue::as_array)
+        .and_then(|results| results[0].get("rows"))
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(
+        rows[0].get("col_1").and_then(json::JsonValue::as_str),
+        Some("Ada")
+    );
+    assert_eq!(
+        rows[1].get("col_1").and_then(json::JsonValue::as_str),
+        Some("Alan")
+    );
 }
 
 #[test]
@@ -238,11 +275,17 @@ fn cli_query_json_errors_use_machine_envelope() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let parsed: JsonValue = serde_json::from_str(&stderr).unwrap();
-    assert_eq!(parsed["ok"], JsonValue::Bool(false));
+    let parsed = json::parse(&stderr).unwrap();
     assert_eq!(
-        parsed["error"]["code"],
-        JsonValue::String("params_json_parse".to_owned())
+        parsed.get("ok").and_then(json::JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        parsed
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(json::JsonValue::as_str),
+        Some("params_json_parse")
     );
 }
 
@@ -268,24 +311,41 @@ fn cli_context_ndjson_outputs_budgeted_contract() {
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 3);
 
-    let meta: JsonValue = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(meta["kind"], JsonValue::String("context_meta".to_owned()));
+    let meta = json::parse(lines[0]).unwrap();
     assert_eq!(
-        meta["policy"]["execution_mode"],
-        JsonValue::String("automation_read_only".to_owned())
+        meta.get("kind").and_then(json::JsonValue::as_str),
+        Some("context_meta")
     );
     assert_eq!(
-        meta["policy"]["retrieval_budget"]["nodes"],
-        JsonValue::Number(2.into())
+        meta.get("policy")
+            .and_then(|policy| policy.get("execution_mode"))
+            .and_then(json::JsonValue::as_str),
+        Some("automation_read_only")
     );
     assert_eq!(
-        meta["retrieval_usage"]["nodes"],
-        JsonValue::Number(2.into())
+        meta.get("policy")
+            .and_then(|policy| policy.get("retrieval_budget"))
+            .and_then(|budget| budget.get("nodes"))
+            .and_then(json::JsonValue::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        meta.get("retrieval_usage")
+            .and_then(|usage| usage.get("nodes"))
+            .and_then(json::JsonValue::as_i64),
+        Some(2)
     );
 
-    let item: JsonValue = serde_json::from_str(lines[1]).unwrap();
-    assert_eq!(item["kind"], JsonValue::String("context_item".to_owned()));
-    assert!(item["item"]["node_id"].is_number());
+    let item = json::parse(lines[1]).unwrap();
+    assert_eq!(
+        item.get("kind").and_then(json::JsonValue::as_str),
+        Some("context_item")
+    );
+    assert!(
+        item.get("item")
+            .and_then(|entry| entry.get("node_id"))
+            .is_some_and(json::JsonValue::is_number)
+    );
 }
 
 #[test]

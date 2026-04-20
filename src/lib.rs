@@ -1,7 +1,9 @@
 pub mod automation;
 pub mod engine;
+pub mod json;
 pub mod package;
 pub mod query;
+mod regex_lite;
 pub mod runtime;
 pub mod source;
 pub mod storage;

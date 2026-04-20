@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use crate::json::{self, JsonNumber, JsonValue};
 
 const PACKAGE_DIR: &str = ".cupld";
 const CONFIG_FILENAME: &str = "config.toml";
@@ -40,17 +40,15 @@ impl std::fmt::Display for PackageError {
 
 impl std::error::Error for PackageError {}
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackageLayoutConfig {
     pub db_path: Option<PathBuf>,
     pub markdown_root: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageConfig {
-    #[serde(default = "package_config_version")]
     pub version: u32,
-    #[serde(default)]
     pub package: PackageLayoutConfig,
 }
 
@@ -177,8 +175,7 @@ impl WorkspacePackage {
     pub fn write(&self) -> Result<(), PackageError> {
         fs::create_dir_all(&self.package_dir)
             .map_err(|error| PackageError::new("package_io", error.to_string()))?;
-        let contents = toml::to_string_pretty(&self.config)
-            .map_err(|error| PackageError::new("package_config_serialize", error.to_string()))?;
+        let contents = render_config(&self.config);
         fs::write(&self.config_path, contents)
             .map_err(|error| PackageError::new("package_io", error.to_string()))
     }
@@ -200,10 +197,6 @@ impl WorkspacePackage {
     }
 }
 
-fn package_config_version() -> u32 {
-    PACKAGE_CONFIG_VERSION
-}
-
 fn load_config(path: &Path) -> Result<PackageConfig, PackageError> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -213,11 +206,104 @@ fn load_config(path: &Path) -> Result<PackageConfig, PackageError> {
         Err(error) => return Err(PackageError::new("package_io", error.to_string())),
     };
 
-    let mut config: PackageConfig = toml::from_str(&contents)
-        .map_err(|error| PackageError::new("package_config_parse", error.to_string()))?;
-    if config.version == PACKAGE_CONFIG_VERSION {
-        return Ok(config);
+    parse_config(&contents)
+}
+
+fn parse_config(input: &str) -> Result<PackageConfig, PackageError> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Section {
+        Root,
+        Package,
     }
+
+    let mut config = PackageConfig::default();
+    let mut saw_version = false;
+    let mut saw_package_table = false;
+    let mut saw_db_path = false;
+    let mut saw_markdown_root = false;
+    let mut section = Section::Root;
+
+    for (index, raw_line) in input.lines().enumerate() {
+        let line_number = index + 1;
+        let line = strip_trailing_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if !line.ends_with(']') {
+                return Err(parse_error(line_number, "invalid table header"));
+            }
+            let table = line[1..line.len() - 1].trim();
+            match table {
+                "package" => {
+                    if saw_package_table {
+                        return Err(parse_error(line_number, "duplicate `[package]` table"));
+                    }
+                    saw_package_table = true;
+                    section = Section::Package;
+                }
+                unknown => {
+                    return Err(parse_error(
+                        line_number,
+                        format!("unknown table `{unknown}`"),
+                    ));
+                }
+            }
+            continue;
+        }
+
+        let Some((key, value)) = split_key_value(line) else {
+            return Err(parse_error(line_number, "expected `key = value`"));
+        };
+        let parsed_value = json::parse(value).map_err(|error| {
+            parse_error(line_number, format!("invalid value for `{key}`: {error}"))
+        })?;
+
+        match (section, key) {
+            (Section::Root, "version") => {
+                if saw_version {
+                    return Err(parse_error(line_number, "duplicate `version`"));
+                }
+                saw_version = true;
+                config.version = parse_version(&parsed_value).map_err(|message| {
+                    parse_error(line_number, format!("invalid `version`: {message}"))
+                })?;
+            }
+            (Section::Root, unknown) => {
+                return Err(parse_error(
+                    line_number,
+                    format!("unknown top-level key `{unknown}`"),
+                ));
+            }
+            (Section::Package, "db_path") => {
+                if saw_db_path {
+                    return Err(parse_error(line_number, "duplicate `db_path`"));
+                }
+                saw_db_path = true;
+                config.package.db_path =
+                    Some(parse_path_value(&parsed_value).map_err(|message| {
+                        parse_error(line_number, format!("invalid `db_path`: {message}"))
+                    })?);
+            }
+            (Section::Package, "markdown_root") => {
+                if saw_markdown_root {
+                    return Err(parse_error(line_number, "duplicate `markdown_root`"));
+                }
+                saw_markdown_root = true;
+                config.package.markdown_root =
+                    Some(parse_path_value(&parsed_value).map_err(|message| {
+                        parse_error(line_number, format!("invalid `markdown_root`: {message}"))
+                    })?);
+            }
+            (Section::Package, unknown) => {
+                return Err(parse_error(
+                    line_number,
+                    format!("unknown package key `{unknown}`"),
+                ));
+            }
+        }
+    }
+
     if config.version > PACKAGE_CONFIG_VERSION {
         return Err(PackageError::new(
             "package_config_version",
@@ -227,8 +313,90 @@ fn load_config(path: &Path) -> Result<PackageConfig, PackageError> {
             ),
         ));
     }
-    config.version = PACKAGE_CONFIG_VERSION;
+    if config.version < PACKAGE_CONFIG_VERSION {
+        config.version = PACKAGE_CONFIG_VERSION;
+    }
     Ok(config)
+}
+
+fn parse_error(line_number: usize, message: impl Into<String>) -> PackageError {
+    PackageError::new(
+        "package_config_parse",
+        format!("line {line_number}: {}", message.into()),
+    )
+}
+
+fn strip_trailing_comment(line: &str) -> &str {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '#' => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn split_key_value(line: &str) -> Option<(&str, &str)> {
+    let index = line.find('=')?;
+    let key = line[..index].trim();
+    let value = line[index + 1..].trim();
+    (!key.is_empty() && !value.is_empty()).then_some((key, value))
+}
+
+fn parse_version(value: &JsonValue) -> Result<u32, &'static str> {
+    match value {
+        JsonValue::Number(JsonNumber::Int(value)) if *value >= 0 => {
+            u32::try_from(*value).map_err(|_| "version is outside the supported range")
+        }
+        JsonValue::Number(JsonNumber::Unsigned(value)) => {
+            u32::try_from(*value).map_err(|_| "version is outside the supported range")
+        }
+        _ => Err("version must be a non-negative integer"),
+    }
+}
+
+fn parse_path_value(value: &JsonValue) -> Result<PathBuf, &'static str> {
+    match value {
+        JsonValue::String(path) => Ok(PathBuf::from(path)),
+        _ => Err("path must be a quoted string"),
+    }
+}
+
+fn render_config(config: &PackageConfig) -> String {
+    let mut output = String::new();
+    output.push_str("version = ");
+    output.push_str(&config.version.to_string());
+    output.push('\n');
+    if config.package.db_path.is_some() || config.package.markdown_root.is_some() {
+        output.push('\n');
+        output.push_str("[package]\n");
+        if let Some(path) = &config.package.db_path {
+            output.push_str("db_path = ");
+            json::write_quoted_string(&mut output, &path.display().to_string());
+            output.push('\n');
+        }
+        if let Some(path) = &config.package.markdown_root {
+            output.push_str("markdown_root = ");
+            json::write_quoted_string(&mut output, &path.display().to_string());
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn absolutize(path: &Path) -> Result<PathBuf, PackageError> {
@@ -249,7 +417,7 @@ fn absolutize_from(path: &Path, base: &Path) -> Result<PathBuf, PackageError> {
 
 #[cfg(test)]
 mod tests {
-    use super::WorkspacePackage;
+    use super::{WorkspacePackage, parse_config, render_config};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -309,11 +477,10 @@ mod tests {
         assert_eq!(reloaded.configured_markdown_root(), Some(markdown_root));
 
         let config = fs::read_to_string(root.join(".cupld").join("config.toml")).unwrap();
-        assert!(
-            config.contains("db_path = \"./.cupld/graph.cupld\"")
-                || config.contains("db_path = \".cupld/graph.cupld\"")
+        assert_eq!(
+            config,
+            "version = 1\n\n[package]\ndb_path = \".cupld/graph.cupld\"\nmarkdown_root = \"notes\"\n"
         );
-        assert!(config.contains("markdown_root = \"notes\""));
     }
 
     #[test]
@@ -333,6 +500,46 @@ mod tests {
             package.configured_db_path(),
             Some(root.join(".cupld").join("legacy.cupld"))
         );
+    }
+
+    #[test]
+    fn package_parser_rejects_duplicate_and_unknown_keys() {
+        let duplicate = parse_config("version = 1\nversion = 1\n").unwrap_err();
+        assert_eq!(duplicate.code(), "package_config_parse");
+        assert!(duplicate.message().contains("duplicate `version`"));
+
+        let unknown = parse_config("[package]\nextra = \"nope\"\n").unwrap_err();
+        assert!(unknown.message().contains("unknown package key `extra`"));
+    }
+
+    #[test]
+    fn package_parser_accepts_comments_and_inline_comments() {
+        let config = parse_config(
+            "# header\nversion = 1 # inline\n\n[package]\ndb_path = \"notes.cupld\" # trailing\n",
+        )
+        .unwrap();
+        assert_eq!(config.version, 1);
+        assert_eq!(config.package.db_path, Some(PathBuf::from("notes.cupld")));
+    }
+
+    #[test]
+    fn package_parser_rejects_unknown_tables_and_future_versions() {
+        let table = parse_config("[other]\nvalue = 1\n").unwrap_err();
+        assert!(table.message().contains("unknown table `other`"));
+
+        let version = parse_config("version = 2\n").unwrap_err();
+        assert_eq!(version.code(), "package_config_version");
+    }
+
+    #[test]
+    fn package_writer_omits_empty_package_table() {
+        let rendered = render_config(
+            &WorkspacePackage::discover_from(temp_dir("render"))
+                .unwrap()
+                .config()
+                .clone(),
+        );
+        assert_eq!(rendered, "version = 1\n");
     }
 
     #[test]

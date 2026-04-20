@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Serialize;
-use serde_json::{Map as JsonMap, Number, Value as JsonValue};
-
+use crate::json::{self, JsonNumber, JsonValue};
 use crate::{ExecutionError, QueryResult, RuntimeValue, SourceError, Value};
 
 const DEFAULT_CONTEXT_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -51,15 +49,24 @@ impl From<SourceError> for AutomationError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
     Interactive,
     AutomationReadOnly,
     AutomationReadWrite,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+impl ExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::AutomationReadOnly => "automation_read_only",
+            Self::AutomationReadWrite => "automation_read_write",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetrievalBudget {
     pub nodes: usize,
     pub edges: usize,
@@ -67,12 +74,10 @@ pub struct RetrievalBudget {
     pub total_payload_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AutomationPolicy {
     pub execution_mode: ExecutionMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rows: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_budget: Option<RetrievalBudget>,
 }
 
@@ -99,7 +104,7 @@ impl AutomationPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetrievalUsage {
     pub nodes: usize,
     pub edges: usize,
@@ -108,33 +113,30 @@ pub struct RetrievalUsage {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextEvidence {
     pub field: String,
     pub value: String,
     pub source: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextItem {
     pub node_id: i64,
     pub labels: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
     pub evidence: Vec<ContextEvidence>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextProvenance {
     pub db_path: String,
     pub source: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextEnvelope {
     pub ok: bool,
     pub command: String,
@@ -144,27 +146,7 @@ pub struct ContextEnvelope {
     pub items: Vec<ContextItem>,
 }
 
-#[derive(Serialize)]
-struct ErrorEnvelope<'a> {
-    ok: bool,
-    error: ErrorBody<'a>,
-}
-
-#[derive(Serialize)]
-struct ErrorBody<'a> {
-    code: &'a str,
-    message: &'a str,
-}
-
-#[derive(Serialize)]
-struct QueryEnvelope {
-    ok: bool,
-    command: String,
-    policy: AutomationPolicy,
-    results: Vec<QueryResultEnvelope>,
-}
-
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 struct QueryResultEnvelope {
     columns: Vec<String>,
     row_count: usize,
@@ -172,51 +154,8 @@ struct QueryResultEnvelope {
     rows: Vec<JsonValue>,
 }
 
-#[derive(Serialize)]
-struct QueryMetaLine {
-    kind: String,
-    ok: bool,
-    command: String,
-    policy: AutomationPolicy,
-    result_count: usize,
-}
-
-#[derive(Serialize)]
-struct QueryResultLine {
-    kind: String,
-    result_index: usize,
-    columns: Vec<String>,
-    row_count: usize,
-    truncated: bool,
-}
-
-#[derive(Serialize)]
-struct QueryRowLine {
-    kind: String,
-    result_index: usize,
-    row_index: usize,
-    row: JsonValue,
-}
-
-#[derive(Serialize)]
-struct ContextMetaLine<'a> {
-    kind: String,
-    ok: bool,
-    command: &'a str,
-    policy: AutomationPolicy,
-    retrieval_usage: &'a RetrievalUsage,
-    provenance: &'a ContextProvenance,
-}
-
-#[derive(Serialize)]
-struct ContextItemLine<'a> {
-    kind: String,
-    item_index: usize,
-    item: &'a ContextItem,
-}
-
 pub fn parse_params_json(input: &str) -> Result<BTreeMap<String, Value>, AutomationError> {
-    let parsed: JsonValue = serde_json::from_str(input).map_err(|error| {
+    let parsed = json::parse(input).map_err(|error| {
         AutomationError::new("params_json_parse", format!("invalid params json: {error}"))
     })?;
     match parsed {
@@ -232,61 +171,62 @@ pub fn parse_params_json(input: &str) -> Result<BTreeMap<String, Value>, Automat
 }
 
 pub fn format_error_json(code: &str, message: &str) -> String {
-    serde_json::to_string(&ErrorEnvelope {
-        ok: false,
-        error: ErrorBody { code, message },
-    })
-    .expect("error envelope should serialize")
+    json::stringify(&JsonValue::object([
+        ("ok", JsonValue::Bool(false)),
+        (
+            "error",
+            JsonValue::object([
+                ("code", JsonValue::from(code)),
+                ("message", JsonValue::from(message)),
+            ]),
+        ),
+    ]))
 }
 
 pub fn query_as_json(results: &[QueryResult], policy: AutomationPolicy) -> String {
-    serde_json::to_string(&QueryEnvelope {
-        ok: true,
-        command: "query".to_owned(),
-        policy,
-        results: results
-            .iter()
-            .map(|result| query_result_envelope(result, policy.max_rows.unwrap_or(usize::MAX)))
-            .collect(),
-    })
-    .expect("query envelope should serialize")
+    let result_values = results
+        .iter()
+        .map(|result| query_result_envelope(result, policy.max_rows.unwrap_or(usize::MAX)))
+        .map(|result| query_result_json_value(&result))
+        .collect::<Vec<_>>();
+
+    json::stringify(&JsonValue::object([
+        ("ok", JsonValue::Bool(true)),
+        ("command", JsonValue::from("query")),
+        ("policy", automation_policy_json_value(&policy)),
+        ("results", JsonValue::Array(result_values)),
+    ]))
 }
 
 pub fn query_as_ndjson(results: &[QueryResult], policy: AutomationPolicy) -> Vec<String> {
     let max_rows = policy.max_rows.unwrap_or(usize::MAX);
-    let mut lines = vec![
-        serde_json::to_string(&QueryMetaLine {
-            kind: "query_meta".to_owned(),
-            ok: true,
-            command: "query".to_owned(),
-            policy,
-            result_count: results.len(),
-        })
-        .expect("query meta should serialize"),
-    ];
+    let mut lines = vec![json::stringify(&JsonValue::object([
+        ("kind", JsonValue::from("query_meta")),
+        ("ok", JsonValue::Bool(true)),
+        ("command", JsonValue::from("query")),
+        ("policy", automation_policy_json_value(&policy)),
+        ("result_count", JsonValue::from(results.len())),
+    ]))];
 
     for (result_index, result) in results.iter().enumerate() {
         let limited = query_result_envelope(result, max_rows);
-        lines.push(
-            serde_json::to_string(&QueryResultLine {
-                kind: "query_result".to_owned(),
-                result_index,
-                columns: limited.columns.clone(),
-                row_count: limited.row_count,
-                truncated: limited.truncated,
-            })
-            .expect("query result line should serialize"),
-        );
+        lines.push(json::stringify(&JsonValue::object([
+            ("kind", JsonValue::from("query_result")),
+            ("result_index", JsonValue::from(result_index)),
+            (
+                "columns",
+                JsonValue::array(limited.columns.iter().cloned().map(JsonValue::from)),
+            ),
+            ("row_count", JsonValue::from(limited.row_count)),
+            ("truncated", JsonValue::Bool(limited.truncated)),
+        ])));
         for (row_index, row) in limited.rows.into_iter().enumerate() {
-            lines.push(
-                serde_json::to_string(&QueryRowLine {
-                    kind: "query_row".to_owned(),
-                    result_index,
-                    row_index,
-                    row,
-                })
-                .expect("query row line should serialize"),
-            );
+            lines.push(json::stringify(&JsonValue::object([
+                ("kind", JsonValue::from("query_row")),
+                ("result_index", JsonValue::from(result_index)),
+                ("row_index", JsonValue::from(row_index)),
+                ("row", row),
+            ])));
         }
     }
 
@@ -309,6 +249,7 @@ pub fn build_context_response(
         .collect::<Result<Vec<_>, _>>()?;
     let mut truncated = items.len() > retrieval_budget.nodes;
     items.truncate(retrieval_budget.nodes);
+    let mut buffer = String::new();
 
     loop {
         let mut response = ContextEnvelope {
@@ -328,11 +269,8 @@ pub fn build_context_response(
             },
             items: items.clone(),
         };
-        let payload_bytes = serde_json::to_vec(&response)
-            .expect("context response should serialize")
-            .len();
+        let payload_bytes = context_payload_bytes(&mut response, &mut buffer);
         if payload_bytes <= retrieval_budget.total_payload_bytes || response.items.is_empty() {
-            response.retrieval_usage.total_payload_bytes = payload_bytes;
             return Ok(response);
         }
         response.items.pop();
@@ -342,59 +280,62 @@ pub fn build_context_response(
 }
 
 pub fn context_as_json(response: &ContextEnvelope) -> String {
-    serde_json::to_string(response).expect("context envelope should serialize")
+    json::stringify(&context_json_value(response))
 }
 
 pub fn context_as_ndjson(response: &ContextEnvelope) -> Vec<String> {
-    let mut lines = vec![
-        serde_json::to_string(&ContextMetaLine {
-            kind: "context_meta".to_owned(),
-            ok: response.ok,
-            command: &response.command,
-            policy: response.policy,
-            retrieval_usage: &response.retrieval_usage,
-            provenance: &response.provenance,
-        })
-        .expect("context meta should serialize"),
-    ];
+    let mut lines = vec![json::stringify(&JsonValue::object([
+        ("kind", JsonValue::from("context_meta")),
+        ("ok", JsonValue::Bool(response.ok)),
+        ("command", JsonValue::from(response.command.clone())),
+        ("policy", automation_policy_json_value(&response.policy)),
+        (
+            "retrieval_usage",
+            retrieval_usage_json_value(&response.retrieval_usage),
+        ),
+        (
+            "provenance",
+            context_provenance_json_value(&response.provenance),
+        ),
+    ]))];
 
     for (item_index, item) in response.items.iter().enumerate() {
-        lines.push(
-            serde_json::to_string(&ContextItemLine {
-                kind: "context_item".to_owned(),
-                item_index,
-                item,
-            })
-            .expect("context item should serialize"),
-        );
+        lines.push(json::stringify(&JsonValue::object([
+            ("kind", JsonValue::from("context_item")),
+            ("item_index", JsonValue::from(item_index)),
+            ("item", context_item_json_value(item)),
+        ])));
     }
 
     lines
+}
+
+fn context_payload_bytes(response: &mut ContextEnvelope, buffer: &mut String) -> usize {
+    loop {
+        buffer.clear();
+        json::write_to(buffer, &context_json_value(response));
+        let payload_bytes = buffer.len();
+        if response.retrieval_usage.total_payload_bytes == payload_bytes {
+            return payload_bytes;
+        }
+        response.retrieval_usage.total_payload_bytes = payload_bytes;
+    }
 }
 
 fn json_to_graph_value(value: JsonValue) -> Result<Value, AutomationError> {
     match value {
         JsonValue::Null => Ok(Value::Null),
         JsonValue::Bool(value) => Ok(Value::Bool(value)),
-        JsonValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Ok(Value::Int(value))
-            } else if let Some(value) = value.as_u64() {
-                i64::try_from(value).map(Value::Int).map_err(|_| {
-                    AutomationError::new(
-                        "params_json_number_range",
-                        format!("integer `{value}` is outside the supported i64 range"),
-                    )
-                })
-            } else if let Some(value) = value.as_f64() {
-                Ok(Value::Float(value))
-            } else {
-                Err(AutomationError::new(
-                    "params_json_number_parse",
-                    "unsupported numeric value in params json",
-                ))
-            }
+        JsonValue::Number(JsonNumber::Int(value)) => Ok(Value::Int(value)),
+        JsonValue::Number(JsonNumber::Unsigned(value)) => {
+            i64::try_from(value).map(Value::Int).map_err(|_| {
+                AutomationError::new(
+                    "params_json_number_range",
+                    format!("integer `{value}` is outside the supported i64 range"),
+                )
+            })
         }
+        JsonValue::Number(JsonNumber::Float(value)) => Ok(Value::Float(value)),
         JsonValue::String(value) => Ok(Value::String(value)),
         JsonValue::Array(values) => values
             .into_iter()
@@ -418,43 +359,122 @@ fn query_result_envelope(result: &QueryResult, max_rows: usize) -> QueryResultEn
             .rows
             .iter()
             .take(max_rows)
-            .map(|row| row_as_json(&result.columns, row))
+            .map(|row| json::row_to_json_object(&result.columns, row))
             .collect(),
     }
 }
 
-fn row_as_json(columns: &[String], row: &[RuntimeValue]) -> JsonValue {
-    let mut object = JsonMap::with_capacity(columns.len());
-    for (column, value) in columns.iter().zip(row.iter()) {
-        object.insert(column.clone(), runtime_value_as_json(value));
-    }
-    JsonValue::Object(object)
+fn query_result_json_value(result: &QueryResultEnvelope) -> JsonValue {
+    JsonValue::object([
+        (
+            "columns",
+            JsonValue::array(result.columns.iter().cloned().map(JsonValue::from)),
+        ),
+        ("row_count", JsonValue::from(result.row_count)),
+        ("truncated", JsonValue::Bool(result.truncated)),
+        ("rows", JsonValue::Array(result.rows.clone())),
+    ])
 }
 
-fn runtime_value_as_json(value: &RuntimeValue) -> JsonValue {
-    match value {
-        RuntimeValue::Null => JsonValue::Null,
-        RuntimeValue::Bool(value) => JsonValue::Bool(*value),
-        RuntimeValue::Int(value) => JsonValue::Number((*value).into()),
-        RuntimeValue::Float(value) => Number::from_f64(*value)
-            .map(JsonValue::Number)
-            .unwrap_or_else(|| JsonValue::String(value.to_string())),
-        RuntimeValue::String(value) => JsonValue::String(value.clone()),
-        RuntimeValue::Bytes(value) => JsonValue::String(format!("{value:?}")),
-        RuntimeValue::Datetime(value) => JsonValue::String(format!("{value:?}")),
-        RuntimeValue::List(values) => {
-            JsonValue::Array(values.iter().map(runtime_value_as_json).collect())
-        }
-        RuntimeValue::Map(entries) => {
-            let mut object = JsonMap::with_capacity(entries.len());
-            for (key, value) in entries {
-                object.insert(key.clone(), runtime_value_as_json(value));
-            }
-            JsonValue::Object(object)
-        }
-        RuntimeValue::Node(node_id) => JsonValue::String(format!("n{}", node_id.get())),
-        RuntimeValue::Edge(edge_id) => JsonValue::String(format!("e{}", edge_id.get())),
+fn automation_policy_json_value(policy: &AutomationPolicy) -> JsonValue {
+    let mut fields = vec![(
+        "execution_mode".to_owned(),
+        JsonValue::from(policy.execution_mode.as_str()),
+    )];
+    if let Some(max_rows) = policy.max_rows {
+        fields.push(("max_rows".to_owned(), JsonValue::from(max_rows)));
     }
+    if let Some(retrieval_budget) = policy.retrieval_budget {
+        fields.push((
+            "retrieval_budget".to_owned(),
+            retrieval_budget_json_value(&retrieval_budget),
+        ));
+    }
+    JsonValue::Object(fields)
+}
+
+fn retrieval_budget_json_value(budget: &RetrievalBudget) -> JsonValue {
+    JsonValue::object([
+        ("nodes", JsonValue::from(budget.nodes)),
+        ("edges", JsonValue::from(budget.edges)),
+        ("snippet_bytes", JsonValue::from(budget.snippet_bytes)),
+        (
+            "total_payload_bytes",
+            JsonValue::from(budget.total_payload_bytes),
+        ),
+    ])
+}
+
+fn retrieval_usage_json_value(usage: &RetrievalUsage) -> JsonValue {
+    JsonValue::object([
+        ("nodes", JsonValue::from(usage.nodes)),
+        ("edges", JsonValue::from(usage.edges)),
+        ("snippet_bytes", JsonValue::from(usage.snippet_bytes)),
+        (
+            "total_payload_bytes",
+            JsonValue::from(usage.total_payload_bytes),
+        ),
+        ("truncated", JsonValue::Bool(usage.truncated)),
+    ])
+}
+
+fn context_evidence_json_value(evidence: &ContextEvidence) -> JsonValue {
+    JsonValue::object([
+        ("field", JsonValue::from(evidence.field.clone())),
+        ("value", JsonValue::from(evidence.value.clone())),
+        ("source", JsonValue::from(evidence.source.clone())),
+    ])
+}
+
+fn context_item_json_value(item: &ContextItem) -> JsonValue {
+    let mut fields = vec![
+        ("node_id".to_owned(), JsonValue::from(item.node_id)),
+        (
+            "labels".to_owned(),
+            JsonValue::array(item.labels.iter().cloned().map(JsonValue::from)),
+        ),
+    ];
+    if let Some(name) = &item.name {
+        fields.push(("name".to_owned(), JsonValue::from(name.clone())));
+    }
+    if let Some(title) = &item.title {
+        fields.push(("title".to_owned(), JsonValue::from(title.clone())));
+    }
+    if let Some(display) = &item.display {
+        fields.push(("display".to_owned(), JsonValue::from(display.clone())));
+    }
+    fields.push((
+        "evidence".to_owned(),
+        JsonValue::array(item.evidence.iter().map(context_evidence_json_value)),
+    ));
+    JsonValue::Object(fields)
+}
+
+fn context_provenance_json_value(provenance: &ContextProvenance) -> JsonValue {
+    JsonValue::object([
+        ("db_path", JsonValue::from(provenance.db_path.clone())),
+        ("source", JsonValue::from(provenance.source.clone())),
+    ])
+}
+
+fn context_json_value(response: &ContextEnvelope) -> JsonValue {
+    JsonValue::object([
+        ("ok", JsonValue::Bool(response.ok)),
+        ("command", JsonValue::from(response.command.clone())),
+        ("policy", automation_policy_json_value(&response.policy)),
+        (
+            "retrieval_usage",
+            retrieval_usage_json_value(&response.retrieval_usage),
+        ),
+        (
+            "provenance",
+            context_provenance_json_value(&response.provenance),
+        ),
+        (
+            "items",
+            JsonValue::array(response.items.iter().map(context_item_json_value)),
+        ),
+    ])
 }
 
 fn parse_context_item(
@@ -584,8 +604,8 @@ mod tests {
         AutomationPolicy, build_context_response, context_as_json, format_error_json,
         parse_params_json, query_as_json,
     };
+    use crate::json;
     use crate::{QueryResult, RuntimeValue, Value};
-    use serde_json::Value as JsonValue;
     use std::path::Path;
 
     #[test]
@@ -619,11 +639,26 @@ mod tests {
             rows: vec![vec![RuntimeValue::String("Ada".to_owned())]],
         };
         let json = query_as_json(&[result], AutomationPolicy::query(100));
-        let parsed: JsonValue = serde_json::from_str(&json).unwrap();
+        let parsed = json::parse(&json).unwrap();
 
-        assert_eq!(parsed["ok"], JsonValue::Bool(true));
-        assert_eq!(parsed["command"], JsonValue::String("query".to_owned()));
-        assert_eq!(parsed["results"][0]["rows"][0]["name"], "Ada");
+        assert_eq!(
+            parsed.get("ok").and_then(json::JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            parsed.get("command").and_then(json::JsonValue::as_str),
+            Some("query")
+        );
+        assert_eq!(
+            parsed
+                .get("results")
+                .and_then(json::JsonValue::as_array)
+                .and_then(|results| results[0].get("rows"))
+                .and_then(json::JsonValue::as_array)
+                .and_then(|rows| rows[0].get("name"))
+                .and_then(json::JsonValue::as_str),
+            Some("Ada")
+        );
     }
 
     #[test]
@@ -654,7 +689,13 @@ mod tests {
                 .any(|evidence| evidence.field == "name")
         );
 
-        let parsed: JsonValue = serde_json::from_str(&context_as_json(&envelope)).unwrap();
-        assert_eq!(parsed["items"][0]["node_id"], JsonValue::Number(7.into()));
+        let parsed = json::parse(&context_as_json(&envelope)).unwrap();
+        assert_eq!(
+            parsed.get("items").unwrap().as_array().unwrap()[0]
+                .get("node_id")
+                .unwrap()
+                .as_i64(),
+            Some(7)
+        );
     }
 }

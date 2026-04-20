@@ -4,8 +4,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use regex::Regex;
-
 use crate::engine::{
     ConstraintRow, ConstraintType, CupldEngine, Edge, EdgeId, GraphError, GraphStats, IndexRow,
     Node, NodeId, PropertyMap, SchemaRow, SchemaTarget, Value,
@@ -15,6 +13,7 @@ use crate::query::{
     PatternSegment, PropertyTarget, Query, QueryError, RemoveTarget, ReturnItem, SetOperator,
     SetTarget, ShowKind, Statement, UnaryOp, parse_script,
 };
+use crate::regex_lite::RegexLite;
 use crate::storage;
 
 const DEFAULT_ROW_LIMIT: usize = 1_000;
@@ -2312,7 +2311,7 @@ impl Session {
             },
             Op::RegexMatch => match (left, right) {
                 (RuntimeValue::String(left), RuntimeValue::String(right)) => {
-                    let regex = Regex::new(&right).map_err(|error| {
+                    let regex = RegexLite::compile(&right).map_err(|error| {
                         ExecutionError::new(
                             "regex_compile_error",
                             format!("invalid regex pattern: {error}"),

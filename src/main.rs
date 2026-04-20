@@ -14,7 +14,7 @@ use cupld::{
         context_as_ndjson, format_error_json as machine_error_json,
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
-    configured_markdown_root,
+    configured_markdown_root, json,
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, watch_markdown_root,
 };
@@ -1669,61 +1669,15 @@ fn table_value(value: &RuntimeValue) -> String {
 }
 
 fn result_as_json(result: &QueryResult) -> String {
-    let rows = result
-        .rows
-        .iter()
-        .map(|row| row_as_json(&result.columns, row))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{rows}]")
+    json::stringify(&json::query_result_rows_to_json(result))
 }
 
 fn result_as_ndjson(result: &QueryResult) -> Vec<String> {
     result
         .rows
         .iter()
-        .map(|row| row_as_json(&result.columns, row))
+        .map(|row| json::stringify(&json::row_to_json_object(&result.columns, row)))
         .collect()
-}
-
-fn row_as_json(columns: &[String], row: &[RuntimeValue]) -> String {
-    let fields = columns
-        .iter()
-        .zip(row.iter())
-        .map(|(column, value)| format!("\"{}\":{}", escape_json(column), value_as_json(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{fields}}}")
-}
-
-fn value_as_json(value: &RuntimeValue) -> String {
-    match value {
-        RuntimeValue::Null => "null".to_owned(),
-        RuntimeValue::Bool(value) => value.to_string(),
-        RuntimeValue::Int(value) => value.to_string(),
-        RuntimeValue::Float(value) => value.to_string(),
-        RuntimeValue::String(value) => format!("\"{}\"", escape_json(value)),
-        RuntimeValue::Bytes(value) => format!("\"{}\"", escape_json(&format!("{value:?}"))),
-        RuntimeValue::Datetime(value) => format!("\"{}\"", escape_json(&format!("{value:?}"))),
-        RuntimeValue::List(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(value_as_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        RuntimeValue::Map(entries) => format!(
-            "{{{}}}",
-            entries
-                .iter()
-                .map(|(key, value)| format!("\"{}\":{}", escape_json(key), value_as_json(value)))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        RuntimeValue::Node(node_id) => format!("\"n{}\"", node_id.get()),
-        RuntimeValue::Edge(edge_id) => format!("\"e{}\"", edge_id.get()),
-    }
 }
 
 fn value_string(value: &RuntimeValue) -> String {
@@ -1756,20 +1710,6 @@ fn value_string(value: &RuntimeValue) -> String {
     }
 }
 
-fn escape_json(input: &str) -> String {
-    input
-        .chars()
-        .flat_map(|ch| match ch {
-            '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
-            '\\' => ['\\', '\\'].into_iter().collect(),
-            '\n' => ['\\', 'n'].into_iter().collect(),
-            '\r' => ['\\', 'r'].into_iter().collect(),
-            '\t' => ['\\', 't'].into_iter().collect(),
-            other => [other].into_iter().collect(),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1778,7 +1718,7 @@ mod tests {
         should_offer_skill_install_prompt, table_value,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
-    use cupld::{QueryResult, RuntimeValue, Value};
+    use cupld::{QueryResult, RuntimeValue, Value, json};
     use std::path::PathBuf;
 
     fn default_alias_db_path() -> PathBuf {
@@ -1824,6 +1764,13 @@ mod tests {
         assert_eq!(
             result_as_ndjson(&result),
             vec![r#"{"name":"Ada","age":36}"#]
+        );
+        let parsed = json::parse(&result_as_json(&result)).unwrap();
+        assert_eq!(
+            parsed.as_array().unwrap()[0]
+                .get("name")
+                .and_then(json::JsonValue::as_str),
+            Some("Ada")
         );
     }
 
