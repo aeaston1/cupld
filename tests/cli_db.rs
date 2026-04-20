@@ -94,9 +94,16 @@ fn run_cli_with_input_in_dir(
     input: &str,
     dir: Option<&Path>,
 ) -> std::process::Output {
+    let home = TempDir::new("cli_home");
+    let config = TempDir::new("cli_config");
     let mut child = Command::new(env!("CARGO_BIN_EXE_cupld"))
         .args(args)
         .current_dir(dir.unwrap_or_else(|| Path::new(".")))
+        .env("CUPLD_NO_INSTALL_PROMPT", "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("APPDATA", config.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

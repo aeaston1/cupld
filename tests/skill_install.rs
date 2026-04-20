@@ -94,6 +94,14 @@ fn cli_install_skill_writes_bundled_skill_and_records_state() {
         .join(".cupld")
         .join("installed-skill-path.txt");
     assert!(state_path.exists());
+    let install_state_path = config.path().join(".cupld").join("install-state.toml");
+    assert!(install_state_path.exists());
+    let install_state = fs::read_to_string(install_state_path).unwrap();
+    assert!(install_state.contains("bundle_revision = 1"));
+    assert!(install_state.contains("skill_signature = "));
+    assert!(install_state.contains("skill_path = "));
+    assert!(install_state.contains("db_path = "));
+    assert!(install_state.contains("root = "));
     assert!(
         !config
             .path()
