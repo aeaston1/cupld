@@ -59,10 +59,78 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
    cupld compact --db default
    ```
 
+## Markdown Authoring Convention
+
+When creating or editing notes under the markdown root, follow this shape.
+
+What markdown creates automatically:
+
+- Each `.md` file becomes one `:MarkdownDocument` node.
+- Body links plus supported frontmatter relationship fields create `:MD_LINKS_TO` edges.
+- Frontmatter and body content populate document properties like `md.title`, `md.tags`, `md.aliases`, `md.headings`, `md.body`, `md.links`, and `md.frontmatter`.
+
+What markdown does not create automatically:
+
+- Arbitrary native nodes, native edge types, or native properties outside the markdown document model.
+- To add native graph structure, use `cupld query` with `CREATE`, `MERGE`, `SET`, `REMOVE`, or `DELETE`.
+
+Recommended note shape:
+
+```md
+---
+title: Project Rollout
+tags: [project, rollout]
+aliases: [Rollout Plan]
+up: Program Overview
+related:
+  - [[notes/schema-notes]]
+  - launch-checklist.md
+next: rollout-phase-2.md
+status: active
+owner: yourname
+---
+
+# Project Rollout
+
+Short summary in 1-3 lines.
+
+## Context
+Key facts and background.
+
+## Related
+- [[notes/schema-notes]]
+- [Launch checklist](../projects/launch-checklist.md)
+
+## Next
+- Follow-up item
+- Another item
+```
+
+Authoring rules:
+
+- Prefer one note per concept, project, person, meeting, or artifact.
+- Use a stable file path. `src.path` is the durable document identity.
+- Prefer a `title` field in frontmatter. If omitted, the first `# Heading` becomes the title.
+- Put structured metadata in frontmatter and prose in the body.
+- Use `tags` and `aliases` as lists of strings.
+- Use `up`, `parent`, `related`, `next`, `previous`, `link`, or `links` only when you intend to create markdown relationships.
+- Supported frontmatter relationship values are a single string or a list of strings. Non-string and nested structured values are ignored.
+- Frontmatter relationship values may be plain targets like `Other Note` or `notes/other.md#section`, or Obsidian wikilinks like `[[Other Note]]`.
+- Use wikilinks or normal markdown links in the body for note-to-note relationships.
+- Inline hashtags are allowed and are added to `md.tags`.
+- Keep frontmatter simple: spaces only, no tabs, simple scalars/lists/maps. Malformed frontmatter is ignored.
+
+Mental model:
+
+- file => node
+- body link or supported frontmatter relationship => edge
+- frontmatter/body => document properties
+- graph facts beyond that => native `cupld query`
+
 ## Markdown Graph Model
 
 - Markdown documents are nodes with label `:MarkdownDocument`.
-- Markdown links become `:MD_LINKS_TO` edges between markdown documents.
+- Body links and supported frontmatter relationship fields become `:MD_LINKS_TO` edges between markdown documents.
 - Dotted keys must be backtick-quoted in queries, for example `d.\`src.path\`` and `d.\`md.title\``.
 - Useful document properties:
   - `src.root`
@@ -81,9 +149,15 @@ Use this skill when `cupld` is available and the task is to read, inspect, persi
 - `src.status` is `current` for present files and `missing` for tombstoned files.
 - Title resolution is: frontmatter `title`, then first heading, then filename stem.
 - Tags come from frontmatter plus inline hashtags.
-- Aliases are stored in `md.aliases` but are not currently used for link resolution.
+- Supported top-level frontmatter outbound-link keys are `up`, `parent`, `related`, `next`, `previous`, `link`, and `links`.
+- Canonical frontmatter relation names are `up`, `related`, `next`, `previous`, and `link`. `parent` normalizes to `up`, and `links` normalizes to `link`.
+- `md.links` contains the deduped union of body links plus supported frontmatter relationship targets in encounter order.
+- Aliases are stored in `md.aliases` and participate in link resolution only as a fallback after exact path and stem matching.
+- Ambiguous alias collisions create no markdown edge and do not fail sync.
 - Wikilinks and standard markdown links are both extracted.
-- Link resolution handles relative paths, root-relative paths, bare stems, and omitted `.md`. It strips `#anchor` and `|alias` parts before resolution.
+- Link resolution handles relative paths, root-relative paths, bare stems, omitted `.md`, plain frontmatter targets, and Obsidian wikilink strings. It strips `#anchor` and `|alias` parts before resolution.
+- Fragments remain document-level: `other.md#section` resolves to `other.md`, while `#section` alone creates no edge.
+- Markdown edge metadata keeps `md.link_target` for compatibility and may also expose aggregated lists on the edge: `md.link_targets`, `md.link_sources`, and `md.link_rels`.
 - Malformed frontmatter falls back to body-only parsing.
 
 ## Query Surface
@@ -126,8 +200,16 @@ Traverse outlinks:
 ```bash
 cupld query --db default --with-markdown \
   "MATCH (a:MarkdownDocument)-[e:MD_LINKS_TO]->(b:MarkdownDocument)
-   RETURN a.\`src.path\`, e.\`md.link_target\`, b.\`src.path\`
+   RETURN a.\`src.path\`, e.\`md.link_target\`, e.\`md.link_sources\`, e.\`md.link_rels\`, b.\`src.path\`
    ORDER BY a.\`src.path\`, b.\`src.path\`"
+```
+
+Inspect frontmatter-driven relationships and aliases:
+
+```bash
+cupld query --db default --with-markdown \
+  "MATCH (d:MarkdownDocument { \`src.path\`: 'projects/cupld-rollout.md' })
+   RETURN d.\`md.title\`, d.\`md.aliases\`, d.\`md.links\`, d.\`md.frontmatter\`"
 ```
 
 Traverse backlinks:

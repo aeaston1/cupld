@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +27,82 @@ pub struct MarkdownDocument {
     pub headings: Vec<String>,
     pub source_hash: String,
     pub has_frontmatter: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarkdownLinkRef {
+    raw_target: String,
+    source: MarkdownLinkSource,
+    relation: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkdownLinkSource {
+    Body,
+    Frontmatter,
+}
+
+impl MarkdownLinkSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Body => "body",
+            Self::Frontmatter => "frontmatter",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MarkdownResolutionIndex {
+    direct: BTreeMap<String, String>,
+    aliases: BTreeMap<String, Option<String>>,
+}
+
+impl MarkdownResolutionIndex {
+    fn insert_direct(&mut self, key: String, target: String) {
+        self.direct.entry(key).or_insert(target);
+    }
+
+    fn insert_alias(&mut self, key: &str, target: &str) {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        match self.aliases.get(trimmed) {
+            Some(Some(existing)) if existing != target => {
+                self.aliases.insert(trimmed.to_owned(), None);
+            }
+            Some(None) | Some(Some(_)) => {}
+            None => {
+                self.aliases
+                    .insert(trimmed.to_owned(), Some(target.to_owned()));
+            }
+        }
+    }
+
+    fn resolve_direct(&self, key: &str) -> Option<String> {
+        self.direct.get(key).cloned()
+    }
+
+    fn resolve_alias(&self, key: &str) -> Option<String> {
+        self.aliases.get(key).and_then(|target| target.clone())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ResolvedMarkdownTarget {
+    raw_targets: Vec<String>,
+    sources: Vec<String>,
+    relations: Vec<String>,
+}
+
+impl ResolvedMarkdownTarget {
+    fn record(&mut self, link_ref: &MarkdownLinkRef) {
+        push_unique(&mut self.raw_targets, link_ref.raw_target.clone());
+        push_unique(&mut self.sources, link_ref.source.as_str().to_owned());
+        if let Some(relation) = &link_ref.relation {
+            push_unique(&mut self.relations, relation.clone());
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,21 +441,32 @@ fn sync_link_edges(
         };
         delete_connector_link_edges(engine, source_id)?;
 
-        let mut resolved_targets = BTreeSet::new();
-        for link in &document.links {
-            let Some(target) = resolve_link_path(&document.path, link, &resolution_index) else {
+        let mut resolved_targets = BTreeMap::new();
+        for link_ref in extract_document_link_refs(document.frontmatter.as_ref(), &document.body) {
+            let Some(target) =
+                resolve_link_path(&document.path, &link_ref.raw_target, &resolution_index)
+            else {
                 continue;
             };
-            if !resolved_targets.insert(target.clone()) {
-                continue;
-            }
+            resolved_targets
+                .entry(target)
+                .or_insert_with(ResolvedMarkdownTarget::default)
+                .record(&link_ref);
+        }
+        for (target, resolved) in resolved_targets {
             let Some(target_id) = node_ids.get(&target).copied() else {
                 continue;
             };
             let mut properties = PropertyMap::from_pairs([
                 ("src.connector", Value::from(CONNECTOR_NAME)),
                 ("src.kind", Value::from("link")),
-                ("md.link_target", Value::from(link.clone())),
+                (
+                    "md.link_target",
+                    Value::from(resolved.raw_targets.first().cloned().unwrap_or_default()),
+                ),
+                ("md.link_targets", list_value(&resolved.raw_targets)),
+                ("md.link_sources", list_value(&resolved.sources)),
+                ("md.link_rels", list_value(&resolved.relations)),
             ]);
             properties.insert("src.status", Value::from("current"));
             engine.create_edge(source_id, target_id, LINK_EDGE_TYPE, properties)?;
@@ -541,7 +628,10 @@ fn read_markdown_document(root: &Path, relative: &Path) -> Result<MarkdownDocume
         push_unique(&mut tags, tag);
     }
     let aliases = extract_frontmatter_strings(frontmatter.as_ref(), &["aliases", "alias"]);
-    let links = extract_links(&body);
+    let mut links = Vec::new();
+    for link_ref in extract_document_link_refs(frontmatter.as_ref(), &body) {
+        push_unique(&mut links, link_ref.raw_target);
+    }
     let title = extract_frontmatter_title(frontmatter.as_ref())
         .or_else(|| headings.first().cloned())
         .unwrap_or_else(|| filename_title(relative));
@@ -744,6 +834,9 @@ fn parse_inline_value(input: &str) -> Option<Value> {
     if input.is_empty() {
         return Some(Value::Null);
     }
+    if is_obsidian_wikilink_literal(input) {
+        return Some(Value::String(input.to_owned()));
+    }
     if input.starts_with('[') {
         return parse_inline_list(input).map(Value::List);
     }
@@ -754,6 +847,10 @@ fn parse_inline_value(input: &str) -> Option<Value> {
         return parse_quoted_string(input).map(Value::String);
     }
     parse_scalar_value(input)
+}
+
+fn is_obsidian_wikilink_literal(input: &str) -> bool {
+    input.starts_with("[[") && input.ends_with("]]") && input.len() >= 4
 }
 
 fn parse_inline_list(input: &str) -> Option<Vec<Value>> {
@@ -1060,6 +1157,106 @@ fn extract_links(body: &str) -> Vec<String> {
     links
 }
 
+fn extract_document_link_refs(
+    frontmatter: Option<&PropertyMap>,
+    body: &str,
+) -> Vec<MarkdownLinkRef> {
+    let mut links = extract_frontmatter_link_refs(frontmatter);
+    for link in extract_links(body) {
+        push_unique_link_ref(&mut links, link, MarkdownLinkSource::Body, None);
+    }
+    links
+}
+
+fn extract_frontmatter_link_refs(frontmatter: Option<&PropertyMap>) -> Vec<MarkdownLinkRef> {
+    let mut links = Vec::new();
+    let Some(frontmatter) = frontmatter else {
+        return links;
+    };
+    for (key, value) in frontmatter.iter() {
+        let Some(relation) = canonical_frontmatter_relation(key) else {
+            continue;
+        };
+        for target in extract_frontmatter_link_targets(value) {
+            push_unique_link_ref(
+                &mut links,
+                target,
+                MarkdownLinkSource::Frontmatter,
+                Some(relation),
+            );
+        }
+    }
+    links
+}
+
+fn canonical_frontmatter_relation(key: &str) -> Option<&'static str> {
+    match key {
+        "up" | "parent" => Some("up"),
+        "related" => Some("related"),
+        "next" => Some("next"),
+        "previous" => Some("previous"),
+        "link" | "links" => Some("link"),
+        _ => None,
+    }
+}
+
+fn normalize_frontmatter_link_target(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = if trimmed.starts_with("[[") && trimmed.ends_with("]]") && trimmed.len() >= 4 {
+        trimmed[2..trimmed.len() - 2].trim()
+    } else {
+        trimmed
+    };
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_owned())
+    }
+}
+
+fn extract_frontmatter_link_targets(value: &Value) -> Vec<String> {
+    let mut targets = Vec::new();
+    match value {
+        Value::String(value) => {
+            if let Some(target) = normalize_frontmatter_link_target(value) {
+                push_unique(&mut targets, target);
+            }
+        }
+        Value::List(entries) => {
+            for entry in entries {
+                match entry {
+                    Value::String(value) => {
+                        if let Some(target) = normalize_frontmatter_link_target(value) {
+                            push_unique(&mut targets, target);
+                        }
+                    }
+                    Value::List(nested) => {
+                        if let Some(target) = normalize_frontmatter_wikilink_list(nested) {
+                            push_unique(&mut targets, target);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    targets
+}
+
+fn normalize_frontmatter_wikilink_list(entries: &[Value]) -> Option<String> {
+    if entries.len() != 1 {
+        return None;
+    }
+    let Value::String(value) = &entries[0] else {
+        return None;
+    };
+    normalize_frontmatter_link_target(value)
+}
+
 fn extract_wikilinks(body: &str, links: &mut Vec<String>) {
     let mut cursor = 0usize;
     while let Some(start) = body[cursor..].find("[[") {
@@ -1116,17 +1313,38 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     values.push(value);
 }
 
-fn build_resolution_index(documents: &[MarkdownDocument]) -> BTreeMap<String, String> {
-    let mut index = BTreeMap::new();
+fn push_unique_link_ref(
+    links: &mut Vec<MarkdownLinkRef>,
+    raw_target: String,
+    source: MarkdownLinkSource,
+    relation: Option<&str>,
+) {
+    if raw_target.is_empty() {
+        return;
+    }
+    let link_ref = MarkdownLinkRef {
+        raw_target,
+        source,
+        relation: relation.map(ToOwned::to_owned),
+    };
+    if links.iter().any(|existing| existing == &link_ref) {
+        return;
+    }
+    links.push(link_ref);
+}
+
+fn build_resolution_index(documents: &[MarkdownDocument]) -> MarkdownResolutionIndex {
+    let mut index = MarkdownResolutionIndex::default();
     for document in documents {
         let relative = path_to_string(&document.path);
-        index.insert(relative.clone(), relative.clone());
+        index.insert_direct(relative.clone(), relative.clone());
         let without_extension = strip_markdown_extension(&relative);
-        index
-            .entry(without_extension.clone())
-            .or_insert(relative.clone());
+        index.insert_direct(without_extension.clone(), relative.clone());
         if let Some(stem) = document.path.file_stem().and_then(|value| value.to_str()) {
-            index.entry(stem.to_owned()).or_insert(relative.clone());
+            index.insert_direct(stem.to_owned(), relative.clone());
+        }
+        for alias in &document.aliases {
+            index.insert_alias(alias, &relative);
         }
     }
     index
@@ -1135,7 +1353,7 @@ fn build_resolution_index(documents: &[MarkdownDocument]) -> BTreeMap<String, St
 fn resolve_link_path(
     current_path: &Path,
     raw_link: &str,
-    index: &BTreeMap<String, String>,
+    index: &MarkdownResolutionIndex,
 ) -> Option<String> {
     let mut target = raw_link.split('|').next()?.trim();
     target = target.split('#').next()?.trim();
@@ -1146,18 +1364,21 @@ fn resolve_link_path(
     let path_target = Path::new(target);
     if let Some(normalized) = resolve_relative_link(current_path, path_target) {
         let string_path = path_to_string(&normalized);
-        if let Some(found) = index.get(&string_path) {
-            return Some(found.clone());
+        if let Some(found) = index.resolve_direct(&string_path) {
+            return Some(found);
         }
         let without_extension = strip_markdown_extension(&string_path);
-        if let Some(found) = index.get(&without_extension) {
-            return Some(found.clone());
+        if let Some(found) = index.resolve_direct(&without_extension) {
+            return Some(found);
         }
     }
 
-    index.get(target).cloned().or_else(|| {
+    index.resolve_direct(target).or_else(|| {
         let normalized = strip_markdown_extension(target);
-        index.get(&normalized).cloned()
+        index
+            .resolve_direct(&normalized)
+            .or_else(|| index.resolve_alias(target))
+            .or_else(|| index.resolve_alias(&normalized))
     })
 }
 
@@ -1261,8 +1482,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, MARKDOWN_DOCUMENT_LABEL,
-        configured_markdown_root, read_markdown_document, set_markdown_root, sync_markdown_root,
+        CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, LINK_EDGE_TYPE, MARKDOWN_DOCUMENT_LABEL,
+        MarkdownLinkRef, MarkdownLinkSource, configured_markdown_root, extract_document_link_refs,
+        read_markdown_document, set_markdown_root, sync_markdown_root,
     };
     use crate::engine::{CupldEngine, Value};
 
@@ -1280,11 +1502,18 @@ title: Frontmatter Title
 tags:
   - rust
 aliases: [One, Two]
+related: [[other]]
+parent: notes/parent.md#overview
+links:
+  - misc/topic
+  - "[[Series Two]]"
+unsupported:
+  - ignored
 nested:
   enabled: true
 ---
 # Heading
-Body with [[other]] and #tagged
+Body with [[other]] and [deep](docs/page.md#intro) and #tagged
 "#,
         )
         .unwrap();
@@ -1294,7 +1523,16 @@ Body with [[other]] and #tagged
         assert_eq!(document.tags, vec!["rust".to_owned(), "tagged".to_owned()]);
         assert_eq!(document.aliases, vec!["One".to_owned(), "Two".to_owned()]);
         assert_eq!(document.headings, vec!["Heading".to_owned()]);
-        assert_eq!(document.links, vec!["other".to_owned()]);
+        assert_eq!(
+            document.links,
+            vec![
+                "other".to_owned(),
+                "notes/parent.md#overview".to_owned(),
+                "misc/topic".to_owned(),
+                "Series Two".to_owned(),
+                "docs/page.md#intro".to_owned(),
+            ]
+        );
         assert!(document.has_frontmatter);
         let frontmatter = document.frontmatter.unwrap();
         assert_eq!(
@@ -1357,6 +1595,58 @@ Body with [[other]] and #tagged
                 && node.property("src.status") == Some(&Value::from("missing"))
         });
         assert!(missing);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn syncs_frontmatter_relationship_metadata_into_edges() {
+        let root = temp_dir("frontmatter_edges");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("note.md"),
+            r#"---
+related: [[other]]
+parent: [[map]]
+links:
+  - misc
+---
+Body with [[other]] and [deep](other.md#intro) and [misc](misc.md)
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("other.md"), "# Other").unwrap();
+        fs::write(root.join("map.md"), "# Map").unwrap();
+        fs::write(root.join("misc.md"), "# Misc").unwrap();
+
+        let document = read_markdown_document(&root, Path::new("note.md")).unwrap();
+        assert!(document.has_frontmatter);
+        let link_refs = extract_document_link_refs(document.frontmatter.as_ref(), &document.body);
+        assert!(link_refs.contains(&MarkdownLinkRef {
+            raw_target: "map".to_owned(),
+            source: MarkdownLinkSource::Frontmatter,
+            relation: Some("up".to_owned()),
+        }));
+
+        let mut engine = CupldEngine::default();
+        let report = sync_markdown_root(&mut engine, &root).unwrap();
+        assert_eq!(report.link_edges, 3);
+
+        let map_edge = engine
+            .edges()
+            .find(|edge| {
+                edge.edge_type() == LINK_EDGE_TYPE
+                    && edge.property("md.link_target") == Some(&Value::from("map"))
+            })
+            .unwrap();
+        assert_eq!(
+            map_edge.property("md.link_sources"),
+            Some(&Value::List(vec![Value::from("frontmatter")]))
+        );
+        assert_eq!(
+            map_edge.property("md.link_rels"),
+            Some(&Value::List(vec![Value::from("up")]))
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

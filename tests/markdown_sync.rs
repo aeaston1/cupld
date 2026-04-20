@@ -63,6 +63,78 @@ Body\n",
 }
 
 #[test]
+fn syncs_frontmatter_relationships_with_edge_metadata() {
+    let db = TestDb::new("markdown_frontmatter_edges");
+    let root = temp_dir("markdown_frontmatter_edges");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("note.md"),
+        r#"---
+related: [[other]]
+parent: [[map]]
+links:
+  - misc
+---
+Body with [[other]] and [deep](other.md#intro) and [misc](misc.md)
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("other.md"), "# Other").unwrap();
+    fs::write(root.join("map.md"), "# Map").unwrap();
+    fs::write(root.join("misc.md"), "# Misc").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'note.md'})-[e:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`, e.`md.link_target`, e.`md.link_targets`, e.`md.link_sources`, e.`md.link_rels`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                RuntimeValue::String("map.md".to_owned()),
+                RuntimeValue::String("map".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("map".to_owned())]),
+                RuntimeValue::List(vec![RuntimeValue::String("frontmatter".to_owned())]),
+                RuntimeValue::List(vec![RuntimeValue::String("up".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("misc.md".to_owned()),
+                RuntimeValue::String("misc".to_owned()),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("misc".to_owned()),
+                    RuntimeValue::String("misc.md".to_owned()),
+                ]),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("frontmatter".to_owned()),
+                    RuntimeValue::String("body".to_owned()),
+                ]),
+                RuntimeValue::List(vec![RuntimeValue::String("link".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("other.md".to_owned()),
+                RuntimeValue::String("other".to_owned()),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("other".to_owned()),
+                    RuntimeValue::String("other.md#intro".to_owned()),
+                ]),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("frontmatter".to_owned()),
+                    RuntimeValue::String("body".to_owned()),
+                ]),
+                RuntimeValue::List(vec![RuntimeValue::String("related".to_owned())]),
+            ],
+        ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn tombstones_missing_documents_without_breaking_native_edges() {
     let db = TestDb::new("markdown_tombstone");
     let root = temp_dir("markdown_tombstone");
@@ -93,6 +165,127 @@ fn tombstones_missing_documents_without_breaking_native_edges() {
         vec![vec![
             RuntimeValue::String("Ada".to_owned()),
             RuntimeValue::String("missing".to_owned()),
+        ]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn alias_resolution_falls_back_after_direct_path_and_stem_matches() {
+    let db = TestDb::new("markdown_alias_resolution");
+    let root = temp_dir("markdown_alias_resolution");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Friendly.md"), "# Direct").unwrap();
+    fs::write(
+        root.join("aliased.md"),
+        "---\n\
+aliases: [Friendly]\n\
+---\n\
+# Aliased\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("alias-target.md"),
+        "---\n\
+aliases: [Alias Only]\n\
+---\n\
+# Alias Only\n",
+    )
+    .unwrap();
+    fs::write(root.join("source.md"), "[[Friendly]]").unwrap();
+    fs::write(root.join("alias-source.md"), "[[Alias Only]]").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let direct = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`",
+    );
+    assert_eq!(
+        direct.rows,
+        vec![vec![RuntimeValue::String("Friendly.md".to_owned())]]
+    );
+    let alias = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'alias-source.md'})-[:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`",
+    );
+    assert_eq!(
+        alias.rows,
+        vec![vec![RuntimeValue::String("alias-target.md".to_owned())]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ambiguous_aliases_are_skipped_without_failing_sync() {
+    let db = TestDb::new("markdown_alias_ambiguous");
+    let root = temp_dir("markdown_alias_ambiguous");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("one.md"),
+        "---\n\
+aliases: [Shared]\n\
+---\n\
+# One\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("two.md"),
+        "---\n\
+aliases: [Shared]\n\
+---\n\
+# Two\n",
+    )
+    .unwrap();
+    fs::write(root.join("source.md"), "[[Shared]]").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_LINKS_TO]->(:MarkdownDocument)
+         RETURN count(e)",
+    );
+    assert_eq!(result.rows, vec![vec![RuntimeValue::Int(0)]]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fragment_only_links_are_ignored_but_document_fragments_still_link_documents() {
+    let db = TestDb::new("markdown_fragment_links");
+    let root = temp_dir("markdown_fragment_links");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("note.md"),
+        "---\n\
+next: other.md#section\n\
+---\n\
+[local](#section)\n",
+    )
+    .unwrap();
+    fs::write(root.join("other.md"), "# Other").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'note.md'})-[e:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`, e.`md.link_targets`, e.`md.link_rels`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::String("other.md".to_owned()),
+            RuntimeValue::List(vec![RuntimeValue::String("other.md#section".to_owned())]),
+            RuntimeValue::List(vec![RuntimeValue::String("next".to_owned())]),
         ]]
     );
 

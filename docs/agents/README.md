@@ -260,7 +260,7 @@ Markdown root resolution order is:
 Markdown behavior:
 
 - `cupld query --with-markdown` overlays markdown into a temporary query session and does not persist imported notes.
-- `cupld sync markdown` persists markdown documents and `:MD_LINKS_TO` edges into the database.
+- `cupld sync markdown` persists markdown documents and `:MD_LINKS_TO` edges from body links plus supported frontmatter relationship keys into the database.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
 - `--poll-ms` controls the poll interval.
 - `--debounce-ms` controls the stable-change debounce window.
@@ -289,6 +289,11 @@ Markdown notes:
 - Dotted keys must be backtick-quoted in queries, for example `d.\`src.path\`` and `d.\`md.title\``.
 - `src.status` is `current` for present files and `missing` for tombstoned files.
 - Title resolution is frontmatter `title`, then first heading, then filename stem.
+- Supported top-level frontmatter outbound-link keys are `up`, `parent`, `related`, `next`, `previous`, `link`, and `links`.
+- `md.links` contains the deduped union of body links plus supported frontmatter relationship targets in encounter order.
+- Aliases are stored in `md.aliases` and participate in link resolution only as a fallback after exact path and stem matching.
+- Ambiguous alias collisions create no markdown edge and do not fail sync.
+- Fragments remain document-level: `other.md#section` resolves to `other.md`, while `#section` alone creates no edge.
 - Malformed frontmatter falls back to body-only parsing.
 
 ## Automation Contracts
