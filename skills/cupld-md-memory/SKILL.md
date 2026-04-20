@@ -114,7 +114,7 @@ Authoring rules:
 - Put structured metadata in frontmatter and prose in the body.
 - Use `tags` and `aliases` as lists of strings.
 - Use `up`, `parent`, `related`, `next`, `previous`, `link`, or `links` only when you intend to create markdown relationships.
-- Supported frontmatter relationship values are a single string or a list of strings. Non-string and nested structured values are ignored.
+- Supported frontmatter relationship values are a single string or a list whose entries resolve to strings. Non-string structured values are ignored.
 - Frontmatter relationship values may be plain targets like `Other Note` or `notes/other.md#section`, or Obsidian wikilinks like `[[Other Note]]`.
 - Use wikilinks or normal markdown links in the body for note-to-note relationships.
 - Inline hashtags are allowed and are added to `md.tags`.
@@ -157,7 +157,7 @@ Mental model:
 - Wikilinks and standard markdown links are both extracted.
 - Link resolution handles relative paths, root-relative paths, bare stems, omitted `.md`, plain frontmatter targets, and Obsidian wikilink strings. It strips `#anchor` and `|alias` parts before resolution.
 - Fragments remain document-level: `other.md#section` resolves to `other.md`, while `#section` alone creates no edge.
-- Markdown edge metadata keeps `md.link_target` for compatibility and may also expose aggregated lists on the edge: `md.link_targets`, `md.link_sources`, and `md.link_rels`.
+- Markdown edge metadata keeps `md.link_target` for compatibility and exposes aggregated lists on the edge: `md.link_targets`, `md.link_sources`, and `md.link_rels`.
 - Malformed frontmatter falls back to body-only parsing.
 
 ## Query Surface
