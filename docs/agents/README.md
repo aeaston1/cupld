@@ -8,7 +8,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 
 - Use `cupld` to start an in-memory REPL.
 - Use `cupld <path.cupld>` or `cupld --db <path.cupld|default>` to open or create a file-backed REPL.
-- Use `cupld install` to install the bundled `cupld-md-memory` skill and bootstrap local memory. The default DB path is `./.cupld/default.cupld` and the default markdown root is `./.cupld/data/`.
+- Use `cupld install` to install or refresh the bundled `cupld-md-memory` skill and bootstrap local memory. The default DB path is `./.cupld/default.cupld` and the default markdown root is `./.cupld/data/`.
 - Use `--db default` to target `./.cupld/default.cupld`.
 - Use `cupld query --db <path.cupld|default> ...` for one-shot automation and `cupld context --db <path.cupld|default> ...` for top-k context rows.
 - Use `cupld query --db ... --with-markdown` for transient markdown overlay reads.
@@ -16,6 +16,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `cupld schema --db ...` and `cupld check --db ...` before making automation assumptions about a database.
 - Opening or checking a database from an older `cupld` release may upgrade the `.cupld` file in place. Treat on-disk databases as forward-only during beta if rollback matters.
 - Use `--output json` or `--output ndjson` for machine consumption.
+- Interactive REPL startup can prompt to install when no skill install is tracked, or to refresh when tracked bundle metadata is stale.
 
 ## CLI Shape
 
@@ -47,6 +48,8 @@ Important constraints:
 - Opening or checking an older `.cupld` file may upgrade it in place to the current on-disk format.
 - Repo-local package defaults live in `.cupld/config.toml`.
 - `--db default` is an alias for `./.cupld/default.cupld`.
+- `install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in user config `install-state.toml`.
+- If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
 
 ## Agent Workflow
 
@@ -311,7 +314,7 @@ Markdown notes:
 Current automation controls:
 
 - `CUPLD_QUERY_MAX_ROWS` sets the default `query --max-rows` cap.
-- `CUPLD_NO_INSTALL_PROMPT=1` disables the interactive bootstrap prompt on REPL startup.
+- `CUPLD_NO_INSTALL_PROMPT=1` disables interactive install and refresh prompts on REPL startup.
 - Prefer explicit `ORDER BY` plus explicit `LIMIT` for deterministic context windows.
 - Use named parameters with `--params-json` or `--params-file`.
 

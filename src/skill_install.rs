@@ -13,7 +13,7 @@ const BUNDLED_SKILL_CONTENTS: &str = include_str!("../skills/cupld-md-memory/SKI
 const CONFIG_DIR_NAME: &str = ".cupld";
 const INSTALLED_SKILL_PATH_FILE: &str = "installed-skill-path.txt";
 const INSTALL_STATE_FILE: &str = "install-state.toml";
-const INSTALL_STATE_VERSION: u32 = 2;
+const INSTALL_STATE_VERSION: u32 = 3;
 const INSTALL_BUNDLE_REVISION: u32 = 1;
 const PROMPT_DISABLED_FILE: &str = "skill-install-prompt.disabled";
 
@@ -109,11 +109,25 @@ struct PromptState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InstallState {
     version: u32,
+    installs: Vec<InstallRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallRecord {
     bundle_revision: u32,
     skill_signature: Option<String>,
     skill_path: PathBuf,
     db_path: PathBuf,
     root: PathBuf,
+}
+
+#[derive(Default)]
+struct InstallRecordBuilder {
+    bundle_revision: Option<u32>,
+    skill_signature: Option<String>,
+    skill_path: Option<PathBuf>,
+    db_path: Option<PathBuf>,
+    root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -165,15 +179,73 @@ impl RefreshReason {
 }
 
 impl InstallState {
-    fn from_outcome(outcome: &InstallOutcome) -> Self {
+    fn empty() -> Self {
         Self {
             version: INSTALL_STATE_VERSION,
+            installs: Vec::new(),
+        }
+    }
+
+    fn first_install(&self) -> Option<&InstallRecord> {
+        self.installs.first()
+    }
+
+    fn upsert(&mut self, record: InstallRecord) {
+        self.version = INSTALL_STATE_VERSION;
+        if let Some(existing) = self
+            .installs
+            .iter_mut()
+            .find(|install| install.skill_path == record.skill_path)
+        {
+            *existing = record;
+        } else {
+            self.installs.push(record);
+        }
+    }
+}
+
+impl InstallRecord {
+    fn from_outcome(outcome: &InstallOutcome) -> Self {
+        Self {
             bundle_revision: INSTALL_BUNDLE_REVISION,
             skill_signature: Some(bundled_skill_signature()),
             skill_path: outcome.skill_path.clone(),
             db_path: outcome.db_path.clone(),
             root: outcome.root.clone(),
         }
+    }
+}
+
+impl InstallRecordBuilder {
+    fn has_values(&self) -> bool {
+        self.bundle_revision.is_some()
+            || self.skill_signature.is_some()
+            || self.skill_path.is_some()
+            || self.db_path.is_some()
+            || self.root.is_some()
+    }
+
+    fn finish(self, version: u32, context: &str) -> Result<InstallRecord, String> {
+        Ok(InstallRecord {
+            bundle_revision: self
+                .bundle_revision
+                .ok_or(format!("missing `bundle_revision` in {context}"))?,
+            skill_signature: if version >= 2 {
+                Some(
+                    self.skill_signature
+                        .ok_or(format!("missing `skill_signature` in {context}"))?,
+                )
+            } else {
+                None
+            },
+            skill_path: self
+                .skill_path
+                .ok_or(format!("missing `skill_path` in {context}"))?,
+            db_path: self
+                .db_path
+                .ok_or(format!("missing `db_path` in {context}"))?,
+            root: self.root.ok_or(format!("missing `root` in {context}"))?,
+        })
     }
 }
 
@@ -461,23 +533,64 @@ fn prompt_for_repl_refresh_request<R: BufRead, W: Write>(
 }
 
 fn refresh_reason(state: &PromptState) -> Result<Option<RefreshReason>, String> {
+    if let Some((_, reason)) = refresh_candidate(state)? {
+        return Ok(Some(reason));
+    }
+    if state.install_state.is_some() {
+        return Ok(None);
+    }
     let Some(skill_path) = state.installed_skill_path.as_deref() else {
         return Ok(None);
     };
+    refresh_reason_for_legacy_path(skill_path)
+}
 
+fn refresh_candidate(
+    state: &PromptState,
+) -> Result<Option<(&InstallRecord, RefreshReason)>, String> {
+    if let Some(install_state) = state.install_state.as_ref() {
+        for install in &install_state.installs {
+            if let Some(reason) = refresh_reason_for_install(install)? {
+                return Ok(Some((install, reason)));
+            }
+        }
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
+fn refresh_reason_for_install(install: &InstallRecord) -> Result<Option<RefreshReason>, String> {
+    if !install.skill_path.exists() {
+        return Ok(None);
+    }
     let bundled_signature = bundled_skill_signature();
-    let skill_contents_changed = match state.install_state.as_ref() {
-        Some(install_state) => match install_state.skill_signature.as_deref() {
-            Some(signature) => signature != bundled_signature.as_str(),
-            None => fs::read_to_string(skill_path).map_err(io_error)? != BUNDLED_SKILL_CONTENTS,
-        },
-        None => fs::read_to_string(skill_path).map_err(io_error)? != BUNDLED_SKILL_CONTENTS,
+    let skill_contents_changed = match install.skill_signature.as_deref() {
+        Some(signature) => signature != bundled_signature.as_str(),
+        None => {
+            fs::read_to_string(&install.skill_path).map_err(io_error)? != BUNDLED_SKILL_CONTENTS
+        }
     };
-    let bundle_revision_changed = state
-        .install_state
-        .as_ref()
-        .is_some_and(|install_state| install_state.bundle_revision != INSTALL_BUNDLE_REVISION);
+    refresh_reason_from_flags(
+        skill_contents_changed,
+        install.bundle_revision != INSTALL_BUNDLE_REVISION,
+    )
+}
 
+fn refresh_reason_for_legacy_path(skill_path: &Path) -> Result<Option<RefreshReason>, String> {
+    if !skill_path.exists() {
+        return Ok(None);
+    }
+    refresh_reason_from_flags(
+        fs::read_to_string(skill_path).map_err(io_error)? != BUNDLED_SKILL_CONTENTS,
+        false,
+    )
+}
+
+fn refresh_reason_from_flags(
+    skill_contents_changed: bool,
+    bundle_revision_changed: bool,
+) -> Result<Option<RefreshReason>, String> {
     Ok(match (skill_contents_changed, bundle_revision_changed) {
         (false, false) => None,
         (true, false) => Some(RefreshReason::SkillContents),
@@ -488,14 +601,17 @@ fn refresh_reason(state: &PromptState) -> Result<Option<RefreshReason>, String> 
 
 fn refresh_install_request(state: &PromptState) -> Result<InstallRequest, String> {
     let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
-    if let Some(install_state) = &state.install_state {
+    if let Some((install, _)) = refresh_candidate(state)? {
         return Ok(InstallRequest {
-            skills_root: skills_root_from_skill_path(&install_state.skill_path)?,
-            db_path: install_state.db_path.clone(),
-            root: install_state.root.clone(),
+            skills_root: skills_root_from_skill_path(&install.skill_path)?,
+            db_path: install.db_path.clone(),
+            root: install.root.clone(),
             force: true,
             yes: true,
         });
+    }
+    if state.install_state.is_some() {
+        return Err("missing stale install state record".to_owned());
     }
     let skill_path = state
         .installed_skill_path
@@ -735,7 +851,11 @@ fn prompt_state_from_config_dir(config_dir: &Path) -> Result<PromptState, String
     let state_path = config_dir.join(INSTALLED_SKILL_PATH_FILE);
     let installed_skill_path = install_state
         .as_ref()
-        .map(|state| state.skill_path.clone())
+        .and_then(|state| {
+            state
+                .first_install()
+                .map(|install| install.skill_path.clone())
+        })
         .or(load_installed_skill_path(&state_path)?);
     Ok(PromptState {
         install_state,
@@ -756,40 +876,89 @@ fn load_install_state(path: &Path) -> Result<Option<InstallState>, String> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error(error)),
+        Err(error) => {
+            eprintln!(
+                "warning: ignoring unreadable install state at {}: {}",
+                path.display(),
+                error
+            );
+            return Ok(None);
+        }
     };
-    let state = parse_install_state(&contents)?;
-    if !state.skill_path.exists() {
+    let state = match parse_install_state(&contents) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "warning: ignoring invalid install state at {}: {}",
+                path.display(),
+                error
+            );
+            return Ok(None);
+        }
+    };
+    let mut installs = Vec::new();
+    for mut install in state.installs {
+        if !install.skill_path.exists() {
+            continue;
+        }
+        install.skill_path = match canonicalize_existing_path(&install.skill_path) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!(
+                    "warning: ignoring install state record for {}: {}",
+                    install.skill_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        installs.push(install);
+    }
+    if installs.is_empty() {
         return Ok(None);
     }
     Ok(Some(InstallState {
-        skill_path: canonicalize_existing_path(&state.skill_path)?,
-        ..state
+        version: INSTALL_STATE_VERSION,
+        installs,
     }))
 }
 
 fn persist_install_state(outcome: &InstallOutcome) -> Result<(), String> {
     let config_dir = config_dir()?;
     fs::create_dir_all(&config_dir).map_err(io_error)?;
-    fs::write(
-        config_dir.join(INSTALL_STATE_FILE),
-        render_install_state(&InstallState::from_outcome(outcome)),
-    )
-    .map_err(io_error)
+    let state_path = config_dir.join(INSTALL_STATE_FILE);
+    let mut state = load_install_state(&state_path)?.unwrap_or_else(InstallState::empty);
+    state.upsert(InstallRecord::from_outcome(outcome));
+    fs::write(state_path, render_install_state(&state)).map_err(io_error)
 }
 
 fn parse_install_state(input: &str) -> Result<InstallState, String> {
     let mut version = None;
-    let mut bundle_revision = None;
-    let mut skill_signature = None;
-    let mut skill_path = None;
-    let mut db_path = None;
-    let mut root = None;
+    let mut legacy = InstallRecordBuilder::default();
+    let mut current = None::<InstallRecordBuilder>;
+    let mut installs = Vec::new();
+    let mut saw_install_section = false;
 
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_trailing_comment(raw_line).trim();
         if line.is_empty() {
+            continue;
+        }
+
+        if line == "[[install]]" {
+            saw_install_section = true;
+            if legacy.has_values() {
+                return Err(format!(
+                    "line {line_number}: legacy install keys cannot be mixed with install sections"
+                ));
+            }
+            if let Some(builder) = current.take() {
+                let parsed_version =
+                    version.ok_or("missing `version` in install state".to_owned())?;
+                installs.push(builder.finish(parsed_version, "install record")?);
+            }
+            current = Some(InstallRecordBuilder::default());
             continue;
         }
 
@@ -799,6 +968,14 @@ fn parse_install_state(input: &str) -> Result<InstallState, String> {
         let parsed = json::parse(value)
             .map_err(|error| format!("line {line_number}: invalid value for `{key}`: {error}"))?;
 
+        if saw_install_section {
+            let builder = current.as_mut().ok_or(format!(
+                "line {line_number}: install key appears before install section"
+            ))?;
+            parse_install_record_key(builder, key, &parsed, line_number)?;
+            continue;
+        }
+
         match key {
             "version" => {
                 if version.is_some() {
@@ -806,36 +983,8 @@ fn parse_install_state(input: &str) -> Result<InstallState, String> {
                 }
                 version = Some(parse_u32_value(&parsed, "version", line_number)?);
             }
-            "bundle_revision" => {
-                if bundle_revision.is_some() {
-                    return Err(format!("line {line_number}: duplicate `bundle_revision`"));
-                }
-                bundle_revision = Some(parse_u32_value(&parsed, "bundle_revision", line_number)?);
-            }
-            "skill_signature" => {
-                if skill_signature.is_some() {
-                    return Err(format!("line {line_number}: duplicate `skill_signature`"));
-                }
-                skill_signature =
-                    Some(parse_string_value(&parsed, "skill_signature", line_number)?);
-            }
-            "skill_path" => {
-                if skill_path.is_some() {
-                    return Err(format!("line {line_number}: duplicate `skill_path`"));
-                }
-                skill_path = Some(parse_path_value(&parsed, "skill_path", line_number)?);
-            }
-            "db_path" => {
-                if db_path.is_some() {
-                    return Err(format!("line {line_number}: duplicate `db_path`"));
-                }
-                db_path = Some(parse_path_value(&parsed, "db_path", line_number)?);
-            }
-            "root" => {
-                if root.is_some() {
-                    return Err(format!("line {line_number}: duplicate `root`"));
-                }
-                root = Some(parse_path_value(&parsed, "root", line_number)?);
+            "bundle_revision" | "skill_signature" | "skill_path" | "db_path" | "root" => {
+                parse_install_record_key(&mut legacy, key, &parsed, line_number)?;
             }
             other => {
                 return Err(format!("line {line_number}: unknown key `{other}`"));
@@ -850,19 +999,78 @@ fn parse_install_state(input: &str) -> Result<InstallState, String> {
         ));
     }
 
+    if saw_install_section {
+        if let Some(builder) = current.take() {
+            installs.push(builder.finish(version, "install record")?);
+        }
+        if installs.is_empty() {
+            return Err("missing install records in install state".to_owned());
+        }
+    } else if legacy.has_values() {
+        installs.push(legacy.finish(version, "install state")?);
+    } else {
+        return Err("missing install records in install state".to_owned());
+    }
+
     Ok(InstallState {
         version: INSTALL_STATE_VERSION,
-        bundle_revision: bundle_revision
-            .ok_or("missing `bundle_revision` in install state".to_owned())?,
-        skill_signature: if version >= 2 {
-            Some(skill_signature.ok_or("missing `skill_signature` in install state".to_owned())?)
-        } else {
-            None
-        },
-        skill_path: skill_path.ok_or("missing `skill_path` in install state".to_owned())?,
-        db_path: db_path.ok_or("missing `db_path` in install state".to_owned())?,
-        root: root.ok_or("missing `root` in install state".to_owned())?,
+        installs,
     })
+}
+
+fn parse_install_record_key(
+    builder: &mut InstallRecordBuilder,
+    key: &str,
+    parsed: &json::JsonValue,
+    line_number: usize,
+) -> Result<(), String> {
+    match key {
+        "bundle_revision" => set_install_field(
+            &mut builder.bundle_revision,
+            parse_u32_value(parsed, "bundle_revision", line_number)?,
+            "bundle_revision",
+            line_number,
+        ),
+        "skill_signature" => set_install_field(
+            &mut builder.skill_signature,
+            parse_string_value(parsed, "skill_signature", line_number)?,
+            "skill_signature",
+            line_number,
+        ),
+        "skill_path" => set_install_field(
+            &mut builder.skill_path,
+            parse_path_value(parsed, "skill_path", line_number)?,
+            "skill_path",
+            line_number,
+        ),
+        "db_path" => set_install_field(
+            &mut builder.db_path,
+            parse_path_value(parsed, "db_path", line_number)?,
+            "db_path",
+            line_number,
+        ),
+        "root" => set_install_field(
+            &mut builder.root,
+            parse_path_value(parsed, "root", line_number)?,
+            "root",
+            line_number,
+        ),
+        other => Err(format!("line {line_number}: unknown install key `{other}`")),
+    }
+}
+
+fn set_install_field<T>(
+    slot: &mut Option<T>,
+    value: T,
+    key: &str,
+    line_number: usize,
+) -> Result<(), String> {
+    if slot.is_some() {
+        Err(format!("line {line_number}: duplicate `{key}`"))
+    } else {
+        *slot = Some(value);
+        Ok(())
+    }
 }
 
 fn render_install_state(state: &InstallState) -> String {
@@ -870,17 +1078,21 @@ fn render_install_state(state: &InstallState) -> String {
     output.push_str("version = ");
     output.push_str(&state.version.to_string());
     output.push('\n');
-    output.push_str("bundle_revision = ");
-    output.push_str(&state.bundle_revision.to_string());
-    output.push('\n');
-    if let Some(signature) = state.skill_signature.as_deref() {
-        output.push_str("skill_signature = ");
-        json::write_quoted_string(&mut output, signature);
+    for install in &state.installs {
         output.push('\n');
+        output.push_str("[[install]]\n");
+        output.push_str("bundle_revision = ");
+        output.push_str(&install.bundle_revision.to_string());
+        output.push('\n');
+        if let Some(signature) = install.skill_signature.as_deref() {
+            output.push_str("skill_signature = ");
+            json::write_quoted_string(&mut output, signature);
+            output.push('\n');
+        }
+        render_install_state_path(&mut output, "skill_path", &install.skill_path);
+        render_install_state_path(&mut output, "db_path", &install.db_path);
+        render_install_state_path(&mut output, "root", &install.root);
     }
-    render_install_state_path(&mut output, "skill_path", &state.skill_path);
-    render_install_state_path(&mut output, "db_path", &state.db_path);
-    render_install_state_path(&mut output, "root", &state.root);
     output
 }
 
@@ -1138,14 +1350,14 @@ mod tests {
     use super::{
         BUNDLED_SKILL_CONTENTS, BUNDLED_SKILL_FILENAME, BUNDLED_SKILL_NAME, CONFIG_DIR_NAME,
         INSTALL_BUNDLE_REVISION, INSTALL_STATE_FILE, INSTALL_STATE_VERSION,
-        INSTALLED_SKILL_PATH_FILE, InstallChoice, InstallCommand, InstallRequest, InstallScope,
-        InstallState, InstallStatus, PROMPT_DISABLED_FILE, PromptState, RefreshReason,
-        SkillInstallTarget, WorkspacePackage, bootstrap_memory, bundled_skill_signature,
-        canonicalize_existing_path, default_root_path, expand_tilde_with_home, install_request,
-        load_installed_skill_path, parse_install_state, prompt_for_install_request,
-        prompt_for_repl_choice, prompt_for_repl_refresh, prompt_for_repl_refresh_request,
-        prompt_state_from_config_dir, refresh_install_request, refresh_reason,
-        render_install_state, resolve_install_request, should_prompt_for_repl,
+        INSTALLED_SKILL_PATH_FILE, InstallChoice, InstallCommand, InstallRecord, InstallRequest,
+        InstallScope, InstallState, InstallStatus, PROMPT_DISABLED_FILE, PromptState,
+        RefreshReason, SkillInstallTarget, WorkspacePackage, bootstrap_memory,
+        bundled_skill_signature, canonicalize_existing_path, default_root_path,
+        expand_tilde_with_home, install_request, load_installed_skill_path, parse_install_state,
+        prompt_for_install_request, prompt_for_repl_choice, prompt_for_repl_refresh,
+        prompt_for_repl_refresh_request, prompt_state_from_config_dir, refresh_install_request,
+        refresh_reason, render_install_state, resolve_install_request, should_prompt_for_repl,
         skills_root_from_skill_path,
     };
     use cupld::{Session, configured_markdown_root};
@@ -1156,6 +1368,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEMP_DIR_ID: AtomicUsize = AtomicUsize::new(1);
+
+    fn test_install_state(record: InstallRecord) -> InstallState {
+        InstallState {
+            version: INSTALL_STATE_VERSION,
+            installs: vec![record],
+        }
+    }
+
+    fn test_install_record(skill_path: PathBuf, db_path: PathBuf, root: PathBuf) -> InstallRecord {
+        InstallRecord {
+            bundle_revision: INSTALL_BUNDLE_REVISION,
+            skill_signature: Some(bundled_skill_signature()),
+            skill_path,
+            db_path,
+            root,
+        }
+    }
 
     #[test]
     fn prompt_only_runs_for_interactive_repl_without_state() {
@@ -1176,15 +1405,13 @@ mod tests {
         fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
         fs::write(&skill_path, BUNDLED_SKILL_CONTENTS).unwrap();
 
+        let install_record = test_install_record(
+            canonicalize_existing_path(&skill_path).unwrap(),
+            root.join("db.cupld"),
+            root.join("notes"),
+        );
         let state = PromptState {
-            install_state: Some(InstallState {
-                version: INSTALL_STATE_VERSION,
-                bundle_revision: INSTALL_BUNDLE_REVISION,
-                skill_signature: Some(bundled_skill_signature()),
-                skill_path: canonicalize_existing_path(&skill_path).unwrap(),
-                db_path: root.join("db.cupld"),
-                root: root.join("notes"),
-            }),
+            install_state: Some(test_install_state(install_record.clone())),
             installed_skill_path: Some(canonicalize_existing_path(&skill_path).unwrap()),
             prompt_disabled: false,
         };
@@ -1194,10 +1421,10 @@ mod tests {
         assert_eq!(refresh_reason(&state).unwrap(), None);
 
         let stale_revision = PromptState {
-            install_state: Some(InstallState {
+            install_state: Some(test_install_state(InstallRecord {
                 bundle_revision: INSTALL_BUNDLE_REVISION - 1,
-                ..state.install_state.clone().unwrap()
-            }),
+                ..install_record.clone()
+            })),
             ..state.clone()
         };
         assert_eq!(
@@ -1206,14 +1433,70 @@ mod tests {
         );
 
         let stale_signature = PromptState {
-            install_state: Some(InstallState {
+            install_state: Some(test_install_state(InstallRecord {
                 skill_signature: Some("stale".to_owned()),
-                ..state.install_state.clone().unwrap()
-            }),
+                ..install_record
+            })),
             ..state.clone()
         };
         assert_eq!(
             refresh_reason(&stale_signature).unwrap(),
+            Some(RefreshReason::SkillContents)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_reason_detects_loaded_install_state_record_changes() {
+        let root = temp_dir("refresh_reason_loaded");
+        let config_dir = root.join(CONFIG_DIR_NAME);
+        fs::create_dir_all(&config_dir).unwrap();
+        let skill_path = root
+            .join("skills")
+            .join(BUNDLED_SKILL_NAME)
+            .join(BUNDLED_SKILL_FILENAME);
+        fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        fs::write(&skill_path, BUNDLED_SKILL_CONTENTS).unwrap();
+
+        let install_record = test_install_record(
+            canonicalize_existing_path(&skill_path).unwrap(),
+            root.join("db.cupld"),
+            root.join("notes"),
+        );
+        fs::write(
+            config_dir.join(INSTALL_STATE_FILE),
+            render_install_state(&test_install_state(install_record.clone())),
+        )
+        .unwrap();
+        let state = prompt_state_from_config_dir(&config_dir).unwrap();
+        assert_eq!(refresh_reason(&state).unwrap(), None);
+
+        fs::write(
+            config_dir.join(INSTALL_STATE_FILE),
+            render_install_state(&test_install_state(InstallRecord {
+                bundle_revision: INSTALL_BUNDLE_REVISION - 1,
+                ..install_record.clone()
+            })),
+        )
+        .unwrap();
+        let state = prompt_state_from_config_dir(&config_dir).unwrap();
+        assert_eq!(
+            refresh_reason(&state).unwrap(),
+            Some(RefreshReason::BundleRevision)
+        );
+
+        fs::write(
+            config_dir.join(INSTALL_STATE_FILE),
+            render_install_state(&test_install_state(InstallRecord {
+                skill_signature: Some("stale".to_owned()),
+                ..install_record
+            })),
+        )
+        .unwrap();
+        let state = prompt_state_from_config_dir(&config_dir).unwrap();
+        assert_eq!(
+            refresh_reason(&state).unwrap(),
             Some(RefreshReason::SkillContents)
         );
 
@@ -1229,16 +1512,17 @@ mod tests {
             .join(BUNDLED_SKILL_FILENAME);
         fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
         fs::write(&skill_path, BUNDLED_SKILL_CONTENTS).unwrap();
+        let install_record = test_install_record(
+            canonicalize_existing_path(&skill_path).unwrap(),
+            root.join("db.cupld"),
+            root.join("notes"),
+        );
 
         let state = PromptState {
-            install_state: Some(InstallState {
-                version: INSTALL_STATE_VERSION,
-                bundle_revision: INSTALL_BUNDLE_REVISION,
-                skill_signature: Some(bundled_skill_signature()),
-                skill_path: canonicalize_existing_path(&skill_path).unwrap(),
-                db_path: root.join("db.cupld"),
-                root: root.join("notes"),
-            }),
+            install_state: Some(test_install_state(InstallRecord {
+                skill_signature: Some("stale".to_owned()),
+                ..install_record.clone()
+            })),
             installed_skill_path: Some(canonicalize_existing_path(&skill_path).unwrap()),
             prompt_disabled: false,
         };
@@ -1529,17 +1813,31 @@ mod tests {
 
     #[test]
     fn install_state_round_trips() {
-        let state = InstallState {
-            version: INSTALL_STATE_VERSION,
-            bundle_revision: INSTALL_BUNDLE_REVISION,
-            skill_signature: Some(bundled_skill_signature()),
-            skill_path: PathBuf::from("/tmp/skill"),
-            db_path: PathBuf::from("/tmp/default.cupld"),
-            root: PathBuf::from("/tmp/notes"),
-        };
+        let state = test_install_state(test_install_record(
+            PathBuf::from("/tmp/skill"),
+            PathBuf::from("/tmp/default.cupld"),
+            PathBuf::from("/tmp/notes"),
+        ));
         assert_eq!(
             parse_install_state(&render_install_state(&state)).unwrap(),
             state
+        );
+    }
+
+    #[test]
+    fn legacy_install_state_migrates_to_install_record() {
+        let legacy = format!(
+            "version = 2\nbundle_revision = 1\nskill_signature = \"{}\"\nskill_path = \"/tmp/skill\"\ndb_path = \"/tmp/default.cupld\"\nroot = \"/tmp/notes\"\n",
+            bundled_skill_signature()
+        );
+        let state = parse_install_state(&legacy).unwrap();
+        assert_eq!(
+            state,
+            test_install_state(test_install_record(
+                PathBuf::from("/tmp/skill"),
+                PathBuf::from("/tmp/default.cupld"),
+                PathBuf::from("/tmp/notes"),
+            ))
         );
     }
 
@@ -1689,6 +1987,35 @@ mod tests {
     }
 
     #[test]
+    fn prompt_state_falls_back_to_installed_skill_path_when_install_state_is_corrupt() {
+        let root = temp_dir("prompt_state_corrupt");
+        let config_dir = root.join(CONFIG_DIR_NAME);
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let skill_path = root.join(BUNDLED_SKILL_NAME).join(BUNDLED_SKILL_FILENAME);
+        fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        fs::write(&skill_path, BUNDLED_SKILL_CONTENTS).unwrap();
+        fs::write(config_dir.join(INSTALL_STATE_FILE), b"not valid state\n").unwrap();
+        fs::write(
+            config_dir.join(INSTALLED_SKILL_PATH_FILE),
+            format!("{}\n", skill_path.display()),
+        )
+        .unwrap();
+
+        let state = prompt_state_from_config_dir(&config_dir).unwrap();
+        assert_eq!(
+            state,
+            PromptState {
+                install_state: None,
+                installed_skill_path: Some(canonicalize_existing_path(&skill_path).unwrap()),
+                prompt_disabled: false,
+            }
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn prompt_state_prefers_saved_install_state() {
         let root = temp_dir("prompt_state_install");
         let config_dir = root.join(CONFIG_DIR_NAME);
@@ -1697,14 +2024,12 @@ mod tests {
         let skill_path = root.join(BUNDLED_SKILL_NAME).join(BUNDLED_SKILL_FILENAME);
         fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
         fs::write(&skill_path, BUNDLED_SKILL_CONTENTS).unwrap();
-        let install_state = InstallState {
-            version: INSTALL_STATE_VERSION,
-            bundle_revision: INSTALL_BUNDLE_REVISION,
-            skill_signature: Some(bundled_skill_signature()),
-            skill_path: canonicalize_existing_path(&skill_path).unwrap(),
-            db_path: root.join("db.cupld"),
-            root: root.join("notes"),
-        };
+        let install_record = test_install_record(
+            canonicalize_existing_path(&skill_path).unwrap(),
+            root.join("db.cupld"),
+            root.join("notes"),
+        );
+        let install_state = test_install_state(install_record.clone());
         fs::write(
             config_dir.join(INSTALL_STATE_FILE),
             render_install_state(&install_state),
@@ -1716,7 +2041,7 @@ mod tests {
             state,
             PromptState {
                 install_state: Some(install_state.clone()),
-                installed_skill_path: Some(install_state.skill_path),
+                installed_skill_path: Some(install_record.skill_path),
                 prompt_disabled: false,
             }
         );

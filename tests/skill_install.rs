@@ -40,6 +40,12 @@ impl Drop for TempDir {
     }
 }
 
+fn quoted_path(path: &Path) -> String {
+    let mut output = String::new();
+    cupld::json::write_quoted_string(&mut output, &path.display().to_string());
+    output
+}
+
 #[test]
 fn cli_install_skill_writes_bundled_skill_and_records_state() {
     let home = TempDir::new("home");
@@ -183,6 +189,91 @@ fn cli_install_skill_supports_provider_home_and_cwd_scopes() {
             .join(".claude/skills/cupld-md-memory/SKILL.md")
             .exists()
     );
+}
+
+#[test]
+fn cli_install_skill_records_multiple_provider_scope_installs() {
+    let home = TempDir::new("home_multi");
+    let config = TempDir::new("config_multi");
+    let workspace = TempDir::new("workspace_multi");
+    let codex_db = workspace.path().join(".cupld").join("codex.cupld");
+    let codex_root = workspace.path().join(".cupld").join("codex-data");
+    let claude_db = workspace.path().join(".cupld").join("claude.cupld");
+    let claude_root = workspace.path().join(".cupld").join("claude-data");
+
+    let codex_output = Command::new(env!("CARGO_BIN_EXE_cupld"))
+        .args([
+            "install",
+            "--target",
+            "codex",
+            "--scope",
+            "home",
+            "--db",
+            codex_db.to_str().unwrap(),
+            "--root",
+            codex_root.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env(
+            if cfg!(windows) {
+                "APPDATA"
+            } else {
+                "XDG_CONFIG_HOME"
+            },
+            config.path(),
+        )
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    assert!(codex_output.status.success());
+
+    let claude_output = Command::new(env!("CARGO_BIN_EXE_cupld"))
+        .args([
+            "install",
+            "--target",
+            "claude",
+            "--scope",
+            "cwd",
+            "--db",
+            claude_db.to_str().unwrap(),
+            "--root",
+            claude_root.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env(
+            if cfg!(windows) {
+                "APPDATA"
+            } else {
+                "XDG_CONFIG_HOME"
+            },
+            config.path(),
+        )
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    assert!(claude_output.status.success());
+
+    let install_state =
+        fs::read_to_string(config.path().join(".cupld").join("install-state.toml")).unwrap();
+    assert!(install_state.contains("version = 3"));
+    assert_eq!(install_state.matches("[[install]]").count(), 2);
+
+    let codex_skill = home
+        .path()
+        .join(".agents/skills/cupld-md-memory/SKILL.md")
+        .canonicalize()
+        .unwrap();
+    let claude_skill = workspace
+        .path()
+        .join(".claude/skills/cupld-md-memory/SKILL.md")
+        .canonicalize()
+        .unwrap();
+    assert!(install_state.contains(&quoted_path(&codex_skill)));
+    assert!(install_state.contains(&quoted_path(&codex_db.canonicalize().unwrap())));
+    assert!(install_state.contains(&quoted_path(&codex_root.canonicalize().unwrap())));
+    assert!(install_state.contains(&quoted_path(&claude_skill)));
+    assert!(install_state.contains(&quoted_path(&claude_db.canonicalize().unwrap())));
+    assert!(install_state.contains(&quoted_path(&claude_root.canonicalize().unwrap())));
 }
 
 #[test]

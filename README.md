@@ -127,7 +127,9 @@ cupld install --target opencode --scope home --db default
 cupld install --path /custom/skills --db default --yes
 ```
 
-The interactive installer asks for a skill location, DB path, and markdown root. Interactive REPL launches can also offer the same bootstrap flow once.
+The interactive installer asks for a skill location, DB path, and markdown root. Interactive REPL launches can offer the same bootstrap flow when no install is tracked, and can prompt to refresh when the bundled skill becomes stale.
+
+`install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in the user config `install-state.toml`. That state lets REPL startup reuse saved paths for refresh prompts. If the state file is corrupt or points at the wrong install, rerun `cupld install ...` with the desired target/path, DB, and root to rewrite it.
 
 Repo-local package settings live in `.cupld/config.toml`. `install` and markdown-aware commands use it as the workspace default for DB path and markdown root.
 
