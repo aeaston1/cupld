@@ -147,6 +147,10 @@ fn run() -> Result<(), String> {
             print_help();
             Ok(())
         }
+        CliCommand::Version => {
+            print_version();
+            Ok(())
+        }
         CliCommand::ReplMemory => run_repl(None),
         CliCommand::ReplWithDb(path) => run_repl(Some(path)),
         CliCommand::Visualise { db_path, query } => run_visualise(db_path, query),
@@ -204,6 +208,7 @@ fn run() -> Result<(), String> {
 #[derive(Debug, PartialEq, Eq)]
 enum CliCommand {
     Help,
+    Version,
     ReplMemory,
     ReplWithDb(PathBuf),
     Visualise {
@@ -256,6 +261,17 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         Some("help") | Some("-h") | Some("--help") => {
             if args.len() == 1 {
                 Ok(CliCommand::Help)
+            } else {
+                Err(format!(
+                    "error: `{}` does not accept additional arguments\n\n{}",
+                    args[0],
+                    cli_usage_text()
+                ))
+            }
+        }
+        Some("-v") | Some("--version") => {
+            if args.len() == 1 {
+                Ok(CliCommand::Version)
             } else {
                 Err(format!(
                     "error: `{}` does not accept additional arguments\n\n{}",
@@ -830,6 +846,7 @@ fn parse_top_level_command(args: &[String]) -> Result<CliCommand, String> {
                 index += 2;
             }
             "-h" | "--help" | "help" => return Ok(CliCommand::Help),
+            "-v" | "--version" => return Ok(CliCommand::Version),
             other if other.starts_with('-') => {
                 return Err(format!(
                     "error: unknown option `{}`\n\n{}",
@@ -874,29 +891,23 @@ fn print_help() {
     println!("{}", cli_usage_text());
 }
 
+fn print_version() {
+    println!("{}", version_text());
+}
+
+fn version_text() -> &'static str {
+    concat!("cupld ", env!("CARGO_PKG_VERSION"))
+}
+
 fn cli_usage_text() -> &'static str {
     "cupld is a local graph database CLI and REPL.
 
 Usage:
-  cupld
-  cupld <path.cupld>
-  cupld --db <path.cupld|default>
-  cupld --visualise <path.cupld>
-  cupld <path.cupld> --visualise
-  cupld --visualise --db <path.cupld|default>
-  cupld --db <path.cupld|default> --visualise
-  cupld --visualise --db <path.cupld|default> --query 'MATCH (n) RETURN n LIMIT 10'
-  cupld query --db <path.cupld|default> [--with-markdown] [--root <path>] [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
-  cupld context --db <path.cupld|default> [--top-k <n>] [--output <table|json|ndjson>]
-  cupld schema --db <path.cupld|default>
-  cupld compact --db <path.cupld|default>
-  cupld check --db <path.cupld|default>
-  cupld sync markdown --db <path.cupld|default> [--root <path>] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
-  cupld source set-root --db <path.cupld|default> <path>
-  cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld|default>] [--root <path>] [--force] [--yes]
-  cupld -h
-  cupld --help
-  cupld help
+  cupld [<path.cupld>]
+  cupld --db <path.cupld|default> [--visualise [--query <query>]]
+  cupld <command> [options]
+  cupld -v|--version
+  cupld -h|--help|help
 
 Commands:
   cupld                   Start an in-memory REPL session.
@@ -924,28 +935,8 @@ Commands:
   sync markdown           Materialize markdown documents into --db and optionally watch for changes.
   source set-root         Persist the default markdown root in --db.
   install                 Install the bundled cupld-md-memory SKILL.md and bootstrap local cupld memory.
+  -v, --version           Print the cupld version.
   -h, --help, help        Show this help text.
-
-Examples:
-  cupld
-  cupld sample.cupld
-  cupld --db default
-  cupld --visualise sample.cupld
-  cupld --visualise --db default --query 'MATCH (n:Person) RETURN n LIMIT 10'
-  cupld --db default --visualise
-  cupld query --db default --output json 'MATCH (n) RETURN n'
-  cupld query --db default --params-json '{\"name\":\"Ada\"}' 'MATCH (n:Person {name: $name}) RETURN n'
-  cupld query --db default --with-markdown --root notes 'MATCH (n) RETURN n'
-  cupld context --db default --top-k 25
-  echo 'MATCH (n) RETURN n' | cupld query --db default
-  cupld schema --db default
-  cupld sync markdown --db default
-  cupld sync markdown --db default --watch --idle-ms 500 --max-runs 2
-  cupld source set-root --db default notes
-  cupld install
-  cupld install --target codex --scope home --db default
-  cupld install --target claude --scope cwd --db default --root notes
-  cupld install --path ~/.claude/skills --db default --yes
 
 REPL:
   Run .help inside the REPL for interactive commands."
@@ -1715,7 +1706,7 @@ mod tests {
     use super::{
         CliCommand, InputEvent, OutputFormat, ReplInput, cap_results, cli_usage_text,
         format_error_json, parse_cli_command, parse_params_json, result_as_json, result_as_ndjson,
-        should_offer_skill_install_prompt, table_value,
+        should_offer_skill_install_prompt, table_value, version_text,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
     use cupld::{QueryResult, RuntimeValue, Value, json};
@@ -2287,26 +2278,38 @@ mod tests {
     }
 
     #[test]
-    fn help_text_includes_sections_commands_and_examples() {
+    fn parses_version_flags() {
+        assert_eq!(
+            parse_cli_command(&["-v".to_owned()]),
+            Ok(CliCommand::Version)
+        );
+        assert_eq!(
+            parse_cli_command(&["--version".to_owned()]),
+            Ok(CliCommand::Version)
+        );
+        assert_eq!(version_text(), concat!("cupld ", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn help_text_includes_core_sections_and_flags() {
         let help = cli_usage_text();
 
         assert!(help.contains("Usage:"));
         assert!(help.contains("Commands:"));
-        assert!(help.contains("Examples:"));
         assert!(help.contains("REPL:"));
         assert!(help.contains("cupld --db <path.cupld|default>"));
-        assert!(help.contains("cupld --visualise <path.cupld>"));
-        assert!(help.contains("cupld --db <path.cupld|default> --visualise"));
-        assert!(help.contains("cupld --visualise --db <path.cupld|default> --query"));
-        assert!(help.contains("cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld|default>] [--root <path>] [--force] [--yes]"));
+        assert!(help.contains("[--visualise [--query <query>]]"));
+        assert!(help.contains("cupld -v|--version"));
+        assert!(help.contains("-v, --version"));
         assert!(help.contains("`default` maps to `./.cupld/default.cupld`."));
         assert!(help.contains(
             "Install the bundled cupld-md-memory SKILL.md and bootstrap local cupld memory."
         ));
         assert!(help.contains("Seed the scene with one read-only RETURN query."));
         assert!(help.contains("Run a query against --db using inline text or stdin."));
-        assert!(help.contains("echo 'MATCH (n) RETURN n' | cupld query --db default"));
         assert!(help.contains("Run .help inside the REPL for interactive commands."));
+        assert_eq!(help.matches("Usage:").count(), 1);
+        assert_eq!(help.matches("Commands:").count(), 1);
     }
 
     #[test]
@@ -2320,10 +2323,19 @@ mod tests {
 
     #[test]
     fn errors_for_unknown_option() {
-        let args = vec!["--version".to_owned()];
+        let args = vec!["--wat".to_owned()];
         assert!(matches!(
             parse_cli_command(&args),
             Err(error) if error.contains("unknown option")
+        ));
+    }
+
+    #[test]
+    fn errors_for_version_with_extra_args() {
+        let args = vec!["--version".to_owned(), "extra".to_owned()];
+        assert!(matches!(
+            parse_cli_command(&args),
+            Err(error) if error.contains("does not accept additional arguments")
         ));
     }
 

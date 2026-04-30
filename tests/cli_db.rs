@@ -132,6 +132,38 @@ fn seed_workspace_default_db(workspace: &Path) -> PathBuf {
 }
 
 #[test]
+fn cli_version_flags_print_package_version() {
+    for flag in ["--version", "-v"] {
+        let output = run_cli(&[flag]);
+        assert!(
+            output.status.success(),
+            "{flag} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            concat!("cupld ", env!("CARGO_PKG_VERSION"), "\n")
+        );
+    }
+}
+
+#[test]
+fn cli_help_flags_print_one_help_block() {
+    for flag in ["--help", "-h"] {
+        let output = run_cli(&[flag]);
+        assert!(
+            output.status.success(),
+            "{flag} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.matches("Usage:").count(), 1);
+        assert_eq!(stdout.matches("Commands:").count(), 1);
+        assert!(!stdout.contains("Examples:"));
+    }
+}
+
+#[test]
 fn cli_repl_creates_a_new_db_when_path_is_missing() {
     let db = TempPath::new("cli_new_db");
     assert!(!db.path().exists());
