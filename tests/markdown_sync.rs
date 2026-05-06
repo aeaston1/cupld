@@ -322,6 +322,40 @@ fn resolves_links_through_index_slug_case_and_url_candidates() {
 }
 
 #[test]
+fn resolves_docs_site_paths_to_lowercase_index_layouts() {
+    let db = TestDb::new("markdown_docs_site_path_layout");
+    let root = temp_dir("markdown_docs_site_path_layout");
+    fs::create_dir_all(root.join("web/javascript/guide")).unwrap();
+    fs::write(
+        root.join("web/javascript/guide/index.md"),
+        "# JavaScript Guide",
+    )
+    .unwrap();
+    fs::write(
+        root.join("source.md"),
+        "[guide](/en-US/docs/Web/JavaScript/Guide)",
+    )
+    .unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![RuntimeValue::String(
+            "web/javascript/guide/index.md".to_owned()
+        )]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unresolved_external_urls_create_no_link_edges() {
     let db = TestDb::new("markdown_external_url_unresolved");
     let root = temp_dir("markdown_external_url_unresolved");
