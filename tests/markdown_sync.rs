@@ -258,6 +258,94 @@ aliases: [Shared]\n\
 }
 
 #[test]
+fn resolves_links_through_index_slug_case_and_url_candidates() {
+    let db = TestDb::new("markdown_enhanced_link_resolution");
+    let root = temp_dir("markdown_enhanced_link_resolution");
+    fs::create_dir_all(root.join("foo/bar")).unwrap();
+    fs::create_dir_all(root.join("Guides")).unwrap();
+    fs::create_dir_all(root.join("games/tutorials")).unwrap();
+    fs::write(root.join("foo/bar/index.md"), "# Index").unwrap();
+    fs::write(root.join("Guides/Topic.md"), "# Case Target").unwrap();
+    fs::write(
+        root.join("games/tutorials/index.md"),
+        "---\nslug: Games/Tutorials\n---\n# Tutorials",
+    )
+    .unwrap();
+    fs::write(
+        root.join("source.md"),
+        "[index](foo/bar)\n\
+         [root-index](/foo/bar)\n\
+         [case](/guides/topic)\n\
+         [slug](/en-US/docs/Games/Tutorials)\n\
+         [url](https://developer.mozilla.org/en-US/docs/Games/Tutorials?x=1#intro)\n\
+         [external](https://example.com/not-in-vault)\n",
+    )
+    .unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`, e.`md.link_targets`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                RuntimeValue::String("Guides/Topic.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("/guides/topic".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("foo/bar/index.md".to_owned()),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("foo/bar".to_owned()),
+                    RuntimeValue::String("/foo/bar".to_owned()),
+                ]),
+            ],
+            vec![
+                RuntimeValue::String("games/tutorials/index.md".to_owned()),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("/en-US/docs/Games/Tutorials".to_owned()),
+                    RuntimeValue::String(
+                        "https://developer.mozilla.org/en-US/docs/Games/Tutorials?x=1#intro"
+                            .to_owned(),
+                    ),
+                ]),
+            ],
+        ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unresolved_external_urls_create_no_link_edges() {
+    let db = TestDb::new("markdown_external_url_unresolved");
+    let root = temp_dir("markdown_external_url_unresolved");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("source.md"),
+        "[external](https://example.com/not-in-vault?x=1#section)",
+    )
+    .unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_LINKS_TO]->(:MarkdownDocument)
+         RETURN count(e)",
+    );
+    assert_eq!(result.rows, vec![vec![RuntimeValue::Int(0)]]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn fragment_only_links_are_ignored_but_document_fragments_still_link_documents() {
     let db = TestDb::new("markdown_fragment_links");
     let root = temp_dir("markdown_fragment_links");
