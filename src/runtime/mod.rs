@@ -16,7 +16,6 @@ use crate::query::{
 use crate::regex_lite::RegexLite;
 use crate::storage;
 
-const DEFAULT_ROW_LIMIT: usize = 1_000;
 const INTERMEDIATE_ROW_LIMIT: usize = 100_000;
 
 #[derive(Clone, Debug)]
@@ -1063,8 +1062,9 @@ impl Session {
         if !order_by.is_empty() {
             rows.sort_by(|left, right| self.compare_rows(left, right, order_by, params));
         }
-        let limit = limit.unwrap_or(DEFAULT_ROW_LIMIT).min(DEFAULT_ROW_LIMIT);
-        if rows.len() > limit {
+        if let Some(limit) = limit
+            && rows.len() > limit
+        {
             rows.truncate(limit);
         }
         rows
@@ -3718,6 +3718,38 @@ mod tests {
                 RuntimeValue::String("Grace".to_owned())
             ]]
         );
+    }
+
+    #[test]
+    fn match_return_rows_are_not_capped_at_one_thousand() {
+        let mut session = Session::new_in_memory();
+        for _ in 0..1_005 {
+            session
+                .execute_script("CREATE (n:Item)", &BTreeMap::new())
+                .unwrap();
+        }
+
+        let results = session
+            .execute_script("MATCH (n:Item) RETURN n", &BTreeMap::new())
+            .unwrap();
+
+        assert_eq!(results[0].rows.len(), 1_005);
+    }
+
+    #[test]
+    fn explicit_limit_can_exceed_one_thousand() {
+        let mut session = Session::new_in_memory();
+        for _ in 0..1_005 {
+            session
+                .execute_script("CREATE (n:Item)", &BTreeMap::new())
+                .unwrap();
+        }
+
+        let results = session
+            .execute_script("MATCH (n:Item) RETURN n LIMIT 1002", &BTreeMap::new())
+            .unwrap();
+
+        assert_eq!(results[0].rows.len(), 1_002);
     }
 
     #[test]
