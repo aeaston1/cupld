@@ -12,7 +12,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `--db default` to target `./.cupld/default.cupld`.
 - Use `cupld query --db <path.cupld|default> ...` for one-shot automation and `cupld context --db <path.cupld|default> ...` for top-k context rows.
 - Use `cupld mcp serve --db <path.cupld|default>` for MCP-capable harnesses that can call local memory tools over stdio.
-- Use `cupld query --db ... --with-markdown` for transient markdown overlay reads.
+- Use `cupld query --db ... --with-md` for transient markdown overlay reads.
 - Use `cupld sync markdown --db ...` to persist markdown and `cupld sync markdown --db ... --watch` to keep syncing after the initial run.
 - Use `cupld schema --db ...` and `cupld check --db ...` before making automation assumptions about a database.
 - Opening or checking a database from an older `cupld` release may upgrade the `.cupld` file in place. Treat on-disk databases as forward-only during beta if rollback matters.
@@ -30,7 +30,7 @@ cupld <path.cupld> --visualise
 cupld --visualise --db <path.cupld|default>
 cupld --db <path.cupld|default> --visualise
 cupld --visualise --db <path.cupld|default> --query 'MATCH (n) RETURN n LIMIT 10'
-cupld query --db <path.cupld|default> [--with-markdown] [--root <path>] [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
+cupld query --db <path.cupld|default> [--with-md] [--root <path>] [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
 cupld context --db <path.cupld|default> [--top-k <n>] [--output <table|json|ndjson>]
 cupld schema --db <path.cupld|default>
 cupld compact --db <path.cupld|default>
@@ -121,7 +121,7 @@ For safe automation, prefer this order:
 2. `cupld schema --db default`
 3. `cupld query --db default --output json 'MATCH (n) RETURN n ORDER BY id(n) LIMIT 10'`
 4. `cupld context --db default --top-k 25 --output json` when prompt assembly needs a bounded context window
-5. `cupld query --db default --with-markdown ...` when you want markdown overlaid without persisting it
+5. `cupld query --db default --with-md ...` when you want markdown overlaid without persisting it
 6. `cupld sync markdown --db default` or `cupld sync markdown --db default --watch ...` when later plain queries should see persisted markdown state
 
 Use explicit transactions for multi-statement batches. Outside a transaction, mutating statements commit immediately.
@@ -326,7 +326,7 @@ Markdown root resolution order is:
 
 Markdown behavior:
 
-- `cupld query --with-markdown` overlays markdown into a temporary query session and does not persist imported notes.
+- `cupld query --with-md` overlays markdown into a temporary query session and does not persist imported notes.
 - `cupld sync markdown` persists markdown documents and `:MD_LINKS_TO` edges from body links plus supported frontmatter relationship keys into the database.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
 - `--poll-ms` controls the poll interval.
@@ -339,7 +339,7 @@ Markdown behavior:
 Useful commands:
 
 ```bash
-cupld query --db default --with-markdown \
+cupld query --db default --with-md \
   "MATCH (d:MarkdownDocument) RETURN d.`src.path`, d.`md.title` ORDER BY d.`src.path`"
 ```
 

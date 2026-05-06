@@ -1,6 +1,6 @@
 ---
 name: cupld-md-memory
-description: "Use when an agent has the `cupld` binary and needs local graph memory through the cupld MCP server, or needs to treat a markdown vault as memory with `cupld query --with-markdown` and `cupld sync markdown`."
+description: "Use when an agent has the `cupld` binary and needs local graph memory through the cupld MCP server, or needs to treat a markdown vault as memory with `cupld query --with-md` and `cupld sync markdown`."
 ---
 
 # cupld-md-memory
@@ -21,7 +21,7 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 - MCP `--read-only` disables `memory_sync` and `memory_add`.
 - `cupld install` and `source set-root` keep repo-local defaults in `.cupld/config.toml`.
 - The skill install location (`.agents/skills`, `.claude/skills`, or a custom path) is separate from the DB path and markdown root. Installing the skill elsewhere does not move `./.cupld/default.cupld` or `./.cupld/data/`.
-- `cupld query --with-markdown` overlays markdown into a temporary query session and does not persist the imported notes.
+- `cupld query --with-md` overlays markdown into a temporary query session and does not persist the imported notes.
 - `cupld sync markdown` persists markdown documents and markdown link edges into the `.cupld` database.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes with `--poll-ms`, `--debounce-ms`, `--batch-ms`, `--idle-ms`, and `--max-runs`.
 - `cupld query --db ...` requires an existing database file. If the DB is missing, create it first with `cupld <path.cupld>`.
@@ -58,12 +58,12 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
    ```
 6. For a one-off CLI root override, pass `--root` directly.
    ```bash
-   cupld query --db default --with-markdown --root /absolute/path/to/notes \
+   cupld query --db default --with-md --root /absolute/path/to/notes \
      "MATCH (d:MarkdownDocument) RETURN d.\`src.path\`, d.\`md.title\` ORDER BY d.\`src.path\`"
    ```
 7. After editing notes without MCP, use overlay queries for transient reads.
    ```bash
-   cupld query --db default --with-markdown \
+   cupld query --db default --with-md \
      "MATCH (d:MarkdownDocument) RETURN d.\`src.path\`, d.\`md.title\` ORDER BY d.\`src.path\`"
    ```
 8. Persist markdown when you want later plain queries or MCP reads to see it.
@@ -205,7 +205,7 @@ For persisted markdown-heavy workloads, the same schema surface supports optiona
 List markdown docs:
 
 ```bash
-cupld query --db default --with-markdown \
+cupld query --db default --with-md \
   "MATCH (d:MarkdownDocument)
    RETURN d.\`src.path\`, d.\`md.title\`, d.\`src.status\`
    ORDER BY d.\`src.path\`"
@@ -214,7 +214,7 @@ cupld query --db default --with-markdown \
 Look up one note by path:
 
 ```bash
-cupld query --db default --with-markdown \
+cupld query --db default --with-md \
   "MATCH (d:MarkdownDocument { \`src.path\`: 'projects/cupld-rollout.md' })
    RETURN d.\`md.title\`, d.\`md.tags\`, d.\`md.headings\`, d.\`md.body\`"
 ```
@@ -222,7 +222,7 @@ cupld query --db default --with-markdown \
 Traverse outlinks:
 
 ```bash
-cupld query --db default --with-markdown \
+cupld query --db default --with-md \
   "MATCH (a:MarkdownDocument)-[e:MD_LINKS_TO]->(b:MarkdownDocument)
    RETURN a.\`src.path\`, e.\`md.link_target\`, e.\`md.link_sources\`, e.\`md.link_rels\`, b.\`src.path\`
    ORDER BY a.\`src.path\`, b.\`src.path\`"
@@ -231,7 +231,7 @@ cupld query --db default --with-markdown \
 Inspect frontmatter-driven relationships and aliases:
 
 ```bash
-cupld query --db default --with-markdown \
+cupld query --db default --with-md \
   "MATCH (d:MarkdownDocument { \`src.path\`: 'projects/cupld-rollout.md' })
    RETURN d.\`md.title\`, d.\`md.aliases\`, d.\`md.links\`, d.\`md.frontmatter\`"
 ```
@@ -239,7 +239,7 @@ cupld query --db default --with-markdown \
 Traverse backlinks:
 
 ```bash
-cupld query --db default --with-markdown \
+cupld query --db default --with-md \
   "MATCH (a:MarkdownDocument)-[:MD_LINKS_TO]->(b:MarkdownDocument { \`src.path\`: 'notes/schema-notes.md' })
    RETURN a.\`src.path\`
    ORDER BY a.\`src.path\`"
@@ -248,7 +248,7 @@ cupld query --db default --with-markdown \
 Join native graph data to markdown notes:
 
 ```bash
-cupld query --db default --with-markdown \
+cupld query --db default --with-md \
   "MATCH (topic)-[:REFERENCES]->(d:MarkdownDocument)
    RETURN topic.name, d.\`src.path\`, d.\`md.title\`, d.\`src.status\`"
 ```
@@ -265,7 +265,7 @@ cupld query --db default \
 Create native graph edges pointing at markdown docs:
 
 ```bash
-cat <<'EOF' | cupld query --db default --with-markdown
+cat <<'EOF' | cupld query --db default --with-md
 BEGIN;
 MATCH (d:MarkdownDocument {`src.path`: 'projects/cupld-rollout.md'})
 CREATE (:Topic {name: 'Rollout'})-[:REFERENCES]->(d);

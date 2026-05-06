@@ -379,9 +379,9 @@ fn parse_query_command(args: &[String]) -> Result<CliCommand, String> {
                 db_path = Some(parse_db_flag_value(path)?);
                 index += 2;
             }
-            "--with-markdown" => {
+            "--with-md" => {
                 if with_markdown {
-                    return Err("duplicate option `--with-markdown`".to_owned());
+                    return Err("duplicate option `--with-md`".to_owned());
                 }
                 with_markdown = true;
                 index += 1;
@@ -1036,7 +1036,7 @@ Commands:
   --query                 Seed the scene with one read-only RETURN query.
   query                   Run a query against --db using inline text or stdin.
   context                 Build compact context rows (top-k nodes) for agent prompts.
-  --with-markdown         Overlay markdown documents into `query` before execution.
+  --with-md               Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
   --watch                 Keep polling markdown for changes after the initial sync.
   --poll-ms               Poll interval for `sync markdown --watch`.

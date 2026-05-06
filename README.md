@@ -116,7 +116,7 @@ Watch markdown after the initial persisted sync:
 cupld sync markdown --db default --root notes --watch --idle-ms 500 --max-runs 2
 ```
 
-Use `cupld query --with-markdown` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state.
+Use `cupld query --with-md` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state.
 
 Install into a provider-specific skills directory or a custom path:
 
