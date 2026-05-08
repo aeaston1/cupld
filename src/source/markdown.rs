@@ -54,7 +54,11 @@ impl MarkdownLinkSource {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct MarkdownResolutionIndex {
     direct: BTreeMap<String, String>,
+    derived_paths: BTreeMap<String, Option<String>>,
     aliases: BTreeMap<String, Option<String>>,
+    slugs: BTreeMap<String, Option<String>>,
+    case_folded_paths: BTreeMap<String, Option<String>>,
+    path_style_paths: BTreeMap<String, Option<String>>,
 }
 
 impl MarkdownResolutionIndex {
@@ -62,30 +66,74 @@ impl MarkdownResolutionIndex {
         self.direct.entry(key).or_insert(target);
     }
 
+    fn insert_derived_path(&mut self, key: &str, target: &str) {
+        insert_collision_aware(&mut self.derived_paths, key, target);
+    }
+
     fn insert_alias(&mut self, key: &str, target: &str) {
-        let trimmed = key.trim();
-        if trimmed.is_empty() {
+        insert_collision_aware(&mut self.aliases, key, target);
+    }
+
+    fn insert_slug(&mut self, key: &str, target: &str) {
+        insert_collision_aware(&mut self.slugs, key, target);
+    }
+
+    fn insert_case_folded_path(&mut self, key: &str, target: &str) {
+        let folded = key.trim().to_lowercase();
+        insert_collision_aware(&mut self.case_folded_paths, &folded, target);
+    }
+
+    fn insert_path_style_path(&mut self, key: &str, target: &str) {
+        let Some(key) = path_style_key(key) else {
             return;
-        }
-        match self.aliases.get(trimmed) {
-            Some(Some(existing)) if existing != target => {
-                self.aliases.insert(trimmed.to_owned(), None);
-            }
-            Some(None) | Some(Some(_)) => {}
-            None => {
-                self.aliases
-                    .insert(trimmed.to_owned(), Some(target.to_owned()));
-            }
-        }
+        };
+        insert_collision_aware(&mut self.path_style_paths, &key, target);
     }
 
     fn resolve_direct(&self, key: &str) -> Option<String> {
         self.direct.get(key).cloned()
     }
 
-    fn resolve_alias(&self, key: &str) -> Option<String> {
-        self.aliases.get(key).and_then(|target| target.clone())
+    fn resolve_derived_path(&self, key: &str) -> Option<String> {
+        resolve_collision_aware(&self.derived_paths, key)
     }
+
+    fn resolve_alias(&self, key: &str) -> Option<String> {
+        resolve_collision_aware(&self.aliases, key)
+    }
+
+    fn resolve_slug(&self, key: &str) -> Option<String> {
+        resolve_collision_aware(&self.slugs, key)
+    }
+
+    fn resolve_case_folded_path(&self, key: &str) -> Option<String> {
+        resolve_collision_aware(&self.case_folded_paths, &key.trim().to_lowercase())
+    }
+
+    fn resolve_path_style_path(&self, key: &str) -> Option<String> {
+        let key = path_style_key(key)?;
+        resolve_collision_aware(&self.path_style_paths, &key)
+    }
+}
+
+fn insert_collision_aware(map: &mut BTreeMap<String, Option<String>>, key: &str, target: &str) {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match map.get(trimmed) {
+        Some(Some(existing)) if existing != target => {
+            map.insert(trimmed.to_owned(), None);
+        }
+        Some(None) | Some(Some(_)) => {}
+        None => {
+            map.insert(trimmed.to_owned(), Some(target.to_owned()));
+        }
+    }
+}
+
+fn resolve_collision_aware(map: &BTreeMap<String, Option<String>>, key: &str) -> Option<String> {
+    map.get(key.trim()).and_then(|target| target.clone())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1288,7 +1336,7 @@ fn extract_markdown_links(body: &str, links: &mut Vec<String>) {
             break;
         };
         let target = body[open_target..open_target + close_target].trim();
-        if !target.is_empty() && !target.contains("://") && !target.starts_with('#') {
+        if !target.is_empty() && !target.starts_with('#') {
             push_unique(links, target.to_owned());
         }
         index = open_target + close_target + 1;
@@ -1338,13 +1386,29 @@ fn build_resolution_index(documents: &[MarkdownDocument]) -> MarkdownResolutionI
     for document in documents {
         let relative = path_to_string(&document.path);
         index.insert_direct(relative.clone(), relative.clone());
+        index.insert_case_folded_path(&relative, &relative);
+        index.insert_path_style_path(&relative, &relative);
+
         let without_extension = strip_markdown_extension(&relative);
         index.insert_direct(without_extension.clone(), relative.clone());
+        index.insert_case_folded_path(&without_extension, &relative);
+        index.insert_path_style_path(&without_extension, &relative);
+
+        if let Some(index_key) = index_document_parent_key(&document.path) {
+            index.insert_derived_path(&index_key, &relative);
+            index.insert_case_folded_path(&index_key, &relative);
+            index.insert_path_style_path(&index_key, &relative);
+        }
+
         if let Some(stem) = document.path.file_stem().and_then(|value| value.to_str()) {
             index.insert_direct(stem.to_owned(), relative.clone());
+            index.insert_case_folded_path(stem, &relative);
         }
         for alias in &document.aliases {
             index.insert_alias(alias, &relative);
+        }
+        if let Some(slug) = extract_frontmatter_string(document.frontmatter.as_ref(), &["slug"]) {
+            insert_slug_candidates(&mut index, &slug, &relative);
         }
     }
     index
@@ -1355,31 +1419,213 @@ fn resolve_link_path(
     raw_link: &str,
     index: &MarkdownResolutionIndex,
 ) -> Option<String> {
-    let mut target = raw_link.split('|').next()?.trim();
-    target = target.split('#').next()?.trim();
+    let target = normalize_resolution_target(raw_link)?;
     if target.is_empty() {
         return None;
     }
+    let target = target.as_str();
+    let stripped_target = strip_markdown_extension(target);
 
     let path_target = Path::new(target);
+    let mut candidate_paths = Vec::new();
     if let Some(normalized) = resolve_relative_link(current_path, path_target) {
         let string_path = path_to_string(&normalized);
+        push_unique(&mut candidate_paths, string_path.clone());
         if let Some(found) = index.resolve_direct(&string_path) {
             return Some(found);
         }
         let without_extension = strip_markdown_extension(&string_path);
+        push_unique(&mut candidate_paths, without_extension.clone());
         if let Some(found) = index.resolve_direct(&without_extension) {
+            return Some(found);
+        }
+        if let Some(found) = index
+            .resolve_derived_path(&string_path)
+            .or_else(|| index.resolve_derived_path(&without_extension))
+        {
             return Some(found);
         }
     }
 
-    index.resolve_direct(target).or_else(|| {
-        let normalized = strip_markdown_extension(target);
-        index
-            .resolve_direct(&normalized)
-            .or_else(|| index.resolve_alias(target))
-            .or_else(|| index.resolve_alias(&normalized))
-    })
+    push_unique(&mut candidate_paths, target.to_owned());
+    push_unique(&mut candidate_paths, stripped_target.clone());
+
+    if let Some(found) = index
+        .resolve_direct(target)
+        .or_else(|| index.resolve_direct(&stripped_target))
+        .or_else(|| index.resolve_derived_path(target))
+        .or_else(|| index.resolve_derived_path(&stripped_target))
+    {
+        return Some(found);
+    }
+
+    for candidate in slug_resolution_candidates(target) {
+        if let Some(found) = index.resolve_slug(&candidate) {
+            return Some(found);
+        }
+    }
+
+    if let Some(found) = index
+        .resolve_alias(target)
+        .or_else(|| index.resolve_alias(&stripped_target))
+    {
+        return Some(found);
+    }
+
+    for candidate in &candidate_paths {
+        if let Some(found) = index.resolve_case_folded_path(candidate) {
+            return Some(found);
+        }
+    }
+
+    for candidate in &candidate_paths {
+        if let Some(found) = index.resolve_path_style_path(candidate) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn normalize_resolution_target(raw_link: &str) -> Option<String> {
+    let target = raw_link.split('|').next()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    if target.contains("://") {
+        return extract_url_path(target);
+    }
+    let target = strip_query_and_fragment(target).trim();
+    if target.is_empty() {
+        None
+    } else {
+        Some(target.to_owned())
+    }
+}
+
+fn extract_url_path(target: &str) -> Option<String> {
+    let scheme_end = target.find("://")?;
+    let after_scheme = &target[scheme_end + 3..];
+    let path_start = after_scheme.find('/')?;
+    let path = strip_query_and_fragment(&after_scheme[path_start..]).trim();
+    if path.is_empty() || path == "/" {
+        None
+    } else {
+        Some(path.to_owned())
+    }
+}
+
+fn strip_query_and_fragment(target: &str) -> &str {
+    let query = target.find('?');
+    let fragment = target.find('#');
+    let end = match (query, fragment) {
+        (Some(query), Some(fragment)) => query.min(fragment),
+        (Some(index), None) | (None, Some(index)) => index,
+        (None, None) => target.len(),
+    };
+    &target[..end]
+}
+
+fn index_document_parent_key(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name.eq_ignore_ascii_case("index.md") {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(path_to_string(parent))
+}
+
+fn insert_slug_candidates(index: &mut MarkdownResolutionIndex, slug: &str, target: &str) {
+    for candidate in slug_resolution_candidates(slug) {
+        index.insert_slug(&candidate, target);
+    }
+}
+
+fn slug_resolution_candidates(target: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return candidates;
+    }
+    push_unique(&mut candidates, trimmed.to_owned());
+
+    let without_leading_slash = trimmed.trim_start_matches('/');
+    push_unique(&mut candidates, without_leading_slash.to_owned());
+    push_unique(&mut candidates, format!("/{without_leading_slash}"));
+    push_unique(&mut candidates, format!("docs/{without_leading_slash}"));
+    push_unique(&mut candidates, format!("/docs/{without_leading_slash}"));
+    push_unique(
+        &mut candidates,
+        format!("en-US/docs/{without_leading_slash}"),
+    );
+    push_unique(
+        &mut candidates,
+        format!("/en-US/docs/{without_leading_slash}"),
+    );
+
+    candidates
+}
+
+fn path_style_key(path: &str) -> Option<String> {
+    let mut normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+    normalized = strip_markdown_extension(&normalized);
+    let trimmed = normalized.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_index = trimmed.strip_suffix("/index").unwrap_or(trimmed);
+    let without_site_prefix = strip_site_path_prefix(without_index);
+    let key = without_site_prefix
+        .trim_matches('/')
+        .to_lowercase()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if key.is_empty() { None } else { Some(key) }
+}
+
+fn strip_site_path_prefix(path: &str) -> &str {
+    if let Some(rest) = path.strip_prefix("docs/") {
+        return rest;
+    }
+    if path
+        .get(..5)
+        .map(|prefix| prefix.eq_ignore_ascii_case("docs/"))
+        .unwrap_or(false)
+    {
+        return &path[5..];
+    }
+
+    let mut segments = path.splitn(3, '/');
+    let Some(first) = segments.next() else {
+        return path;
+    };
+    let Some(second) = segments.next() else {
+        return path;
+    };
+    let Some(rest) = segments.next() else {
+        return path;
+    };
+    if looks_locale_segment(first) && second.eq_ignore_ascii_case("docs") {
+        rest
+    } else {
+        path
+    }
+}
+
+fn looks_locale_segment(segment: &str) -> bool {
+    let len = segment.len();
+    (len == 2 || (segment.contains('-') && len <= 12))
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn resolve_relative_link(current_path: &Path, target: &Path) -> Option<PathBuf> {
@@ -1483,10 +1729,11 @@ mod tests {
 
     use super::{
         CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, LINK_EDGE_TYPE, MARKDOWN_DOCUMENT_LABEL,
-        MarkdownLinkRef, MarkdownLinkSource, configured_markdown_root, extract_document_link_refs,
-        read_markdown_document, set_markdown_root, sync_markdown_root,
+        MarkdownDocument, MarkdownLinkRef, MarkdownLinkSource, build_resolution_index,
+        configured_markdown_root, extract_document_link_refs, read_markdown_document,
+        resolve_link_path, set_markdown_root, sync_markdown_root,
     };
-    use crate::engine::{CupldEngine, Value};
+    use crate::engine::{CupldEngine, PropertyMap, Value};
 
     static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -1652,6 +1899,77 @@ Body with [[other]] and [deep](other.md#intro) and [misc](misc.md)
     }
 
     #[test]
+    fn resolver_prefers_explicit_markdown_file_over_index_fallback() {
+        let documents = vec![
+            test_document("foo/bar.md", &[], None),
+            test_document("foo/bar/index.md", &[], None),
+            test_document("source.md", &[], None),
+        ];
+        let index = build_resolution_index(&documents);
+
+        assert_eq!(
+            resolve_link_path(Path::new("source.md"), "foo/bar", &index),
+            Some("foo/bar.md".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolver_prefers_alias_over_case_and_path_style_fallbacks() {
+        let documents = vec![
+            test_document("alias-target.md", &["Web/JavaScript/Guide"], None),
+            test_document("web/javascript/guide/index.md", &[], None),
+            test_document("source.md", &[], None),
+        ];
+        let index = build_resolution_index(&documents);
+
+        assert_eq!(
+            resolve_link_path(Path::new("source.md"), "Web/JavaScript/Guide", &index),
+            Some("alias-target.md".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolver_skips_ambiguous_case_slug_and_path_style_matches() {
+        let documents = vec![
+            test_document("Docs/Topic.md", &[], Some("Shared")),
+            test_document("docs/topic.md", &[], Some("Shared")),
+            test_document("source.md", &[], None),
+        ];
+        let index = build_resolution_index(&documents);
+
+        assert_eq!(
+            resolve_link_path(Path::new("source.md"), "DOCS/TOPIC", &index),
+            None
+        );
+        assert_eq!(
+            resolve_link_path(Path::new("source.md"), "Shared", &index),
+            None
+        );
+        assert_eq!(
+            resolve_link_path(Path::new("source.md"), "/en-US/docs/docs/topic", &index),
+            None
+        );
+    }
+
+    #[test]
+    fn resolver_resolves_url_paths_through_slug_candidates() {
+        let documents = vec![
+            test_document("games/tutorials/index.md", &[], Some("Games/Tutorials")),
+            test_document("source.md", &[], None),
+        ];
+        let index = build_resolution_index(&documents);
+
+        assert_eq!(
+            resolve_link_path(
+                Path::new("source.md"),
+                "https://developer.mozilla.org/en-US/docs/Games/Tutorials?x=1#intro",
+                &index,
+            ),
+            Some("games/tutorials/index.md".to_owned())
+        );
+    }
+
+    #[test]
     fn persists_configured_root_in_engine() {
         let root = temp_dir("config");
         fs::create_dir_all(&root).unwrap();
@@ -1673,6 +1991,23 @@ Body with [[other]] and [deep](other.md#intro) and [misc](misc.md)
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_document(path: &str, aliases: &[&str], slug: Option<&str>) -> MarkdownDocument {
+        let frontmatter = slug.map(|slug| PropertyMap::from_pairs([("slug", Value::from(slug))]));
+        MarkdownDocument {
+            path: PathBuf::from(path),
+            raw: String::new(),
+            body: String::new(),
+            frontmatter,
+            title: path.to_owned(),
+            tags: Vec::new(),
+            aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+            links: Vec::new(),
+            headings: Vec::new(),
+            source_hash: String::new(),
+            has_frontmatter: slug.is_some(),
+        }
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
