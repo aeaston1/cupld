@@ -11,6 +11,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `cupld install` to install or refresh the bundled `cupld-md-memory` skill and bootstrap local memory. The default DB path is `./.cupld/default.cupld` and the default markdown root is `./.cupld/data/`.
 - Use `--db default` to target `./.cupld/default.cupld`.
 - Use `cupld query --db <path.cupld|default> ...` for one-shot automation and `cupld context --db <path.cupld|default> ...` for top-k context rows.
+- Use `cupld mcp serve --db <path.cupld|default>` for MCP-capable harnesses that can call local memory tools over stdio.
 - Use `cupld query --db ... --with-markdown` for transient markdown overlay reads.
 - Use `cupld sync markdown --db ...` to persist markdown and `cupld sync markdown --db ... --watch` to keep syncing after the initial run.
 - Use `cupld schema --db ...` and `cupld check --db ...` before making automation assumptions about a database.
@@ -36,6 +37,7 @@ cupld compact --db <path.cupld|default>
 cupld check --db <path.cupld|default>
 cupld sync markdown --db <path.cupld|default> [--root <path>] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
 cupld source set-root --db <path.cupld|default> <path>
+cupld mcp serve --db <path.cupld|default> [--root <path>] [--read-only]
 cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld|default>] [--root <path>] [--force] [--yes]
 ```
 
@@ -50,6 +52,66 @@ Important constraints:
 - `--db default` is an alias for `./.cupld/default.cupld`.
 - `install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in user config `install-state.toml`.
 - If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
+- `mcp serve` is a single-threaded stdio server. It emits MCP JSON-RPC on stdout only and writes diagnostics to stderr.
+
+## MCP Memory
+
+Start the local memory MCP server manually:
+
+```bash
+cupld mcp serve --db default
+```
+
+Codex config example:
+
+```toml
+[mcp_servers.cupld-memory]
+command = "cupld"
+args = ["mcp", "serve", "--db", "default"]
+```
+
+Claude config example:
+
+```json
+{
+  "mcpServers": {
+    "cupld-memory": {
+      "command": "cupld",
+      "args": ["mcp", "serve", "--db", "default"]
+    }
+  }
+}
+```
+
+Recommended persistent instruction snippet:
+
+```md
+## Memory
+Use the cupld MCP server for durable local memory.
+Before non-trivial tasks, search memory when prior preferences, project decisions,
+architecture choices, recurring workflows, or local notes may matter.
+When the user explicitly asks you to remember something, call `memory_add`.
+Do not store secrets, credentials, tokens, private keys, or transient command output.
+```
+
+MCP tools:
+
+- `memory_health`
+- `memory_get`
+- `memory_list`
+- `memory_search`
+- `memory_sync`
+- `memory_add`
+
+MCP resources:
+
+- `memory://index`
+- `memory://recent`
+- `memory://note/{path}`
+- `memory://tag/{tag}`
+- `memory://config`
+
+MCP reads are DB-backed only and never run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1.
 
 ## Agent Workflow
 

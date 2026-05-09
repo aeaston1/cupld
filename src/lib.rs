@@ -1,6 +1,7 @@
 pub mod automation;
 pub mod engine;
 pub mod json;
+pub mod mcp;
 pub mod package;
 pub mod query;
 mod regex_lite;
