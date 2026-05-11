@@ -1,0 +1,792 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{BufRead, Write};
+use std::path::{Component, Path, PathBuf};
+
+use crate::json::{self, JsonValue};
+use crate::package::WorkspacePackage;
+use crate::runtime::{RuntimeValue, Session};
+use crate::source::{configured_markdown_root, sync_markdown_root};
+use crate::{MarkdownSyncReport, Value};
+
+const MAX_LIMIT: usize = 50;
+const DEFAULT_LIMIT: usize = 10;
+const DEFAULT_SNIPPET_CHARS: usize = 500;
+const DEFAULT_BODY_CHARS: usize = 4000;
+
+#[derive(Clone, Debug)]
+pub struct McpConfig {
+    pub db_path: PathBuf,
+    pub root_override: Option<PathBuf>,
+    pub read_only: bool,
+}
+
+pub fn serve_stdio(
+    config: McpConfig,
+    input: impl BufRead,
+    mut output: impl Write,
+) -> Result<(), String> {
+    for line in input.lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = handle_json_line(&config, &line);
+        if let Some(response) = response {
+            writeln!(output, "{response}").map_err(|error| error.to_string())?;
+            output.flush().map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+pub fn handle_json_line(config: &McpConfig, input: &str) -> Option<String> {
+    let value = match json::parse(input) {
+        Ok(value) => value,
+        Err(error) => {
+            return Some(json::stringify(&json_rpc_error(
+                JsonValue::Null,
+                -32700,
+                "parse_error",
+                &error.to_string(),
+            )));
+        }
+    };
+    handle_request(config, &value).map(|value| json::stringify(&value))
+}
+
+fn handle_request(config: &McpConfig, request: &JsonValue) -> Option<JsonValue> {
+    let id = request.get("id").cloned().unwrap_or(JsonValue::Null);
+    let Some(method) = request.get("method").and_then(JsonValue::as_str) else {
+        return Some(json_rpc_error(
+            id,
+            -32600,
+            "invalid_request",
+            "expected JSON-RPC method",
+        ));
+    };
+    if request.get("id").is_none() && method == "notifications/initialized" {
+        return None;
+    }
+    match method {
+        "initialize" => Some(json_rpc_result(
+            id,
+            JsonValue::object([
+                ("protocolVersion", JsonValue::from("2025-06-18")),
+                (
+                    "capabilities",
+                    JsonValue::object([("tools", empty_object()), ("resources", empty_object())]),
+                ),
+                (
+                    "serverInfo",
+                    JsonValue::object([
+                        ("name", JsonValue::from("cupld-memory")),
+                        ("version", JsonValue::from(env!("CARGO_PKG_VERSION"))),
+                    ]),
+                ),
+            ]),
+        )),
+        "tools/list" => Some(json_rpc_result(
+            id,
+            JsonValue::object([("tools", JsonValue::array(tool_definitions()))]),
+        )),
+        "tools/call" => {
+            let params = request.get("params").unwrap_or(&JsonValue::Null);
+            let result = call_tool(config, params);
+            Some(json_rpc_result(id, tool_content(result)))
+        }
+        "resources/list" => Some(json_rpc_result(
+            id,
+            JsonValue::object([("resources", JsonValue::array(resource_definitions()))]),
+        )),
+        "resources/read" => {
+            let params = request.get("params").unwrap_or(&JsonValue::Null);
+            let result = read_resource(config, params);
+            Some(json_rpc_result(id, result))
+        }
+        _ => Some(json_rpc_error(
+            id,
+            -32601,
+            "method_not_found",
+            "unknown MCP method",
+        )),
+    }
+}
+
+fn json_rpc_result(id: JsonValue, result: JsonValue) -> JsonValue {
+    JsonValue::object([
+        ("jsonrpc", JsonValue::from("2.0")),
+        ("id", id),
+        ("result", result),
+    ])
+}
+
+fn empty_object() -> JsonValue {
+    JsonValue::Object(Vec::new())
+}
+
+fn json_rpc_error(id: JsonValue, rpc_code: i64, code: &str, message: &str) -> JsonValue {
+    JsonValue::object([
+        ("jsonrpc", JsonValue::from("2.0")),
+        ("id", id),
+        (
+            "error",
+            JsonValue::object([
+                ("code", JsonValue::from(rpc_code)),
+                ("message", JsonValue::from(message)),
+                ("data", error_payload(code, message)),
+            ]),
+        ),
+    ])
+}
+
+fn error_payload(code: &str, message: &str) -> JsonValue {
+    JsonValue::object([
+        ("ok", JsonValue::from(false)),
+        (
+            "error",
+            JsonValue::object([
+                ("code", JsonValue::from(code)),
+                ("message", JsonValue::from(message)),
+            ]),
+        ),
+    ])
+}
+
+fn tool_content(payload: JsonValue) -> JsonValue {
+    JsonValue::object([(
+        "content",
+        JsonValue::array([JsonValue::object([
+            ("type", JsonValue::from("text")),
+            ("text", JsonValue::from(json::stringify(&payload))),
+        ])]),
+    )])
+}
+
+fn tool_definitions() -> Vec<JsonValue> {
+    [
+        (
+            "memory_health",
+            "Report cupld memory DB and markdown root status.",
+        ),
+        (
+            "memory_get",
+            "Get one DB-backed memory note by URI, path, id, or title.",
+        ),
+        ("memory_list", "List DB-backed memory notes."),
+        (
+            "memory_search",
+            "Search DB-backed memory notes with capped lexical matching.",
+        ),
+        (
+            "memory_sync",
+            "Sync configured markdown memory into the cupld DB.",
+        ),
+        (
+            "memory_add",
+            "Write a markdown memory note and sync it into the DB.",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description)| {
+        JsonValue::object([
+            ("name", JsonValue::from(name)),
+            ("description", JsonValue::from(description)),
+            (
+                "inputSchema",
+                JsonValue::object([
+                    ("type", JsonValue::from("object")),
+                    ("additionalProperties", JsonValue::from(true)),
+                ]),
+            ),
+        ])
+    })
+    .collect()
+}
+
+fn resource_definitions() -> Vec<JsonValue> {
+    [
+        ("memory://index", "Memory index"),
+        ("memory://recent", "Recent memory notes"),
+        ("memory://config", "Memory server config"),
+    ]
+    .into_iter()
+    .map(|(uri, name)| {
+        JsonValue::object([
+            ("uri", JsonValue::from(uri)),
+            ("name", JsonValue::from(name)),
+            ("mimeType", JsonValue::from("application/json")),
+        ])
+    })
+    .collect()
+}
+
+fn call_tool(config: &McpConfig, params: &JsonValue) -> JsonValue {
+    let Some(name) = params.get("name").and_then(JsonValue::as_str) else {
+        return error_payload("validation_error", "expected tool name");
+    };
+    let args = params.get("arguments").unwrap_or(&JsonValue::Null);
+    match name {
+        "memory_health" => memory_health(config),
+        "memory_get" => memory_get(config, args),
+        "memory_list" => memory_list(config, args),
+        "memory_search" => memory_search(config, args),
+        "memory_sync" => memory_sync(config),
+        "memory_add" => memory_add(config, args),
+        _ => error_payload("unknown_tool", "unknown memory tool"),
+    }
+}
+
+fn read_resource(config: &McpConfig, params: &JsonValue) -> JsonValue {
+    let Some(uri) = params.get("uri").and_then(JsonValue::as_str) else {
+        return resource_text(
+            "memory://error",
+            error_payload("validation_error", "expected uri"),
+        );
+    };
+    let payload = if uri == "memory://index" || uri == "memory://recent" {
+        memory_list(
+            config,
+            &JsonValue::object([("limit", JsonValue::from(10usize))]),
+        )
+    } else if uri == "memory://config" {
+        memory_health(config)
+    } else if let Some(path) = uri.strip_prefix("memory://note/") {
+        memory_get(
+            config,
+            &JsonValue::object([("id_or_uri", JsonValue::from(path))]),
+        )
+    } else if let Some(tag) = uri.strip_prefix("memory://tag/") {
+        memory_list(
+            config,
+            &JsonValue::object([("tags", JsonValue::array([tag.into()]))]),
+        )
+    } else {
+        error_payload("resource_not_found", "unknown memory resource")
+    };
+    resource_text(uri, payload)
+}
+
+fn resource_text(uri: &str, payload: JsonValue) -> JsonValue {
+    JsonValue::object([(
+        "contents",
+        JsonValue::array([JsonValue::object([
+            ("uri", JsonValue::from(uri)),
+            ("mimeType", JsonValue::from("application/json")),
+            ("text", JsonValue::from(json::stringify(&payload))),
+        ])]),
+    )])
+}
+
+fn memory_health(config: &McpConfig) -> JsonValue {
+    match open_session(config) {
+        Ok(session) => {
+            let root = resolve_markdown_root(config, Some(&session));
+            JsonValue::object([
+                ("ok", true.into()),
+                ("db_path", path_json(&config.db_path)),
+                (
+                    "markdown_root",
+                    root.map(path_json).unwrap_or(JsonValue::Null),
+                ),
+                ("read_only", config.read_only.into()),
+                (
+                    "db_last_tx_id",
+                    JsonValue::from(session.transaction_info().last_tx_id),
+                ),
+            ])
+        }
+        Err(error) => error_payload("db_open_failed", &error),
+    }
+}
+
+fn memory_get(config: &McpConfig, args: &JsonValue) -> JsonValue {
+    let Some(needle) = args.get("id_or_uri").and_then(JsonValue::as_str) else {
+        return error_payload("validation_error", "expected id_or_uri");
+    };
+    let max_chars = bounded_usize(args.get("max_chars"), DEFAULT_BODY_CHARS, 20_000);
+    match load_docs(config) {
+        Ok(docs) => {
+            let normalized = needle.strip_prefix("memory://note/").unwrap_or(needle);
+            let matches = docs
+                .into_iter()
+                .filter(|doc| {
+                    doc.id.to_string() == normalized
+                        || doc.path == normalized
+                        || doc.title.eq_ignore_ascii_case(normalized)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return error_payload("not_found", "expected exactly one matching memory note");
+            }
+            let (body, truncated) = truncate(&matches[0].body, max_chars);
+            JsonValue::object([
+                ("ok", true.into()),
+                ("item", matches[0].to_json_with_body(&body)),
+                ("truncated", truncated.into()),
+                ("provenance", provenance()),
+            ])
+        }
+        Err(error) => error_payload("db_query_failed", &error),
+    }
+}
+
+fn memory_list(config: &McpConfig, args: &JsonValue) -> JsonValue {
+    let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
+    let tags = arg_strings(args.get("tags"));
+    match load_docs(config) {
+        Ok(docs) => list_payload(filter_tags(docs, &tags), limit),
+        Err(error) => error_payload("db_query_failed", &error),
+    }
+}
+
+fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
+    let Some(query) = args.get("query").and_then(JsonValue::as_str) else {
+        return error_payload("validation_error", "expected query");
+    };
+    let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
+    let tags = arg_strings(args.get("tags"));
+    let query = query.to_ascii_lowercase();
+    match load_docs(config) {
+        Ok(docs) => {
+            let mut scored = filter_tags(docs, &tags)
+                .into_iter()
+                .filter_map(|doc| doc.search_score(&query).map(|score| (score, doc)))
+                .collect::<Vec<_>>();
+            scored.sort_by(|(left_score, left), (right_score, right)| {
+                left_score
+                    .cmp(right_score)
+                    .then_with(|| left.path.cmp(&right.path))
+            });
+            list_payload(scored.into_iter().map(|(_, doc)| doc).collect(), limit)
+        }
+        Err(error) => error_payload("db_query_failed", &error),
+    }
+}
+
+fn list_payload(docs: Vec<MemoryDoc>, limit: usize) -> JsonValue {
+    let truncated = docs.len() > limit;
+    JsonValue::object([
+        ("ok", true.into()),
+        (
+            "items",
+            JsonValue::array(
+                docs.into_iter()
+                    .take(limit)
+                    .map(|doc| doc.to_item_json(DEFAULT_SNIPPET_CHARS)),
+            ),
+        ),
+        ("truncated", truncated.into()),
+        ("provenance", provenance()),
+    ])
+}
+
+fn memory_sync(config: &McpConfig) -> JsonValue {
+    if config.read_only {
+        return error_payload("read_only", "memory_sync is disabled in read-only mode");
+    }
+    match sync_configured_root(config) {
+        Ok(report) => JsonValue::object([
+            ("ok", true.into()),
+            ("report", report_json(&report)),
+            ("db_updated", true.into()),
+        ]),
+        Err(error) => error_payload("sync_failed", &error),
+    }
+}
+
+fn memory_add(config: &McpConfig, args: &JsonValue) -> JsonValue {
+    if config.read_only {
+        return error_payload("read_only", "memory_add is disabled in read-only mode");
+    }
+    let Some(content) = args.get("content").and_then(JsonValue::as_str) else {
+        return error_payload("validation_error", "expected content");
+    };
+    let session = match open_session(config) {
+        Ok(session) => session,
+        Err(error) => return error_payload("db_open_failed", &error),
+    };
+    let root = match resolve_markdown_root(config, Some(&session)) {
+        Some(root) => root,
+        None => return error_payload("markdown_root_missing", "markdown root is not configured"),
+    };
+    let title = args
+        .get("title")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("Memory Note");
+    let path_hint = args.get("path_hint").and_then(JsonValue::as_str);
+    let relative_path = match safe_relative_path(title, path_hint) {
+        Ok(path) => path,
+        Err(error) => return error_payload("invalid_path", &error),
+    };
+    let note_path = root.join(&relative_path);
+    if let Some(parent) = note_path.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        return error_payload("markdown_write_failed", &error.to_string());
+    }
+    if let Err(error) = ensure_confined_write(&root, &note_path) {
+        return error_payload("invalid_path", &error);
+    }
+    let markdown = note_markdown(
+        content,
+        title,
+        &arg_strings(args.get("tags")),
+        args.get("source").and_then(JsonValue::as_str),
+    );
+    if let Err(error) = fs::write(&note_path, markdown) {
+        return error_payload("markdown_write_failed", &error.to_string());
+    }
+    match sync_configured_root(config) {
+        Ok(report) => JsonValue::object([
+            ("ok", true.into()),
+            ("note_path", JsonValue::from(path_to_string(&relative_path))),
+            (
+                "uri",
+                JsonValue::from(format!("memory://note/{}", path_to_string(&relative_path))),
+            ),
+            ("sync_report", report_json(&report)),
+            ("db_updated", true.into()),
+            ("status", JsonValue::from("ok")),
+        ]),
+        Err(error) => JsonValue::object([
+            ("ok", false.into()),
+            ("note_path", JsonValue::from(path_to_string(&relative_path))),
+            ("db_updated", false.into()),
+            ("status", JsonValue::from("markdown_written_sync_failed")),
+            (
+                "error",
+                JsonValue::object([
+                    ("code", JsonValue::from("sync_failed")),
+                    ("message", JsonValue::from(error)),
+                ]),
+            ),
+        ]),
+    }
+}
+
+fn sync_configured_root(config: &McpConfig) -> Result<MarkdownSyncReport, String> {
+    let mut session = open_session(config)?;
+    let root = resolve_markdown_root(config, Some(&session))
+        .ok_or_else(|| "markdown root is not configured".to_owned())?;
+    let mut engine = session.engine().clone();
+    let report = sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?;
+    engine.commit().map_err(|error| error.to_string())?;
+    session
+        .replace_engine(engine)
+        .map_err(|error| error.to_string())?;
+    session.save().map_err(|error| error.to_string())?;
+    Ok(report)
+}
+
+fn open_session(config: &McpConfig) -> Result<Session, String> {
+    Session::open(&config.db_path).map_err(|error| error.to_string())
+}
+
+fn resolve_markdown_root(config: &McpConfig, session: Option<&Session>) -> Option<PathBuf> {
+    if let Some(root) = &config.root_override {
+        return Some(root.clone());
+    }
+    let package = WorkspacePackage::discover_current().ok()?;
+    if let Some(root) = package.configured_markdown_root() {
+        return Some(root);
+    }
+    if let Some(session) = session
+        && let Some(root) = configured_markdown_root(session.engine())
+    {
+        return Some(root);
+    }
+    Some(package.default_markdown_root())
+}
+
+fn load_docs(config: &McpConfig) -> Result<Vec<MemoryDoc>, String> {
+    let mut session = open_session(config)?;
+    let result = session
+        .execute_script(
+            "MATCH (d:MarkdownDocument)
+             RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
+             ORDER BY d.`src.path`",
+            &BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .remove(0);
+    Ok(result.rows.into_iter().map(MemoryDoc::from_row).collect())
+}
+
+#[derive(Clone, Debug)]
+struct MemoryDoc {
+    id: i64,
+    path: String,
+    title: String,
+    tags: Vec<String>,
+    aliases: Vec<String>,
+    headings: Vec<String>,
+    body: String,
+    raw: String,
+}
+
+impl MemoryDoc {
+    fn from_row(row: Vec<RuntimeValue>) -> Self {
+        Self {
+            id: int_at(&row, 0),
+            path: string_at(&row, 1),
+            title: string_at(&row, 2),
+            tags: string_list_at(&row, 3),
+            aliases: string_list_at(&row, 4),
+            headings: string_list_at(&row, 5),
+            body: string_at(&row, 6),
+            raw: string_at(&row, 7),
+        }
+    }
+
+    fn to_item_json(&self, max_chars: usize) -> JsonValue {
+        let (snippet, _) = truncate(
+            if self.body.is_empty() {
+                &self.raw
+            } else {
+                &self.body
+            },
+            max_chars,
+        );
+        self.to_json_with_body(&snippet)
+    }
+
+    fn to_json_with_body(&self, body: &str) -> JsonValue {
+        JsonValue::object([
+            ("id", JsonValue::from(self.id)),
+            (
+                "uri",
+                JsonValue::from(format!("memory://note/{}", self.path)),
+            ),
+            ("path", JsonValue::from(self.path.clone())),
+            ("title", JsonValue::from(self.title.clone())),
+            (
+                "tags",
+                JsonValue::array(self.tags.iter().cloned().map(JsonValue::from)),
+            ),
+            ("snippet", JsonValue::from(body.to_owned())),
+            ("updated_at", JsonValue::Null),
+        ])
+    }
+
+    fn search_score(&self, query: &str) -> Option<u8> {
+        let title = self.title.to_ascii_lowercase();
+        let path = self.path.to_ascii_lowercase();
+        if title == query || path == query {
+            return Some(0);
+        }
+        if title.contains(query) || path.contains(query) {
+            return Some(1);
+        }
+        if self
+            .tags
+            .iter()
+            .chain(self.aliases.iter())
+            .chain(self.headings.iter())
+            .any(|value| value.to_ascii_lowercase().contains(query))
+        {
+            return Some(2);
+        }
+        self.body.to_ascii_lowercase().contains(query).then_some(3)
+    }
+}
+
+fn filter_tags(docs: Vec<MemoryDoc>, tags: &[String]) -> Vec<MemoryDoc> {
+    if tags.is_empty() {
+        return docs;
+    }
+    docs.into_iter()
+        .filter(|doc| {
+            tags.iter()
+                .all(|tag| doc.tags.iter().any(|doc_tag| doc_tag == tag))
+        })
+        .collect()
+}
+
+fn safe_relative_path(title: &str, path_hint: Option<&str>) -> Result<PathBuf, String> {
+    let raw = path_hint
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{}.md", slug(title)));
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return Err("absolute path_hint is not allowed".to_owned());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err("path traversal is not allowed".to_owned());
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+        return Err("path_hint must end with .md".to_owned());
+    }
+    Ok(path)
+}
+
+fn ensure_confined_write(root: &Path, note_path: &Path) -> Result<(), String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize markdown root: {error}"))?;
+    let parent = note_path
+        .parent()
+        .ok_or_else(|| "note path has no parent".to_owned())?
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize note parent: {error}"))?;
+    if !parent.starts_with(&root) {
+        return Err("path escapes markdown root".to_owned());
+    }
+    Ok(())
+}
+
+fn note_markdown(content: &str, title: &str, tags: &[String], source: Option<&str>) -> String {
+    let mut output = String::new();
+    output.push_str("---\n");
+    output.push_str("title: ");
+    output.push_str(&yaml_scalar(title));
+    output.push('\n');
+    if !tags.is_empty() {
+        output.push_str("tags: [");
+        for (index, tag) in tags.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&yaml_scalar(tag));
+        }
+        output.push_str("]\n");
+    }
+    if let Some(source) = source {
+        output.push_str("source: ");
+        output.push_str(&yaml_scalar(source));
+        output.push('\n');
+    }
+    output.push_str("---\n\n");
+    output.push_str(content);
+    output.push('\n');
+    output
+}
+
+fn yaml_scalar(input: &str) -> String {
+    let mut output = String::from("\"");
+    for ch in input.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' | '\r' => output.push(' '),
+            ch => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn slug(input: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+    let output = output.trim_matches('-');
+    if output.is_empty() {
+        "memory-note".to_owned()
+    } else {
+        output.to_owned()
+    }
+}
+
+fn bounded_usize(value: Option<&JsonValue>, default: usize, max: usize) -> usize {
+    value
+        .and_then(JsonValue::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(default)
+        .min(max)
+}
+
+fn arg_strings(value: Option<&JsonValue>) -> Vec<String> {
+    value
+        .and_then(JsonValue::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn truncate(input: &str, max_chars: usize) -> (String, bool) {
+    let mut output = String::new();
+    for (index, ch) in input.chars().enumerate() {
+        if index >= max_chars {
+            return (output, true);
+        }
+        output.push(ch);
+    }
+    (output, false)
+}
+
+fn string_at(row: &[RuntimeValue], index: usize) -> String {
+    match row.get(index) {
+        Some(RuntimeValue::String(value)) => value.clone(),
+        _ => String::new(),
+    }
+}
+
+fn string_list_at(row: &[RuntimeValue], index: usize) -> Vec<String> {
+    match row.get(index) {
+        Some(RuntimeValue::List(values)) => values
+            .iter()
+            .filter_map(|value| match value {
+                RuntimeValue::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn int_at(row: &[RuntimeValue], index: usize) -> i64 {
+    match row.get(index) {
+        Some(RuntimeValue::Int(value)) => *value,
+        _ => 0,
+    }
+}
+
+fn path_json(path: impl AsRef<Path>) -> JsonValue {
+    JsonValue::from(path_to_string(path.as_ref()))
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn provenance() -> JsonValue {
+    JsonValue::object([("source", JsonValue::from("cupld_db"))])
+}
+
+fn report_json(report: &MarkdownSyncReport) -> JsonValue {
+    JsonValue::object([
+        ("root", path_json(&report.root)),
+        ("scanned_documents", report.scanned_documents.into()),
+        ("upserted_documents", report.upserted_documents.into()),
+        ("tombstoned_documents", report.tombstoned_documents.into()),
+        ("link_edges", report.link_edges.into()),
+    ])
+}
+
+#[allow(dead_code)]
+fn _value_json(value: &Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(value) => JsonValue::from(*value),
+        Value::Int(value) => JsonValue::from(*value),
+        Value::Float(value) => JsonValue::from(*value),
+        Value::String(value) => JsonValue::from(value.clone()),
+        Value::Bytes(_) | Value::Datetime(_) | Value::List(_) | Value::Map(_) => JsonValue::Null,
+    }
+}

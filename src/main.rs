@@ -15,11 +15,13 @@ use cupld::{
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
     configured_markdown_root, json,
+    mcp::{self, McpConfig},
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, watch_markdown_root,
 };
 use skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
 
+mod install_mcp;
 mod skill_install;
 mod visualise;
 
@@ -201,6 +203,11 @@ fn run() -> Result<(), String> {
             max_runs,
         ),
         CliCommand::SourceSetRoot { db_path, root } => run_source_set_root(db_path, root),
+        CliCommand::McpServe {
+            db_path,
+            root_override,
+            read_only,
+        } => run_mcp_serve(db_path, root_override, read_only),
         CliCommand::Install(command) => skill_install::install(command),
     }
 }
@@ -252,6 +259,11 @@ enum CliCommand {
     SourceSetRoot {
         db_path: PathBuf,
         root: PathBuf,
+    },
+    McpServe {
+        db_path: PathBuf,
+        root_override: Option<PathBuf>,
+        read_only: bool,
     },
     Install(InstallCommand),
 }
@@ -305,6 +317,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         }
         Some("sync") => parse_sync_command(&args[1..]),
         Some("source") => parse_source_command(&args[1..]),
+        Some("mcp") => parse_mcp_command(&args[1..]),
         Some("install") => parse_install_command(&args[1..]),
         Some(path) if path.starts_with('-') => parse_top_level_command(args),
         Some(path) => {
@@ -703,6 +716,55 @@ fn parse_source_command(args: &[String]) -> Result<CliCommand, String> {
     Ok(CliCommand::SourceSetRoot { db_path, root })
 }
 
+fn parse_mcp_command(args: &[String]) -> Result<CliCommand, String> {
+    if args.first().map(String::as_str) != Some("serve") {
+        return Err(format!(
+            "error: expected `mcp serve --db <path.cupld|default> [--root <path>] [--read-only]`\n\n{}",
+            cli_usage_text()
+        ));
+    }
+    let mut db_path = None;
+    let mut root_override = None;
+    let mut read_only = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("expected --db <path.cupld|default> for `mcp serve`".to_owned());
+                };
+                db_path = Some(parse_db_flag_value(path)?);
+                index += 2;
+            }
+            "--root" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("expected --root <path> for `mcp serve`".to_owned());
+                };
+                root_override = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--read-only" => {
+                read_only = true;
+                index += 1;
+            }
+            value => {
+                return Err(format!(
+                    "error: unexpected argument `{value}`\n\n{}",
+                    cli_usage_text()
+                ));
+            }
+        }
+    }
+    let Some(db_path) = db_path else {
+        return Err("expected --db <path.cupld|default> for `mcp serve`".to_owned());
+    };
+    Ok(CliCommand::McpServe {
+        db_path,
+        root_override,
+        read_only,
+    })
+}
+
 fn parse_install_command(args: &[String]) -> Result<CliCommand, String> {
     ensure_subcommand_has_no_option(args, "install", "--visualise")?;
     ensure_subcommand_has_no_option(args, "install", "--query")?;
@@ -714,6 +776,11 @@ fn parse_install_command(args: &[String]) -> Result<CliCommand, String> {
     let mut root = None;
     let mut force = false;
     let mut yes = false;
+    let mut mcp = false;
+    let mut dry_run = false;
+    let mut print_only = false;
+    let mut mcp_server_name = None;
+    let mut mcp_command = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -789,6 +856,53 @@ fn parse_install_command(args: &[String]) -> Result<CliCommand, String> {
                 yes = true;
                 index += 1;
             }
+            "--mcp" => {
+                if mcp {
+                    return Err("duplicate option `--mcp`".to_owned());
+                }
+                mcp = true;
+                index += 1;
+            }
+            "--dry-run" => {
+                if dry_run {
+                    return Err("duplicate option `--dry-run`".to_owned());
+                }
+                dry_run = true;
+                index += 1;
+            }
+            "--print-only" => {
+                if print_only {
+                    return Err("duplicate option `--print-only`".to_owned());
+                }
+                print_only = true;
+                index += 1;
+            }
+            "--mcp-server-name" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --mcp-server-name <name> for `install`".to_owned());
+                };
+                if mcp_server_name.is_some() {
+                    return Err("duplicate option `--mcp-server-name`".to_owned());
+                }
+                if value.trim().is_empty() {
+                    return Err("expected non-empty --mcp-server-name for `install`".to_owned());
+                }
+                mcp_server_name = Some(value.clone());
+                index += 2;
+            }
+            "--mcp-command" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --mcp-command <path|command> for `install`".to_owned());
+                };
+                if mcp_command.is_some() {
+                    return Err("duplicate option `--mcp-command`".to_owned());
+                }
+                if value.trim().is_empty() {
+                    return Err("expected non-empty --mcp-command for `install`".to_owned());
+                }
+                mcp_command = Some(value.clone());
+                index += 2;
+            }
             value => {
                 return Err(format!(
                     "error: unexpected argument `{value}`\n\n{}",
@@ -806,6 +920,11 @@ fn parse_install_command(args: &[String]) -> Result<CliCommand, String> {
         root,
         force,
         yes,
+        mcp,
+        dry_run,
+        print_only,
+        mcp_server_name,
+        mcp_command,
     }))
 }
 
@@ -934,7 +1053,9 @@ Commands:
   check                   Validate --db and print recovery metadata.
   sync markdown           Materialize markdown documents into --db and optionally watch for changes.
   source set-root         Persist the default markdown root in --db.
+  mcp serve               Run the stdio MCP memory server for --db.
   install                 Install the bundled cupld-md-memory SKILL.md and bootstrap local cupld memory.
+  install --mcp           Also write supported harness MCP config; use --dry-run or --print-only for previews.
   -v, --version           Print the cupld version.
   -h, --help, help        Show this help text.
 
@@ -1213,6 +1334,24 @@ fn run_source_set_root(db_path: PathBuf, root: PathBuf) -> Result<(), String> {
     persist_local_package_state(&db_path, &root)?;
     println!("markdown_root {}", root.display());
     Ok(())
+}
+
+fn run_mcp_serve(
+    db_path: PathBuf,
+    root_override: Option<PathBuf>,
+    read_only: bool,
+) -> Result<(), String> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    mcp::serve_stdio(
+        McpConfig {
+            db_path,
+            root_override,
+            read_only,
+        },
+        stdin.lock(),
+        stdout.lock(),
+    )
 }
 
 fn persist_local_package_state(db_path: &Path, root: &Path) -> Result<(), String> {
@@ -1585,7 +1724,15 @@ fn missing_top_level_query(option: &str) -> String {
 fn is_registered_command(input: &str) -> bool {
     matches!(
         input,
-        "query" | "context" | "schema" | "compact" | "check" | "sync" | "source" | "install"
+        "query"
+            | "context"
+            | "schema"
+            | "compact"
+            | "check"
+            | "sync"
+            | "source"
+            | "mcp"
+            | "install"
     )
 }
 
@@ -2004,6 +2151,11 @@ mod tests {
                 root: None,
                 force: false,
                 yes: false,
+                mcp: false,
+                dry_run: false,
+                print_only: false,
+                mcp_server_name: None,
+                mcp_command: None,
             }))
         );
     }
@@ -2029,6 +2181,11 @@ mod tests {
                 root: None,
                 force: false,
                 yes: false,
+                mcp: false,
+                dry_run: false,
+                print_only: false,
+                mcp_server_name: None,
+                mcp_command: None,
             }))
         );
     }
@@ -2056,7 +2213,65 @@ mod tests {
                 root: Some(PathBuf::from("notes")),
                 force: true,
                 yes: true,
+                mcp: false,
+                dry_run: false,
+                print_only: false,
+                mcp_server_name: None,
+                mcp_command: None,
             }))
+        );
+    }
+
+    #[test]
+    fn parses_install_mcp_flags() {
+        let args = vec![
+            "install".to_owned(),
+            "--mcp".to_owned(),
+            "--dry-run".to_owned(),
+            "--print-only".to_owned(),
+            "--target".to_owned(),
+            "codex".to_owned(),
+            "--scope".to_owned(),
+            "cwd".to_owned(),
+            "--mcp-server-name".to_owned(),
+            "memory".to_owned(),
+            "--mcp-command".to_owned(),
+            "cupld".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::Install(InstallCommand {
+                target: Some(SkillInstallTarget::Codex),
+                scope: Some(InstallScope::Cwd),
+                path: None,
+                db_path: None,
+                root: None,
+                force: false,
+                yes: false,
+                mcp: true,
+                dry_run: true,
+                print_only: true,
+                mcp_server_name: Some("memory".to_owned()),
+                mcp_command: Some("cupld".to_owned()),
+            }))
+        );
+    }
+
+    #[test]
+    fn errors_for_duplicate_install_mcp_flags() {
+        assert_eq!(
+            parse_cli_command(&["install".to_owned(), "--mcp".to_owned(), "--mcp".to_owned(),]),
+            Err("duplicate option `--mcp`".to_owned())
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "install".to_owned(),
+                "--mcp-server-name".to_owned(),
+                "one".to_owned(),
+                "--mcp-server-name".to_owned(),
+                "two".to_owned(),
+            ]),
+            Err("duplicate option `--mcp-server-name`".to_owned())
         );
     }
 
@@ -2410,6 +2625,11 @@ mod tests {
                 root: None,
                 force: false,
                 yes: false,
+                mcp: false,
+                dry_run: false,
+                print_only: false,
+                mcp_server_name: None,
+                mcp_command: None,
             }
         )));
     }

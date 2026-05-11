@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use crate::install_mcp::{self, prompt::McpPromptChoice, state::McpInstallRecord};
 use cupld::{Session, json, package::WorkspacePackage, set_markdown_root};
 
 pub const BUNDLED_SKILL_NAME: &str = "cupld-md-memory";
@@ -13,9 +14,22 @@ const BUNDLED_SKILL_CONTENTS: &str = include_str!("../skills/cupld-md-memory/SKI
 const CONFIG_DIR_NAME: &str = ".cupld";
 const INSTALLED_SKILL_PATH_FILE: &str = "installed-skill-path.txt";
 const INSTALL_STATE_FILE: &str = "install-state.toml";
-const INSTALL_STATE_VERSION: u32 = 3;
+const INSTALL_STATE_VERSION: u32 = 4;
 const INSTALL_BUNDLE_REVISION: u32 = 1;
 const PROMPT_DISABLED_FILE: &str = "skill-install-prompt.disabled";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_test_config_dir<T>(config_dir: &Path, run: impl FnOnce() -> T) -> T {
+    TEST_CONFIG_DIR.with(|slot| *slot.borrow_mut() = Some(config_dir.to_path_buf()));
+    let output = run();
+    TEST_CONFIG_DIR.with(|slot| *slot.borrow_mut() = None);
+    output
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillInstallTarget {
@@ -97,6 +111,11 @@ pub struct InstallCommand {
     pub root: Option<PathBuf>,
     pub force: bool,
     pub yes: bool,
+    pub mcp: bool,
+    pub dry_run: bool,
+    pub print_only: bool,
+    pub mcp_server_name: Option<String>,
+    pub mcp_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -110,6 +129,7 @@ struct PromptState {
 struct InstallState {
     version: u32,
     installs: Vec<InstallRecord>,
+    mcp_installs: Vec<McpInstallRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,6 +203,7 @@ impl InstallState {
         Self {
             version: INSTALL_STATE_VERSION,
             installs: Vec::new(),
+            mcp_installs: Vec::new(),
         }
     }
 
@@ -200,6 +221,19 @@ impl InstallState {
             *existing = record;
         } else {
             self.installs.push(record);
+        }
+    }
+
+    fn upsert_mcp(&mut self, record: McpInstallRecord) {
+        self.version = INSTALL_STATE_VERSION;
+        if let Some(existing) = self
+            .mcp_installs
+            .iter_mut()
+            .find(|install| install.same_key(&record))
+        {
+            *existing = record;
+        } else {
+            self.mcp_installs.push(record);
         }
     }
 }
@@ -273,7 +307,7 @@ pub fn maybe_prompt_for_repl() -> Result<(), String> {
         return match choice {
             InstallChoice::Request(request) => {
                 let request = prompt_for_repl_refresh_request(&mut input, &mut output, &request)?;
-                handle_request(request, interactive)
+                handle_request(request, interactive, &mut output).map(|_| ())
             }
             InstallChoice::Skip => {
                 println!("skipped cupld install");
@@ -301,8 +335,36 @@ pub fn maybe_prompt_for_repl() -> Result<(), String> {
 
 pub fn install(command: InstallCommand) -> Result<(), String> {
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let request = resolve_install_request(command, interactive)?;
-    handle_request(request, interactive)
+    install_with_io(
+        command,
+        interactive,
+        &mut io::stdin().lock(),
+        &mut io::stdout(),
+    )
+}
+
+pub(crate) fn install_with_io<R: BufRead, W: Write>(
+    command: InstallCommand,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), String> {
+    if command.print_only && !command.mcp {
+        return Err("`install --print-only` requires --mcp".to_owned());
+    }
+    if command.dry_run && !command.mcp {
+        return Err("`install --dry-run` requires --mcp".to_owned());
+    }
+    if command.mcp {
+        return handle_mcp_command(command, interactive, output);
+    }
+
+    let request = resolve_install_request_with_io(command, interactive, input, output)?;
+    let outcome = handle_request(request, interactive, output)?;
+    if interactive {
+        handle_interactive_mcp_prompt(input, output, &outcome)?;
+    }
+    Ok(())
 }
 
 pub fn should_prompt_for_repl(
@@ -317,7 +379,8 @@ fn handle_choice(choice: InstallChoice) -> Result<(), String> {
     match choice {
         InstallChoice::Request(request) => {
             let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-            handle_request(request, interactive)
+            let mut output = io::stdout();
+            handle_request(request, interactive, &mut output).map(|_| ())
         }
         InstallChoice::Skip => {
             println!("skipped cupld install");
@@ -331,12 +394,115 @@ fn handle_choice(choice: InstallChoice) -> Result<(), String> {
     }
 }
 
-fn handle_request(request: InstallRequest, interactive: bool) -> Result<(), String> {
+fn handle_request<W: Write>(
+    request: InstallRequest,
+    interactive: bool,
+    output: &mut W,
+) -> Result<InstallOutcome, String> {
     let outcome = install_request(&request, interactive)?;
-    println!("installed_skill {}", outcome.skill_path.display());
-    println!("installed_db {}", outcome.db_path.display());
-    println!("markdown_root {}", outcome.root.display());
+    writeln!(output, "installed_skill {}", outcome.skill_path.display()).map_err(io_error)?;
+    writeln!(output, "installed_db {}", outcome.db_path.display()).map_err(io_error)?;
+    writeln!(output, "markdown_root {}", outcome.root.display()).map_err(io_error)?;
     if let Err(error) = persist_install_state(&outcome) {
+        eprintln!("warning: {error}");
+    }
+    if let Err(error) = persist_installed_skill_path(&outcome.skill_path) {
+        eprintln!("warning: {error}");
+    }
+    if let Err(error) = clear_prompt_disabled_sentinel() {
+        eprintln!("warning: {error}");
+    }
+    Ok(outcome)
+}
+
+fn handle_mcp_command<W: Write>(
+    command: InstallCommand,
+    _interactive: bool,
+    output: &mut W,
+) -> Result<(), String> {
+    if command.path.is_some() {
+        return Err("`install --mcp` requires --target and does not accept --path".to_owned());
+    }
+    let target = command
+        .target
+        .ok_or("`install --mcp` requires --target <codex|claude|opencode>".to_owned())?;
+    let scope = command.scope.unwrap_or(InstallScope::Home);
+    let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
+    let server_name = command
+        .mcp_server_name
+        .clone()
+        .unwrap_or_else(|| install_mcp::DEFAULT_SERVER_NAME.to_owned());
+    let mcp_command = command
+        .mcp_command
+        .clone()
+        .unwrap_or_else(install_mcp::default_mcp_command);
+    let db_path = command
+        .db_path
+        .clone()
+        .unwrap_or_else(|| package.resolve_db_path(None));
+    let db_arg = install_mcp::db_arg_for_config(&db_path);
+
+    if command.print_only {
+        let spec = install_mcp::build_print_spec(target, scope, server_name, mcp_command, db_arg)?;
+        output
+            .write_all(install_mcp::render_print_spec(&spec).as_bytes())
+            .map_err(io_error)?;
+        return Ok(());
+    }
+
+    let request =
+        resolve_install_request_with_io(command.clone(), false, &mut io::empty(), &mut io::sink())?;
+    let skill_path = skill_path_for_request(&request);
+    let skill_action = preview_skill_action(&skill_path)?;
+    let spec = install_mcp::build_spec(
+        target,
+        scope,
+        server_name,
+        mcp_command,
+        db_arg,
+        request.db_path.clone(),
+        request.root.clone(),
+    )?;
+    let plan = install_mcp::build_plan(spec, skill_path, skill_action)?;
+
+    if command.dry_run {
+        return install_mcp::render_dry_run(output, &plan);
+    }
+
+    let config_outcome = install_mcp::execute_config_plan(&plan.config)?;
+    let outcome = install_request(&request, false).map_err(|error| {
+        format!(
+            "{error}; MCP config was already written at {}{}",
+            config_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.path.as_deref())
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "manual".to_owned()),
+            config_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.backup_path.as_deref())
+                .map(|path| format!(" with backup at {}", path.display()))
+                .unwrap_or_default()
+        )
+    })?;
+
+    if let Some(config_outcome) = config_outcome.as_ref() {
+        if let Some(path) = config_outcome.path.as_deref() {
+            writeln!(
+                output,
+                "mcp_config {} {}",
+                config_outcome.action.label(),
+                path.display()
+            )
+            .map_err(io_error)?;
+        }
+    }
+    writeln!(output, "installed_skill {}", outcome.skill_path.display()).map_err(io_error)?;
+    writeln!(output, "installed_db {}", outcome.db_path.display()).map_err(io_error)?;
+    writeln!(output, "markdown_root {}", outcome.root.display()).map_err(io_error)?;
+
+    let mcp_record = install_mcp::mcp_state_record_from_plan(&plan);
+    if let Err(error) = persist_install_state_with_mcp(&outcome, mcp_record) {
         eprintln!("warning: {error}");
     }
     if let Err(error) = persist_installed_skill_path(&outcome.skill_path) {
@@ -348,9 +514,87 @@ fn handle_request(request: InstallRequest, interactive: bool) -> Result<(), Stri
     Ok(())
 }
 
+fn handle_interactive_mcp_prompt<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    outcome: &InstallOutcome,
+) -> Result<(), String> {
+    let choice = install_mcp::prompt::prompt_for_mcp_choice(input, output)?;
+    match choice {
+        McpPromptChoice::Skip => Ok(()),
+        McpPromptChoice::OtherPrintOnly => {
+            let spec = install_mcp::build_print_spec(
+                SkillInstallTarget::Opencode,
+                InstallScope::Cwd,
+                install_mcp::DEFAULT_SERVER_NAME.to_owned(),
+                install_mcp::default_mcp_command(),
+                install_mcp::db_arg_for_config(&outcome.db_path),
+            )?;
+            output
+                .write_all(install_mcp::render_print_spec(&spec).as_bytes())
+                .map_err(io_error)
+        }
+        McpPromptChoice::Codex | McpPromptChoice::Claude => {
+            let target = choice.target().expect("target choice");
+            let scope = InstallScope::Cwd;
+            let spec = install_mcp::build_spec(
+                target,
+                scope,
+                install_mcp::DEFAULT_SERVER_NAME.to_owned(),
+                install_mcp::default_mcp_command(),
+                install_mcp::db_arg_for_config(&outcome.db_path),
+                outcome.db_path.clone(),
+                outcome.root.clone(),
+            )?;
+            let plan = install_mcp::build_plan(
+                spec,
+                outcome.skill_path.clone(),
+                install_mcp::SkillPreviewAction::AlreadyInstalled,
+            )?;
+            if let install_mcp::McpConfigPlan::Write(edit) = &plan.config {
+                writeln!(output, "mcp_config_path {}", edit.path.display()).map_err(io_error)?;
+            }
+            let config_outcome = install_mcp::execute_config_plan(&plan.config)?;
+            if let Some(config_outcome) = config_outcome.as_ref()
+                && let Some(path) = config_outcome.path.as_deref()
+            {
+                writeln!(
+                    output,
+                    "mcp_config {} {}",
+                    config_outcome.action.label(),
+                    path.display()
+                )
+                .map_err(io_error)?;
+            }
+            if let Err(error) = persist_install_state_with_mcp(
+                outcome,
+                install_mcp::mcp_state_record_from_plan(&plan),
+            ) {
+                eprintln!("warning: {error}");
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
 fn resolve_install_request(
     command: InstallCommand,
     interactive: bool,
+) -> Result<InstallRequest, String> {
+    resolve_install_request_with_io(
+        command,
+        interactive,
+        &mut io::stdin().lock(),
+        &mut io::stdout(),
+    )
+}
+
+fn resolve_install_request_with_io<R: BufRead, W: Write>(
+    command: InstallCommand,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
 ) -> Result<InstallRequest, String> {
     let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
     if command.target.is_some() && command.path.is_some() {
@@ -397,8 +641,8 @@ fn resolve_install_request(
     }
 
     prompt_for_install_request(
-        &mut io::stdin().lock(),
-        &mut io::stdout(),
+        input,
+        output,
         &package,
         skills_root,
         db_path,
@@ -738,21 +982,23 @@ fn read_prompt_line<R: BufRead>(input: &mut R) -> Result<Option<String>, String>
 }
 
 fn install_request(request: &InstallRequest, interactive: bool) -> Result<InstallOutcome, String> {
-    let skill_dir = request.skills_root.join(BUNDLED_SKILL_NAME);
-    let skill_path = skill_dir.join(BUNDLED_SKILL_FILENAME);
+    let skill_path = skill_path_for_request(request);
+    let skill_dir = skill_path
+        .parent()
+        .ok_or(format!("invalid skill path {}", skill_path.display()))?;
     fs::create_dir_all(&skill_dir).map_err(io_error)?;
 
     let status = if skill_path.exists() {
-        if !request.force && !request.yes && !confirm_overwrite(&skill_path, interactive)? {
-            return Err(format!(
-                "refusing to overwrite existing skill at {} without --force or --yes",
-                skill_path.display()
-            ));
-        }
         let existing = fs::read_to_string(&skill_path).map_err(io_error)?;
         if existing == BUNDLED_SKILL_CONTENTS {
             InstallStatus::AlreadyInstalled
         } else {
+            if !request.force && !request.yes && !confirm_overwrite(&skill_path, interactive)? {
+                return Err(format!(
+                    "refusing to overwrite existing skill at {} without --force or --yes",
+                    skill_path.display()
+                ));
+            }
             fs::write(&skill_path, BUNDLED_SKILL_CONTENTS).map_err(io_error)?;
             InstallStatus::Overwritten
         }
@@ -769,6 +1015,25 @@ fn install_request(request: &InstallRequest, interactive: bool) -> Result<Instal
         root: canonicalize_existing_path(&request.root)?,
         status,
     })
+}
+
+fn skill_path_for_request(request: &InstallRequest) -> PathBuf {
+    request
+        .skills_root
+        .join(BUNDLED_SKILL_NAME)
+        .join(BUNDLED_SKILL_FILENAME)
+}
+
+fn preview_skill_action(skill_path: &Path) -> Result<install_mcp::SkillPreviewAction, String> {
+    if !skill_path.exists() {
+        return Ok(install_mcp::SkillPreviewAction::Install);
+    }
+    let existing = fs::read_to_string(skill_path).map_err(io_error)?;
+    if existing == BUNDLED_SKILL_CONTENTS {
+        Ok(install_mcp::SkillPreviewAction::AlreadyInstalled)
+    } else {
+        Ok(install_mcp::SkillPreviewAction::Overwrite)
+    }
 }
 
 fn bootstrap_memory(db_path: &Path, root: &Path) -> Result<PathBuf, String> {
@@ -914,30 +1179,42 @@ fn load_install_state(path: &Path) -> Result<Option<InstallState>, String> {
         };
         installs.push(install);
     }
-    if installs.is_empty() {
+    if installs.is_empty() && state.mcp_installs.is_empty() {
         return Ok(None);
     }
     Ok(Some(InstallState {
         version: INSTALL_STATE_VERSION,
         installs,
+        mcp_installs: state.mcp_installs,
     }))
 }
 
 fn persist_install_state(outcome: &InstallOutcome) -> Result<(), String> {
+    persist_install_state_with_mcp(outcome, None)
+}
+
+fn persist_install_state_with_mcp(
+    outcome: &InstallOutcome,
+    mcp_record: Option<McpInstallRecord>,
+) -> Result<(), String> {
     let config_dir = config_dir()?;
     fs::create_dir_all(&config_dir).map_err(io_error)?;
     let state_path = config_dir.join(INSTALL_STATE_FILE);
     let mut state = load_install_state(&state_path)?.unwrap_or_else(InstallState::empty);
     state.upsert(InstallRecord::from_outcome(outcome));
+    if let Some(record) = mcp_record {
+        state.upsert_mcp(record);
+    }
     fs::write(state_path, render_install_state(&state)).map_err(io_error)
 }
 
 fn parse_install_state(input: &str) -> Result<InstallState, String> {
     let mut version = None;
     let mut legacy = InstallRecordBuilder::default();
-    let mut current = None::<InstallRecordBuilder>;
+    let mut current = None::<InstallStateSection>;
     let mut installs = Vec::new();
-    let mut saw_install_section = false;
+    let mut mcp_installs = Vec::new();
+    let mut saw_section = false;
 
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -946,19 +1223,21 @@ fn parse_install_state(input: &str) -> Result<InstallState, String> {
             continue;
         }
 
-        if line == "[[install]]" {
-            saw_install_section = true;
+        if line == "[[install]]" || line == "[[mcp_install]]" {
+            saw_section = true;
             if legacy.has_values() {
                 return Err(format!(
                     "line {line_number}: legacy install keys cannot be mixed with install sections"
                 ));
             }
-            if let Some(builder) = current.take() {
-                let parsed_version =
-                    version.ok_or("missing `version` in install state".to_owned())?;
-                installs.push(builder.finish(parsed_version, "install record")?);
+            if let Some(section) = current.take() {
+                finish_install_state_section(section, version, &mut installs, &mut mcp_installs)?;
             }
-            current = Some(InstallRecordBuilder::default());
+            current = Some(if line == "[[install]]" {
+                InstallStateSection::Install(InstallRecordBuilder::default())
+            } else {
+                InstallStateSection::Mcp(install_mcp::state::McpInstallRecordBuilder::default())
+            });
             continue;
         }
 
@@ -968,11 +1247,23 @@ fn parse_install_state(input: &str) -> Result<InstallState, String> {
         let parsed = json::parse(value)
             .map_err(|error| format!("line {line_number}: invalid value for `{key}`: {error}"))?;
 
-        if saw_install_section {
-            let builder = current.as_mut().ok_or(format!(
+        if saw_section {
+            let section = current.as_mut().ok_or(format!(
                 "line {line_number}: install key appears before install section"
             ))?;
-            parse_install_record_key(builder, key, &parsed, line_number)?;
+            match section {
+                InstallStateSection::Install(builder) => {
+                    parse_install_record_key(builder, key, &parsed, line_number)?
+                }
+                InstallStateSection::Mcp(builder) => {
+                    install_mcp::state::parse_mcp_install_record_key(
+                        builder,
+                        key,
+                        &parsed,
+                        line_number,
+                    )?
+                }
+            }
             continue;
         }
 
@@ -999,11 +1290,11 @@ fn parse_install_state(input: &str) -> Result<InstallState, String> {
         ));
     }
 
-    if saw_install_section {
-        if let Some(builder) = current.take() {
-            installs.push(builder.finish(version, "install record")?);
+    if saw_section {
+        if let Some(section) = current.take() {
+            finish_install_state_section(section, Some(version), &mut installs, &mut mcp_installs)?;
         }
-        if installs.is_empty() {
+        if installs.is_empty() && mcp_installs.is_empty() {
             return Err("missing install records in install state".to_owned());
         }
     } else if legacy.has_values() {
@@ -1015,7 +1306,31 @@ fn parse_install_state(input: &str) -> Result<InstallState, String> {
     Ok(InstallState {
         version: INSTALL_STATE_VERSION,
         installs,
+        mcp_installs,
     })
+}
+
+fn finish_install_state_section(
+    section: InstallStateSection,
+    version: Option<u32>,
+    installs: &mut Vec<InstallRecord>,
+    mcp_installs: &mut Vec<McpInstallRecord>,
+) -> Result<(), String> {
+    let version = version.ok_or("missing `version` in install state".to_owned())?;
+    match section {
+        InstallStateSection::Install(builder) => {
+            installs.push(builder.finish(version, "install record")?)
+        }
+        InstallStateSection::Mcp(builder) => {
+            mcp_installs.push(builder.finish("mcp_install record")?)
+        }
+    }
+    Ok(())
+}
+
+enum InstallStateSection {
+    Install(InstallRecordBuilder),
+    Mcp(install_mcp::state::McpInstallRecordBuilder),
 }
 
 fn parse_install_record_key(
@@ -1092,6 +1407,9 @@ fn render_install_state(state: &InstallState) -> String {
         render_install_state_path(&mut output, "skill_path", &install.skill_path);
         render_install_state_path(&mut output, "db_path", &install.db_path);
         render_install_state_path(&mut output, "root", &install.root);
+    }
+    for install in &state.mcp_installs {
+        install_mcp::state::render_mcp_install_record(&mut output, install);
     }
     output
 }
@@ -1306,6 +1624,10 @@ fn expand_tilde_with_home(path: &Path, home: Option<&Path>) -> Result<PathBuf, S
 }
 
 fn config_dir() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(path) = TEST_CONFIG_DIR.with(|slot| slot.borrow().clone()) {
+        return Ok(path);
+    }
     if cfg!(windows)
         && let Some(path) = env_path("APPDATA")
     {
@@ -1354,11 +1676,11 @@ mod tests {
         InstallScope, InstallState, InstallStatus, PROMPT_DISABLED_FILE, PromptState,
         RefreshReason, SkillInstallTarget, WorkspacePackage, bootstrap_memory,
         bundled_skill_signature, canonicalize_existing_path, default_root_path,
-        expand_tilde_with_home, install_request, load_installed_skill_path, parse_install_state,
-        prompt_for_install_request, prompt_for_repl_choice, prompt_for_repl_refresh,
-        prompt_for_repl_refresh_request, prompt_state_from_config_dir, refresh_install_request,
-        refresh_reason, render_install_state, resolve_install_request, should_prompt_for_repl,
-        skills_root_from_skill_path,
+        expand_tilde_with_home, install_request, install_with_io, load_installed_skill_path,
+        parse_install_state, prompt_for_install_request, prompt_for_repl_choice,
+        prompt_for_repl_refresh, prompt_for_repl_refresh_request, prompt_state_from_config_dir,
+        refresh_install_request, refresh_reason, render_install_state, resolve_install_request,
+        should_prompt_for_repl, skills_root_from_skill_path, with_test_config_dir,
     };
     use cupld::{Session, configured_markdown_root};
     use std::fs;
@@ -1373,6 +1695,7 @@ mod tests {
         InstallState {
             version: INSTALL_STATE_VERSION,
             installs: vec![record],
+            mcp_installs: Vec::new(),
         }
     }
 
@@ -1712,6 +2035,11 @@ mod tests {
             root: None,
             force: false,
             yes: false,
+            mcp: false,
+            dry_run: false,
+            print_only: false,
+            mcp_server_name: None,
+            mcp_command: None,
         };
         let error = resolve_install_request(command, false).unwrap_err();
         assert!(error.contains("non-interactive"));
@@ -1825,6 +2153,54 @@ mod tests {
     }
 
     #[test]
+    fn install_state_v4_round_trips_skill_and_mcp_records() {
+        let mut state = test_install_state(test_install_record(
+            PathBuf::from("/tmp/skill"),
+            PathBuf::from("/tmp/default.cupld"),
+            PathBuf::from("/tmp/notes"),
+        ));
+        state
+            .mcp_installs
+            .push(crate::install_mcp::state::McpInstallRecord {
+                target: "codex".to_owned(),
+                scope: "cwd".to_owned(),
+                server_name: "cupld-memory".to_owned(),
+                config_path: PathBuf::from("/tmp/.codex/config.toml"),
+                command: "cupld".to_owned(),
+                args: vec![
+                    "mcp".to_owned(),
+                    "serve".to_owned(),
+                    "--db".to_owned(),
+                    "default".to_owned(),
+                ],
+                db_path: PathBuf::from("/tmp/default.cupld"),
+                root: PathBuf::from("/tmp/notes"),
+                managed_block_signature: "abc".to_owned(),
+                installed_at: "2026-05-08T00:00:00Z".to_owned(),
+                cupld_version: "0.2.0".to_owned(),
+            });
+
+        let rendered = render_install_state(&state);
+
+        assert!(rendered.contains("version = 4"));
+        assert!(rendered.contains("[[mcp_install]]"));
+        assert_eq!(parse_install_state(&rendered).unwrap(), state);
+    }
+
+    #[test]
+    fn version_3_install_state_still_loads() {
+        let input = format!(
+            "version = 3\n\n[[install]]\nbundle_revision = 1\nskill_signature = \"{}\"\nskill_path = \"/tmp/skill\"\ndb_path = \"/tmp/default.cupld\"\nroot = \"/tmp/notes\"\n",
+            bundled_skill_signature()
+        );
+        let state = parse_install_state(&input).unwrap();
+
+        assert_eq!(state.version, INSTALL_STATE_VERSION);
+        assert_eq!(state.installs.len(), 1);
+        assert!(state.mcp_installs.is_empty());
+    }
+
+    #[test]
     fn legacy_install_state_migrates_to_install_record() {
         let legacy = format!(
             "version = 2\nbundle_revision = 1\nskill_signature = \"{}\"\nskill_path = \"/tmp/skill\"\ndb_path = \"/tmp/default.cupld\"\nroot = \"/tmp/notes\"\n",
@@ -1892,6 +2268,11 @@ mod tests {
             root: None,
             force: false,
             yes: false,
+            mcp: false,
+            dry_run: false,
+            print_only: false,
+            mcp_server_name: None,
+            mcp_command: None,
         };
         let request = resolve_install_request(command, false).unwrap();
         assert_eq!(
@@ -1915,6 +2296,11 @@ mod tests {
             root: Some(PathBuf::from("notes")),
             force: true,
             yes: true,
+            mcp: false,
+            dry_run: false,
+            print_only: false,
+            mcp_server_name: None,
+            mcp_command: None,
         };
         let request = resolve_install_request(command, false).unwrap();
         assert_eq!(
@@ -1936,6 +2322,11 @@ mod tests {
             root: None,
             force: false,
             yes: false,
+            mcp: false,
+            dry_run: false,
+            print_only: false,
+            mcp_server_name: None,
+            mcp_command: None,
         };
         let error = resolve_install_request(command, false).unwrap_err();
         assert!(error.contains("--scope only with --target"));
@@ -2049,6 +2440,44 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn interactive_install_mcp_choices_run_through_command_path() {
+        for (choice, codex_expected, claude_expected, snippet_expected) in [
+            ("1\n", true, false, false),
+            ("2\n", false, true, false),
+            ("3\n", false, false, true),
+            ("4\n", false, false, false),
+        ] {
+            let home = temp_dir("interactive_home");
+            let config = temp_dir("interactive_config");
+            let workspace = temp_dir("interactive_workspace");
+            with_test_install_paths(&home, &config, &workspace, || {
+                let mut input = Cursor::new(choice.as_bytes());
+                let mut output = Vec::new();
+
+                install_with_io(
+                    base_install_command(&workspace),
+                    true,
+                    &mut input,
+                    &mut output,
+                )
+                .unwrap();
+
+                assert!(workspace.join("skills/cupld-md-memory/SKILL.md").exists());
+                assert_eq!(
+                    workspace.join(".codex/config.toml").exists(),
+                    codex_expected
+                );
+                assert_eq!(workspace.join(".mcp.json").exists(), claude_expected);
+                let output = String::from_utf8(output).unwrap();
+                assert_eq!(output.contains("\"mcpServers\""), snippet_expected);
+            });
+            fs::remove_dir_all(home).unwrap();
+            fs::remove_dir_all(config).unwrap();
+            fs::remove_dir_all(workspace).unwrap();
+        }
+    }
+
     fn choice_request(choice: InstallChoice) -> InstallRequest {
         match choice {
             InstallChoice::Request(request) => request,
@@ -2070,5 +2499,33 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn base_install_command(workspace: &Path) -> InstallCommand {
+        InstallCommand {
+            target: None,
+            scope: None,
+            path: Some(workspace.join("skills")),
+            db_path: Some(workspace.join("memory.cupld")),
+            root: Some(workspace.join("notes")),
+            force: false,
+            yes: false,
+            mcp: false,
+            dry_run: false,
+            print_only: false,
+            mcp_server_name: None,
+            mcp_command: Some("cupld".to_owned()),
+        }
+    }
+
+    fn with_test_install_paths<T>(
+        home: &Path,
+        config: &Path,
+        workspace: &Path,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        with_test_config_dir(config, || {
+            crate::install_mcp::with_test_paths(home, workspace, run)
+        })
     }
 }
