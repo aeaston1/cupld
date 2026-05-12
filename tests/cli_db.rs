@@ -696,12 +696,13 @@ fn cli_memory_find_stale_ndjson_reports_changed_markdown() {
 }
 
 #[test]
-fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
+fn cli_memory_find_orphans_json_reports_disconnected_current_markdown() {
     let db = TestDb::new("cli_memory_find_orphans");
     let root = TempDir::new("cli_memory_find_orphans_root");
-    fs::write(root.path().join("old.md"), "# Old").unwrap();
+    fs::write(root.path().join("b.md"), "# Bee").unwrap();
+    fs::write(root.path().join("a.md"), "# Aye").unwrap();
 
-    let first_sync = run_cli(&[
+    let sync = run_cli(&[
         "sync",
         "markdown",
         "--db",
@@ -709,17 +710,7 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
         "--root",
         root.path().to_str().unwrap(),
     ]);
-    assert!(first_sync.status.success());
-    fs::remove_file(root.path().join("old.md")).unwrap();
-    let second_sync = run_cli(&[
-        "sync",
-        "markdown",
-        "--db",
-        db.path().to_str().unwrap(),
-        "--root",
-        root.path().to_str().unwrap(),
-    ]);
-    assert!(second_sync.status.success());
+    assert!(sync.status.success());
 
     let output = run_cli(&[
         "memory",
@@ -742,20 +733,56 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
             .get("summary")
             .and_then(|summary| summary.get("orphan_items"))
             .and_then(json::JsonValue::as_i64),
-        Some(1)
+        Some(2)
     );
     let items = parsed
         .get("items")
         .and_then(json::JsonValue::as_array)
         .unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(
-        items[0].get("kind").and_then(json::JsonValue::as_str),
-        Some("document")
-    );
+    assert_eq!(items.len(), 2);
     assert_eq!(
         items[0].get("path").and_then(json::JsonValue::as_str),
-        Some("old.md")
+        Some("a.md")
+    );
+    assert_eq!(
+        items[0].get("title").and_then(json::JsonValue::as_str),
+        Some("Aye")
+    );
+    assert_eq!(
+        items[0].get("status").and_then(json::JsonValue::as_str),
+        Some("current")
+    );
+    assert_eq!(
+        items[0]
+            .get("markdown_inbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0]
+            .get("markdown_outbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0]
+            .get("native_inbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0]
+            .get("native_outbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0].get("reason").and_then(json::JsonValue::as_str),
+        Some("no_markdown_or_native_connectivity")
+    );
+    assert_eq!(
+        items[1].get("path").and_then(json::JsonValue::as_str),
+        Some("b.md")
     );
     let checks = parsed
         .get("checks")
@@ -769,6 +796,72 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
         checks[0].get("status").and_then(json::JsonValue::as_str),
         Some("warn")
     );
+}
+
+#[test]
+fn cli_memory_find_orphans_excludes_markdown_links_and_native_edges() {
+    let db = TestDb::new("cli_memory_find_orphans_connected");
+    let root = TempDir::new("cli_memory_find_orphans_connected_root");
+    fs::write(
+        root.path().join("linked-source.md"),
+        "[target](linked-target.md)",
+    )
+    .unwrap();
+    fs::write(root.path().join("linked-target.md"), "# Linked Target").unwrap();
+    fs::write(root.path().join("native-in.md"), "# Native In").unwrap();
+    fs::write(root.path().join("native-out.md"), "# Native Out").unwrap();
+    fs::write(root.path().join("directory-only.md"), "# Directory Only").unwrap();
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--filesystem-graph",
+    ]);
+    assert!(sync.status.success());
+
+    let mut session = db.open();
+    run(
+        &mut session,
+        "MATCH (d:MarkdownDocument {`src.path`: 'native-in.md'})
+         CREATE (:Person {name: 'Ada'})-[:REFERS_TO]->(d)",
+    );
+    run(
+        &mut session,
+        "MATCH (d:MarkdownDocument {`src.path`: 'native-out.md'})
+         CREATE (d)-[:DESCRIBES]->(:Topic {name: 'Graph'})",
+    );
+    session.save().unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "find-orphans",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut paths = Vec::new();
+    for line in stdout.lines() {
+        let parsed = json::parse(line).unwrap();
+        if parsed.get("kind").and_then(json::JsonValue::as_str) == Some("memory_item") {
+            paths.push(
+                parsed
+                    .get("item")
+                    .and_then(|item| item.get("path"))
+                    .and_then(json::JsonValue::as_str)
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(paths, vec!["directory-only.md"]);
 }
 
 #[test]
