@@ -694,15 +694,15 @@ fn cli_sync_markdown_include_fs_graph_persists_structural_graph() {
     let mut session = db.open();
     let result = run(
         &mut session,
-        "MATCH (dir:MarkdownDirectory {`src.path`: 'notes'})-[e:FS_CONTAINS]->(doc:MarkdownDocument)
-         RETURN dir.`fs.name`, doc.`src.path`, e.`fs.child_kind`",
+        "MATCH (doc:MarkdownDocument {`src.path`: 'notes/synced.md'})-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: 'notes'})
+         RETURN dir.name, doc.`src.path`, e.`md.edge_source`",
     );
     assert_eq!(
         result.rows,
         vec![vec![
             RuntimeValue::String("notes".to_owned()),
             RuntimeValue::String("notes/synced.md".to_owned()),
-            RuntimeValue::String("document".to_owned()),
+            RuntimeValue::String("filesystem".to_owned()),
         ]]
     );
 }
@@ -727,7 +727,7 @@ fn cli_sync_markdown_reads_include_fs_graph_from_workspace_config() {
     let mut session = Session::open(&db_path).unwrap();
     let result = run(
         &mut session,
-        "MATCH (dir:MarkdownDirectory {`src.path`: ''})-[:FS_CONTAINS]->(doc:MarkdownDocument)
+        "MATCH (doc:MarkdownDocument {`src.path`: 'configured.md'})-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: '.'})
          RETURN doc.`src.path`",
     );
     assert_eq!(
