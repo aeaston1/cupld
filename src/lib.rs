@@ -24,9 +24,10 @@ pub use query::{
 };
 pub use runtime::{ExecutionError, QueryResult, RuntimeValue, Session, TransactionInfo};
 pub use source::{
-    MARKDOWN_DIRECTORY_LABEL, MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, MarkdownDocument,
-    MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, MarkdownWatchReport,
-    SourceError, configured_markdown_root, set_markdown_root, sync_markdown_root,
+    MARKDOWN_DIRECTORY_LABEL, MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, MarkdownAliasAmbiguity,
+    MarkdownAliasDiagnostics, MarkdownDocument, MarkdownSyncOptions, MarkdownSyncReport,
+    MarkdownWatchOptions, MarkdownWatchReport, SourceError, configured_markdown_root,
+    markdown_alias_diagnostics, set_markdown_root, sync_markdown_root,
     sync_markdown_root_with_options, watch_markdown_root, watch_markdown_root_with_sync_options,
 };
 pub use storage::{IntegrityReport, StorageError};

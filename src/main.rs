@@ -16,7 +16,7 @@ use cupld::{
         context_as_ndjson, format_error_json as machine_error_json,
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
-    configured_markdown_root, json,
+    configured_markdown_root, json, markdown_alias_diagnostics,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
@@ -1281,7 +1281,7 @@ Commands:
   --batch-ms              Max coalescing window before a forced watched sync.
   --idle-ms               Exit watched sync after this long with no pending changes.
   --max-runs              Stop watched sync after this many sync runs, including the initial run.
-  --output                Select output mode for query/context: table, json, ndjson.
+  --output                Select output mode for query/context/memory: table, json, ndjson.
   --params-json           Provide named query parameters as a JSON object.
   --params-file           Read named query parameters from a JSON file.
   --max-rows              Hard cap result rows in non-interactive query mode.
@@ -1497,12 +1497,15 @@ fn run_compact(db_path: PathBuf) -> Result<(), String> {
 
 fn run_check(db_path: PathBuf) -> Result<(), String> {
     let report = Session::check(&db_path).map_err(|error| error.to_string())?;
+    let session = Session::open(&db_path).map_err(|error| error.to_string())?;
+    let alias_diagnostics = markdown_alias_diagnostics(session.engine());
     println!(
-        "ok db={} last_tx_id={} wal_records={} recovered_tail={}",
+        "ok db={} last_tx_id={} wal_records={} recovered_tail={} ambiguous_markdown_aliases={}",
         db_path.display(),
         report.last_tx_id,
         report.wal_records,
-        report.recovered_tail
+        report.recovered_tail,
+        alias_diagnostics.ambiguous_alias_count()
     );
     Ok(())
 }
@@ -1590,6 +1593,7 @@ fn run_memory_check(
         .map_err(|error| format_command_error(output, &error))?;
     let orphans =
         memory_orphan_items(&mut session).map_err(|error| format_command_error(output, &error))?;
+    let alias_diagnostics = markdown_alias_diagnostics(session.engine());
     let strict_failure =
         strict && (integrity.recovered_tail || !stale.rows.is_empty() || !orphans.rows.is_empty());
     let aggregate_status = if strict_failure {
@@ -1630,6 +1634,11 @@ fn run_memory_check(
             maintenance_status_for_problem(!orphans.rows.is_empty(), strict),
             RuntimeValue::Int(orphans.rows.len() as i64),
         ),
+        MemoryMaintenanceCheck::new(
+            "ambiguous_markdown_aliases",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(alias_diagnostics.ambiguous_alias_count() as i64),
+        ),
     ];
     let status = maintenance_report_status(&checks);
     let report = MemoryMaintenanceReport {
@@ -1639,6 +1648,7 @@ fn run_memory_check(
         strict: Some(strict),
         status,
         checks,
+        markdown_alias_diagnostics: Some(alias_diagnostics),
         items: QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -1684,6 +1694,7 @@ fn run_memory_find_stale(
         strict: None,
         status: maintenance_report_status(&checks),
         checks,
+        markdown_alias_diagnostics: None,
         items,
     };
     print_memory_report(&report, output);
@@ -1709,6 +1720,7 @@ fn run_memory_find_orphans(db_path: PathBuf, output: OutputFormat) -> Result<(),
         strict: None,
         status: maintenance_report_status(&checks),
         checks,
+        markdown_alias_diagnostics: None,
         items,
     };
     print_memory_report(&report, output);
@@ -1794,6 +1806,7 @@ fn run_memory_reindex(db_path: PathBuf, output: OutputFormat) -> Result<(), Stri
         strict: None,
         status: maintenance_report_status(&checks),
         checks,
+        markdown_alias_diagnostics: None,
         items: QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -1933,7 +1946,6 @@ fn print_memory_report(report: &MemoryMaintenanceReport, output: OutputFormat) {
         }
     }
 }
-
 fn string_column(
     columns: &[String],
     row: &[RuntimeValue],

@@ -16,7 +16,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `cupld sync markdown --db ...` to persist markdown and `cupld sync markdown --db ... --watch` to keep syncing after the initial run.
 - Use `cupld schema --db ...` and `cupld check --db ...` before making automation assumptions about a database.
 - Opening or checking a database from an older `cupld` release may upgrade the `.cupld` file in place. Treat on-disk databases as forward-only during beta if rollback matters.
-- Use `--output json` or `--output ndjson` for machine consumption.
+- Use `--output json` or `--output ndjson` for machine consumption where supported.
 - Interactive REPL startup can prompt to install when no skill install is tracked, or to refresh when tracked bundle metadata is stale.
 
 ## CLI Shape
@@ -402,12 +402,13 @@ Markdown notes:
 
 ## Automation Contracts
 
-`query` and `context` expose stable machine contracts when `--output json` or `--output ndjson` is selected.
+`query`, `context`, and `check` expose stable machine contracts when `--output json` or `--output ndjson` is selected.
 
 - `cupld query --output json` writes one JSON envelope to stdout with `ok`, `command`, `policy`, and `results`.
 - `cupld query --output ndjson` writes one `query_meta` line, one `query_result` line per result set, and one `query_row` line per returned row.
 - `cupld context --output json` writes one JSON envelope to stdout with `ok`, `command`, `policy`, `retrieval_usage`, `provenance`, and `items`.
 - `cupld context --output ndjson` writes one `context_meta` line plus one `context_item` line per item.
+- `cupld check --output json` includes storage integrity plus markdown alias diagnostics, including ambiguous alias counts and colliding paths.
 - `cupld memory check|find-stale|find-orphans|reindex --output json` writes one JSON envelope to stdout with `ok`, `command`, `status`, resolved `db_path`, resolved `root` where applicable, `summary`, `checks`, and `items`.
 - `cupld memory ... --output ndjson` writes one `memory_meta` line, one `memory_check` line per check, and one `memory_item` line per item.
 - Memory maintenance `status` values are stable: `pass`, `warn`, and `fail`.

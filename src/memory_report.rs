@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    QueryResult, RuntimeValue,
+    MarkdownAliasAmbiguity, MarkdownAliasDiagnostics, QueryResult, RuntimeValue,
     json::{self, JsonValue},
 };
 
@@ -62,6 +62,7 @@ pub struct MemoryMaintenanceReport {
     pub strict: Option<bool>,
     pub status: MemoryMaintenanceStatus,
     pub checks: Vec<MemoryMaintenanceCheck>,
+    pub markdown_alias_diagnostics: Option<MarkdownAliasDiagnostics>,
     pub items: QueryResult,
 }
 
@@ -165,6 +166,12 @@ impl MemoryMaintenanceReport {
                 "checks".to_owned(),
                 JsonValue::array(self.checks.iter().map(check_json)),
             ));
+            if let Some(alias_diagnostics) = &self.markdown_alias_diagnostics {
+                fields.push((
+                    "markdown".to_owned(),
+                    markdown_alias_diagnostics_json(alias_diagnostics),
+                ));
+            }
             fields.push((
                 "items".to_owned(),
                 json::query_result_rows_to_json(&self.items),
@@ -256,6 +263,34 @@ fn check_json(check: &MemoryMaintenanceCheck) -> JsonValue {
                 .as_ref()
                 .map(|message| JsonValue::from(message.clone()))
                 .unwrap_or(JsonValue::Null),
+        ),
+    ])
+}
+
+fn markdown_alias_diagnostics_json(alias_diagnostics: &MarkdownAliasDiagnostics) -> JsonValue {
+    JsonValue::object([
+        (
+            "ambiguous_alias_count",
+            JsonValue::from(alias_diagnostics.ambiguous_alias_count() as i64),
+        ),
+        (
+            "ambiguous_aliases",
+            JsonValue::array(
+                alias_diagnostics
+                    .ambiguous_aliases
+                    .iter()
+                    .map(markdown_alias_ambiguity_json),
+            ),
+        ),
+    ])
+}
+
+fn markdown_alias_ambiguity_json(ambiguity: &MarkdownAliasAmbiguity) -> JsonValue {
+    JsonValue::object([
+        ("alias", JsonValue::from(ambiguity.alias.clone())),
+        (
+            "paths",
+            JsonValue::array(ambiguity.paths.iter().cloned().map(JsonValue::from)),
         ),
     ])
 }
@@ -379,6 +414,7 @@ mod tests {
                 MemoryMaintenanceStatus::Warn,
                 RuntimeValue::Int(1),
             )],
+            markdown_alias_diagnostics: None,
             items: QueryResult {
                 columns: vec!["path".to_owned(), "reason".to_owned()],
                 rows: vec![vec![
