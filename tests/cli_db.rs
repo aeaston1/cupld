@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cupld::{RuntimeValue, Session, json};
+use cupld::{RuntimeValue, Session, Value, json};
 
 use support::{TestDb, run, seed_person_graph};
 
@@ -689,10 +689,125 @@ fn cli_memory_find_stale_ndjson_reports_changed_markdown() {
     );
     assert_eq!(
         item.get("item")
-            .and_then(|item| item.get("reason"))
+            .and_then(|item| item.get("kind"))
             .and_then(json::JsonValue::as_str),
         Some("hash_mismatch")
     );
+    assert!(
+        item.get("item")
+            .and_then(|item| item.get("stored_hash"))
+            .and_then(json::JsonValue::as_str)
+            .is_some()
+    );
+    assert!(
+        item.get("item")
+            .and_then(|item| item.get("current_hash"))
+            .and_then(json::JsonValue::as_str)
+            .is_some()
+    );
+}
+
+#[test]
+fn cli_memory_find_stale_json_reports_filesystem_freshness_kinds() {
+    let db = TestDb::new("cli_memory_find_stale_kinds");
+    let root = TempDir::new("cli_memory_find_stale_kinds_root");
+    for (path, title) in [
+        ("changed.md", "Changed"),
+        ("missing.md", "Missing"),
+        ("tombstone.md", "Tombstone"),
+        ("metadata.md", "Metadata"),
+        ("root.md", "Root"),
+    ] {
+        fs::write(root.path().join(path), format!("# {title}\n")).unwrap();
+    }
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+
+    fs::write(root.path().join("changed.md"), "# Changed\n\nupdated\n").unwrap();
+    fs::remove_file(root.path().join("missing.md")).unwrap();
+    let mut session = db.open();
+    let mut engine = session.engine().clone();
+    let tombstone_id = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("tombstone.md")))
+        .unwrap()
+        .id();
+    engine
+        .set_node_property(tombstone_id, "src.status", Value::from("missing"))
+        .unwrap();
+    let metadata_id = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("metadata.md")))
+        .unwrap()
+        .id();
+    engine
+        .remove_node_property(metadata_id, "src.hash")
+        .unwrap();
+    let root_id = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("root.md")))
+        .unwrap()
+        .id();
+    engine
+        .set_node_property(root_id, "src.root", Value::from("/tmp/other-root"))
+        .unwrap();
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "find-stale",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
+    );
+    let items = parsed
+        .get("items")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    for kind in [
+        "hash_mismatch",
+        "missing_file",
+        "tombstoned_document",
+        "metadata_incomplete",
+        "root_mismatch",
+    ] {
+        let item = items
+            .iter()
+            .find(|item| item.get("kind").and_then(json::JsonValue::as_str) == Some(kind))
+            .unwrap_or_else(|| panic!("missing stale item kind {kind}: {stdout}"));
+        assert!(item.get("path").is_some());
+        assert!(item.get("title").is_some());
+        assert!(item.get("status").is_some());
+        assert!(item.get("stored_hash").is_some());
+        assert!(item.get("current_hash").is_some());
+        assert!(
+            item.get("suggestion")
+                .and_then(json::JsonValue::as_str)
+                .unwrap()
+                .contains("cupld sync markdown --db ... --root")
+        );
+    }
 }
 
 #[test]

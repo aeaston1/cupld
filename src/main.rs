@@ -1820,7 +1820,11 @@ fn memory_stale_items(session: &mut Session, root: &Path) -> Result<QueryResult,
     let result = session
         .execute_script(
             "MATCH (d:MarkdownDocument)
-             RETURN d.`src.path` AS path, d.`src.hash` AS source_hash, d.`src.status` AS status
+             RETURN d.`src.path` AS path,
+                    d.`md.title` AS title,
+                    d.`src.hash` AS source_hash,
+                    d.`src.root` AS source_root,
+                    d.`src.status` AS status
              ORDER BY d.`src.path`",
             &BTreeMap::new(),
         )
@@ -1833,38 +1837,103 @@ fn memory_stale_items(session: &mut Session, root: &Path) -> Result<QueryResult,
         });
     let mut rows = Vec::new();
     for row in result.rows {
-        let path = string_column(&result.columns, &row, "path")?;
+        let path = optional_string_column(&result.columns, &row, "path")?;
+        let title = optional_string_column(&result.columns, &row, "title")?;
         let source_hash = optional_string_column(&result.columns, &row, "source_hash")?;
-        let status = optional_string_column(&result.columns, &row, "status")?
-            .unwrap_or_else(|| "unknown".to_owned());
+        let source_root = optional_string_column(&result.columns, &row, "source_root")?;
+        let status = optional_string_column(&result.columns, &row, "status")?;
+        let metadata_incomplete =
+            path.is_none() || source_hash.is_none() || source_root.is_none() || status.is_none();
+        let path_for_report = path.clone().unwrap_or_default();
+        let status_for_report = status.clone().unwrap_or_else(|| "unknown".to_owned());
+        let root_for_report = root.display().to_string();
+        if metadata_incomplete {
+            push_stale_item(
+                &mut rows,
+                "metadata_incomplete",
+                &path_for_report,
+                title.as_deref(),
+                &status_for_report,
+                source_hash.as_deref(),
+                None,
+                source_root.as_deref(),
+                &root_for_report,
+            );
+            continue;
+        }
+
+        let Some(path) = path else {
+            continue;
+        };
+        if source_root.as_deref() != Some(root_for_report.as_str()) {
+            push_stale_item(
+                &mut rows,
+                "root_mismatch",
+                &path,
+                title.as_deref(),
+                &status_for_report,
+                source_hash.as_deref(),
+                None,
+                source_root.as_deref(),
+                &root_for_report,
+            );
+        }
+
         let disk_path = root.join(&path);
         match fs::read(&disk_path) {
             Ok(bytes) => {
                 let disk_hash = stable_hash_hex(&bytes);
-                if status == "missing" {
-                    rows.push(vec![
-                        RuntimeValue::String(path),
-                        RuntimeValue::String("present_but_tombstoned".to_owned()),
-                        RuntimeValue::String(status),
-                        RuntimeValue::String("present".to_owned()),
-                    ]);
+                if status.as_deref() == Some("missing") {
+                    push_stale_item(
+                        &mut rows,
+                        "tombstoned_document",
+                        &path,
+                        title.as_deref(),
+                        &status_for_report,
+                        source_hash.as_deref(),
+                        Some(&disk_hash),
+                        source_root.as_deref(),
+                        &root_for_report,
+                    );
                 } else if source_hash.as_deref() != Some(disk_hash.as_str()) {
-                    rows.push(vec![
-                        RuntimeValue::String(path),
-                        RuntimeValue::String("hash_mismatch".to_owned()),
-                        RuntimeValue::String(status),
-                        RuntimeValue::String("changed".to_owned()),
-                    ]);
+                    push_stale_item(
+                        &mut rows,
+                        "hash_mismatch",
+                        &path,
+                        title.as_deref(),
+                        &status_for_report,
+                        source_hash.as_deref(),
+                        Some(&disk_hash),
+                        source_root.as_deref(),
+                        &root_for_report,
+                    );
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if status == "current" {
-                    rows.push(vec![
-                        RuntimeValue::String(path),
-                        RuntimeValue::String("missing_on_disk".to_owned()),
-                        RuntimeValue::String(status),
-                        RuntimeValue::String("missing".to_owned()),
-                    ]);
+                if status.as_deref() == Some("missing") {
+                    push_stale_item(
+                        &mut rows,
+                        "tombstoned_document",
+                        &path,
+                        title.as_deref(),
+                        &status_for_report,
+                        source_hash.as_deref(),
+                        None,
+                        source_root.as_deref(),
+                        &root_for_report,
+                    );
+                } else if status.as_deref() == Some("current") {
+                    push_stale_item(
+                        &mut rows,
+                        "missing_file",
+                        &path,
+                        title.as_deref(),
+                        &status_for_report,
+                        source_hash.as_deref(),
+                        None,
+                        source_root.as_deref(),
+                        &root_for_report,
+                    );
                 }
             }
             Err(error) => {
@@ -1877,13 +1946,77 @@ fn memory_stale_items(session: &mut Session, root: &Path) -> Result<QueryResult,
     }
     Ok(QueryResult {
         columns: vec![
+            "kind".to_owned(),
             "path".to_owned(),
-            "reason".to_owned(),
-            "db_status".to_owned(),
-            "filesystem_status".to_owned(),
+            "title".to_owned(),
+            "status".to_owned(),
+            "stored_hash".to_owned(),
+            "current_hash".to_owned(),
+            "stored_root".to_owned(),
+            "resolved_root".to_owned(),
+            "suggestion".to_owned(),
         ],
         rows,
     })
+}
+
+fn push_stale_item(
+    rows: &mut Vec<Vec<RuntimeValue>>,
+    kind: &str,
+    path: &str,
+    title: Option<&str>,
+    status: &str,
+    stored_hash: Option<&str>,
+    current_hash: Option<&str>,
+    stored_root: Option<&str>,
+    resolved_root: &str,
+) {
+    rows.push(vec![
+        RuntimeValue::String(kind.to_owned()),
+        string_or_null(path),
+        option_string(title),
+        RuntimeValue::String(status.to_owned()),
+        option_string(stored_hash),
+        option_string(current_hash),
+        option_string(stored_root),
+        RuntimeValue::String(resolved_root.to_owned()),
+        RuntimeValue::String(stale_item_suggestion(kind, resolved_root)),
+    ]);
+}
+
+fn stale_item_suggestion(kind: &str, root: &str) -> String {
+    match kind {
+        "missing_file" => format!(
+            "restore the file or run `cupld sync markdown --db ... --root {root}` to refresh persisted markdown state"
+        ),
+        "hash_mismatch" => format!(
+            "run `cupld sync markdown --db ... --root {root}` to refresh persisted markdown state"
+        ),
+        "tombstoned_document" => format!(
+            "restore the file and run `cupld sync markdown --db ... --root {root}` if the document should be current"
+        ),
+        "metadata_incomplete" => format!(
+            "run `cupld sync markdown --db ... --root {root}` to restore required source metadata"
+        ),
+        "root_mismatch" => format!(
+            "run `cupld sync markdown --db ... --root {root}` if this is the intended markdown root"
+        ),
+        _ => format!("run `cupld sync markdown --db ... --root {root}`"),
+    }
+}
+
+fn option_string(value: Option<&str>) -> RuntimeValue {
+    value
+        .map(|value| RuntimeValue::String(value.to_owned()))
+        .unwrap_or(RuntimeValue::Null)
+}
+
+fn string_or_null(value: &str) -> RuntimeValue {
+    if value.is_empty() {
+        RuntimeValue::Null
+    } else {
+        RuntimeValue::String(value.to_owned())
+    }
 }
 
 fn memory_orphan_items(session: &mut Session) -> Result<QueryResult, AutomationError> {
