@@ -1296,7 +1296,7 @@ Commands:
   memory check            Validate memory DB health and markdown maintenance status.
   memory find-stale       List indexed markdown documents that differ from the filesystem.
   memory find-orphans     List tombstoned markdown documents and directories retained in memory.
-  memory reindex          Rebuild markdown memory state from the configured root.
+  memory reindex          Verify existing schema indexes in the database.
   sync markdown           Materialize markdown documents into --db and optionally watch for changes.
   source set-root         Persist the default markdown root in --db.
   mcp serve               Run the stdio MCP memory server for --db.
@@ -1734,88 +1734,67 @@ fn run_memory_find_orphans(db_path: PathBuf, output: OutputFormat) -> Result<(),
 
 fn run_memory_reindex(db_path: PathBuf, output: OutputFormat) -> Result<(), String> {
     let report_db_path = resolved_report_db_path(&db_path, output)?;
-    let mut session = open_initial_session(Some(db_path.clone())).map_err(|message| {
+    let session = open_initial_session(Some(db_path.clone())).map_err(|message| {
         format_command_error(output, &AutomationError::new("memory_db", message))
     })?;
-    let root = resolve_markdown_root(None, Some(&session)).map_err(|message| {
-        format_command_error(output, &AutomationError::new("memory_root", message))
-    })?;
-    let package = WorkspacePackage::discover_current().map_err(|error| {
-        format_command_error(output, &AutomationError::new(error.code(), error.message()))
-    })?;
-    let sync_options = MarkdownSyncOptions {
-        include_fs_graph: package.configured_markdown_include_fs_graph(),
-    };
-    let mut engine = session.engine().clone();
-    let sync_report = sync_markdown_root_with_options(&mut engine, &root, &sync_options)
-        .map_err(AutomationError::from)
-        .map_err(|error| format_command_error(output, &error))?;
-    engine
-        .commit()
-        .map_err(|error| AutomationError::new(error.code(), error.to_string()))
-        .map_err(|error| format_command_error(output, &error))?;
-    session
-        .replace_engine(engine)
-        .map_err(AutomationError::from)
-        .map_err(|error| format_command_error(output, &error))?;
-    session
-        .save()
-        .map_err(AutomationError::from)
-        .map_err(|error| format_command_error(output, &error))?;
+    let indexes = session.engine().show_indexes(None);
+    let index_count = indexes.len();
     let checks = vec![
         MemoryMaintenanceCheck::new(
-            "include_fs_graph",
+            "index_count",
             MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Bool(sync_options.include_fs_graph),
+            RuntimeValue::Int(index_count as i64),
         ),
         MemoryMaintenanceCheck::new(
-            "scanned_documents",
+            "schema_indexes",
             MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Int(sync_report.scanned_documents as i64),
-        ),
-        MemoryMaintenanceCheck::new(
-            "upserted_documents",
-            MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Int(sync_report.upserted_documents as i64),
-        ),
-        MemoryMaintenanceCheck::new(
-            "tombstoned_documents",
-            MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Int(sync_report.tombstoned_documents as i64),
-        ),
-        MemoryMaintenanceCheck::new(
-            "link_edges",
-            MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Int(sync_report.link_edges as i64),
-        ),
-        MemoryMaintenanceCheck::new(
-            "upserted_directories",
-            MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Int(sync_report.upserted_directories as i64),
-        ),
-        MemoryMaintenanceCheck::new(
-            "tombstoned_directories",
-            MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Int(sync_report.tombstoned_directories as i64),
-        ),
-        MemoryMaintenanceCheck::new(
-            "structural_edges",
-            MemoryMaintenanceStatus::Pass,
-            RuntimeValue::Int(sync_report.structural_edges as i64),
+            RuntimeValue::String(if index_count == 0 { "none" } else { "verified" }.to_owned()),
+        )
+        .with_message(
+            "existing schema index definitions were inspected; no new indexes were created",
         ),
     ];
+    let items = QueryResult {
+        columns: vec![
+            "name".to_owned(),
+            "target_kind".to_owned(),
+            "target_name".to_owned(),
+            "property".to_owned(),
+            "kind".to_owned(),
+            "unique".to_owned(),
+            "status".to_owned(),
+            "outcome".to_owned(),
+        ],
+        rows: indexes
+            .into_iter()
+            .map(|index| {
+                let outcome = if index.status == "ready" {
+                    "verified"
+                } else {
+                    "status_preserved"
+                };
+                vec![
+                    RuntimeValue::String(index.name),
+                    RuntimeValue::String(index.target_kind),
+                    RuntimeValue::String(index.target_name),
+                    RuntimeValue::String(index.property),
+                    RuntimeValue::String(index.kind),
+                    RuntimeValue::Bool(index.unique),
+                    RuntimeValue::String(index.status),
+                    RuntimeValue::String(outcome.to_owned()),
+                ]
+            })
+            .collect(),
+    };
     let report = MemoryMaintenanceReport {
         command: "memory.reindex",
         db_path: report_db_path,
-        root: Some(root),
+        root: None,
         strict: None,
         status: maintenance_report_status(&checks),
         checks,
         markdown_alias_diagnostics: None,
-        items: QueryResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-        },
+        items,
     };
     print_memory_report(&report, output);
     Ok(())

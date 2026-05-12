@@ -982,9 +982,6 @@ fn cli_memory_find_orphans_excludes_markdown_links_and_native_edges() {
 #[test]
 fn cli_memory_reindex_reads_default_workspace_root() {
     let workspace = TempDir::new("cli_memory_reindex_default_root");
-    let notes_root = workspace.path().join("notes");
-    fs::create_dir_all(&notes_root).unwrap();
-    fs::write(notes_root.join("indexed.md"), "# Indexed").unwrap();
     fs::create_dir_all(workspace.path().join(".cupld")).unwrap();
     fs::write(
         workspace.path().join(".cupld").join("config.toml"),
@@ -1001,6 +998,29 @@ fn cli_memory_reindex_reads_default_workspace_root() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed = json::parse(&stdout).unwrap();
     assert_eq!(
+        parsed.get("db_path").and_then(json::JsonValue::as_str),
+        workspace_default_db_path(workspace.path()).to_str()
+    );
+    assert_eq!(parsed.get("root"), Some(&json::JsonValue::Null));
+}
+
+#[test]
+fn cli_memory_reindex_handles_empty_db_without_indexes() {
+    let db = TestDb::new("cli_memory_reindex_empty");
+
+    let output = run_cli(&[
+        "memory",
+        "reindex",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
         parsed.get("command").and_then(json::JsonValue::as_str),
         Some("memory.reindex")
     );
@@ -1010,20 +1030,148 @@ fn cli_memory_reindex_reads_default_workspace_root() {
     );
     assert_eq!(
         parsed.get("db_path").and_then(json::JsonValue::as_str),
-        workspace_default_db_path(workspace.path()).to_str()
+        db.path().to_str()
     );
+    assert_eq!(parsed.get("root"), Some(&json::JsonValue::Null));
     assert_eq!(
-        parsed.get("root").and_then(json::JsonValue::as_str),
-        notes_root.to_str()
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("index_count"))
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
     );
     assert_eq!(
         parsed
             .get("summary")
-            .and_then(|summary| summary.get("scanned_documents"))
-            .and_then(json::JsonValue::as_i64),
-        Some(1)
+            .and_then(|summary| summary.get("schema_indexes"))
+            .and_then(json::JsonValue::as_str),
+        Some("none")
     );
-    assert!(workspace_default_db_path(workspace.path()).exists());
+    assert_eq!(
+        parsed
+            .get("items")
+            .and_then(json::JsonValue::as_array)
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn cli_memory_reindex_reports_existing_schema_indexes() {
+    let db = TestDb::new("cli_memory_reindex_schema_indexes");
+    let mut session = Session::new_in_memory();
+    run(&mut session, "CREATE LABEL Person");
+    run(
+        &mut session,
+        "CREATE INDEX idx_person_name ON :Person(name)",
+    );
+    run(
+        &mut session,
+        "CREATE INDEX idx_person_age ON :Person(age) KIND RANGE",
+    );
+    run(
+        &mut session,
+        "ALTER INDEX idx_person_age SET STATUS INVALID",
+    );
+    session.save_as(db.path()).unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "reindex",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("index_count"))
+            .and_then(json::JsonValue::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("schema_indexes"))
+            .and_then(json::JsonValue::as_str),
+        Some("verified")
+    );
+    let items = parsed
+        .get("items")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].get("name").and_then(json::JsonValue::as_str),
+        Some("idx_person_age")
+    );
+    assert_eq!(
+        items[0].get("status").and_then(json::JsonValue::as_str),
+        Some("invalid")
+    );
+    assert_eq!(
+        items[0].get("outcome").and_then(json::JsonValue::as_str),
+        Some("status_preserved")
+    );
+    assert_eq!(
+        items[1].get("name").and_then(json::JsonValue::as_str),
+        Some("idx_person_name")
+    );
+    assert_eq!(
+        items[1].get("status").and_then(json::JsonValue::as_str),
+        Some("ready")
+    );
+    assert_eq!(
+        items[1].get("outcome").and_then(json::JsonValue::as_str),
+        Some("verified")
+    );
+}
+
+#[test]
+fn cli_memory_reindex_supports_table_and_ndjson_output() {
+    let db = TestDb::new("cli_memory_reindex_outputs");
+    let mut session = Session::new_in_memory();
+    run(&mut session, "CREATE LABEL Doc");
+    run(
+        &mut session,
+        "CREATE INDEX idx_doc_tags ON :Doc(tags) KIND LIST",
+    );
+    session.save_as(db.path()).unwrap();
+
+    let table = run_cli(&[
+        "memory",
+        "reindex",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "table",
+    ]);
+    assert!(table.status.success());
+    let stdout = String::from_utf8(table.stdout).unwrap();
+    assert!(stdout.contains("idx_doc_tags"));
+    assert!(stdout.contains("verified"));
+
+    let ndjson = run_cli(&[
+        "memory",
+        "reindex",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+    ]);
+    assert!(ndjson.status.success());
+    let stdout = String::from_utf8(ndjson.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4);
+    assert!(lines[0].contains("\"kind\":\"memory_meta\""));
+    assert!(lines[3].contains("\"kind\":\"memory_item\""));
+    assert!(lines[3].contains("\"idx_doc_tags\""));
 }
 
 #[test]
