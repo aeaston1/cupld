@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -32,6 +32,14 @@ const MARKDOWN_DOCUMENT_LABEL: &str = "MarkdownDocument";
 const MD_LINKS_TO: &str = "MD_LINKS_TO";
 const MD_IN_DIRECTORY: &str = "MD_IN_DIRECTORY";
 const MD_PARENT_DIRECTORY: &str = "MD_PARENT_DIRECTORY";
+const REQUIRED_MARKDOWN_SOURCE_METADATA: [&str; 6] = [
+    "src.connector",
+    "src.kind",
+    "src.root",
+    "src.path",
+    "src.hash",
+    "src.status",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -1599,11 +1607,21 @@ fn run_memory_check(
     let orphans =
         memory_orphan_items(&mut session).map_err(|error| format_command_error(output, &error))?;
     let alias_diagnostics = markdown_alias_diagnostics(session.engine());
-    let strict_failure =
-        strict && (integrity.recovered_tail || !stale.rows.is_empty() || !orphans.rows.is_empty());
-    let aggregate_status = if strict_failure {
-        MemoryMaintenanceStatus::Fail
-    } else if integrity.recovered_tail || !stale.rows.is_empty() || !orphans.rows.is_empty() {
+    let stale_summary = memory_stale_summary(&stale);
+    let metadata_summary = markdown_metadata_summary(&session);
+    let duplicate_path_count = duplicate_current_markdown_path_count(&session);
+    let duplicate_link_edge_count = duplicate_connector_owned_markdown_link_edge_count(&session);
+    let schema_index_summary = schema_index_summary(&session);
+    let has_warning = integrity.recovered_tail
+        || stale_summary.missing_or_tombstoned_documents > 0
+        || stale_summary.stale_current_documents > 0
+        || metadata_summary.missing_required_metadata > 0
+        || duplicate_path_count > 0
+        || duplicate_link_edge_count > 0
+        || alias_diagnostics.ambiguous_alias_count() > 0
+        || schema_index_summary.non_ready_indexes > 0
+        || !orphans.rows.is_empty();
+    let aggregate_status = if has_warning {
         MemoryMaintenanceStatus::Warn
     } else {
         MemoryMaintenanceStatus::Pass
@@ -1626,22 +1644,63 @@ fn run_memory_check(
         ),
         MemoryMaintenanceCheck::new(
             "recovered_tail",
-            maintenance_status_for_problem(integrity.recovered_tail, strict),
+            maintenance_status_for_problem(integrity.recovered_tail, false),
             RuntimeValue::Bool(integrity.recovered_tail),
         ),
         MemoryMaintenanceCheck::new(
+            "missing_tombstoned_markdown_documents",
+            maintenance_status_for_problem(
+                stale_summary.missing_or_tombstoned_documents > 0,
+                false,
+            ),
+            RuntimeValue::Int(stale_summary.missing_or_tombstoned_documents as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "stale_current_markdown_documents",
+            maintenance_status_for_problem(stale_summary.stale_current_documents > 0, false),
+            RuntimeValue::Int(stale_summary.stale_current_documents as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "markdown_documents_missing_source_metadata",
+            maintenance_status_for_problem(metadata_summary.missing_required_metadata > 0, false),
+            RuntimeValue::Int(metadata_summary.missing_required_metadata as i64),
+        )
+        .with_message(format!(
+            "required_metadata={}",
+            REQUIRED_MARKDOWN_SOURCE_METADATA.join(",")
+        )),
+        MemoryMaintenanceCheck::new(
+            "duplicate_current_markdown_document_paths",
+            maintenance_status_for_problem(duplicate_path_count > 0, false),
+            RuntimeValue::Int(duplicate_path_count as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "duplicate_connector_owned_md_links_to_edges",
+            maintenance_status_for_problem(duplicate_link_edge_count > 0, false),
+            RuntimeValue::Int(duplicate_link_edge_count as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "schema_indexes",
+            maintenance_status_for_problem(schema_index_summary.non_ready_indexes > 0, false),
+            RuntimeValue::Int(schema_index_summary.total_indexes as i64),
+        )
+        .with_message(format!(
+            "ready={} non_ready={}",
+            schema_index_summary.ready_indexes, schema_index_summary.non_ready_indexes
+        )),
+        MemoryMaintenanceCheck::new(
             "stale_items",
-            maintenance_status_for_problem(!stale.rows.is_empty(), strict),
+            maintenance_status_for_problem(!stale.rows.is_empty(), false),
             RuntimeValue::Int(stale.rows.len() as i64),
         ),
         MemoryMaintenanceCheck::new(
             "orphan_items",
-            maintenance_status_for_problem(!orphans.rows.is_empty(), strict),
+            maintenance_status_for_problem(!orphans.rows.is_empty(), false),
             RuntimeValue::Int(orphans.rows.len() as i64),
         ),
         MemoryMaintenanceCheck::new(
             "ambiguous_markdown_aliases",
-            MemoryMaintenanceStatus::Pass,
+            maintenance_status_for_problem(alias_diagnostics.ambiguous_alias_count() > 0, false),
             RuntimeValue::Int(alias_diagnostics.ambiguous_alias_count() as i64),
         ),
     ];
@@ -1660,14 +1719,8 @@ fn run_memory_check(
         },
     };
     print_memory_report(&report, output);
-    if strict_failure {
-        return Err(format_command_error(
-            output,
-            &AutomationError::new(
-                "memory_check_strict",
-                "strict memory check failed because stale or orphaned items were found",
-            ),
-        ));
+    if strict && status == MemoryMaintenanceStatus::Warn {
+        process::exit(2);
     }
     Ok(())
 }
@@ -1986,6 +2039,124 @@ fn stale_item_suggestion(kind: &str, root: &str) -> String {
             "run `cupld sync markdown --db ... --root {root}` if this is the intended markdown root"
         ),
         _ => format!("run `cupld sync markdown --db ... --root {root}`"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryStaleSummary {
+    missing_or_tombstoned_documents: usize,
+    stale_current_documents: usize,
+}
+
+fn memory_stale_summary(items: &QueryResult) -> MemoryStaleSummary {
+    let Some(kind_index) = items.columns.iter().position(|column| column == "kind") else {
+        return MemoryStaleSummary::default();
+    };
+    let mut summary = MemoryStaleSummary::default();
+    for row in &items.rows {
+        let Some(RuntimeValue::String(kind)) = row.get(kind_index) else {
+            continue;
+        };
+        match kind.as_str() {
+            "missing_file" | "tombstoned_document" => {
+                summary.missing_or_tombstoned_documents += 1;
+            }
+            "hash_mismatch" => {
+                summary.stale_current_documents += 1;
+            }
+            _ => {}
+        }
+    }
+    summary
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MarkdownMetadataSummary {
+    missing_required_metadata: usize,
+}
+
+fn markdown_metadata_summary(session: &Session) -> MarkdownMetadataSummary {
+    let mut missing_required_metadata = 0;
+    for node in session
+        .engine()
+        .nodes()
+        .filter(|node| node.labels().contains(MARKDOWN_DOCUMENT_LABEL))
+    {
+        if REQUIRED_MARKDOWN_SOURCE_METADATA.iter().any(
+            |key| !matches!(node.property(key), Some(Value::String(value)) if !value.is_empty()),
+        ) {
+            missing_required_metadata += 1;
+        }
+    }
+    MarkdownMetadataSummary {
+        missing_required_metadata,
+    }
+}
+
+fn duplicate_current_markdown_path_count(session: &Session) -> usize {
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for node in session
+        .engine()
+        .nodes()
+        .filter(|node| node.labels().contains(MARKDOWN_DOCUMENT_LABEL))
+    {
+        if string_property(node.property("src.status")) != Some("current") {
+            continue;
+        }
+        let Some(path) = string_property(node.property("src.path")) else {
+            continue;
+        };
+        if !seen.insert(path.to_owned()) {
+            duplicates.insert(path.to_owned());
+        }
+    }
+    duplicates.len()
+}
+
+fn duplicate_connector_owned_markdown_link_edge_count(session: &Session) -> usize {
+    let mut seen = BTreeSet::new();
+    let mut duplicates = 0;
+    for edge in session
+        .engine()
+        .edges()
+        .filter(|edge| edge.edge_type() == MD_LINKS_TO)
+        .filter(|edge| string_property(edge.property("src.connector")) == Some("markdown"))
+    {
+        let from_path = session
+            .engine()
+            .node(edge.from())
+            .and_then(|node| string_property(node.property("src.path")));
+        let to_path = session
+            .engine()
+            .node(edge.to())
+            .and_then(|node| string_property(node.property("src.path")));
+        let key = (
+            from_path.map(ToOwned::to_owned),
+            to_path.map(ToOwned::to_owned),
+            edge.edge_type().to_owned(),
+        );
+        if !seen.insert(key) {
+            duplicates += 1;
+        }
+    }
+    duplicates
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SchemaIndexSummary {
+    total_indexes: usize,
+    ready_indexes: usize,
+    non_ready_indexes: usize,
+}
+
+fn schema_index_summary(session: &Session) -> SchemaIndexSummary {
+    let rows = session.engine().show_indexes(None);
+    let ready_indexes = rows.iter().filter(|row| row.status == "ready").count();
+    SchemaIndexSummary {
+        total_indexes: rows.len(),
+        ready_indexes,
+        non_ready_indexes: rows.len().saturating_sub(ready_indexes),
     }
 }
 

@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cupld::{RuntimeValue, Session, Value, json};
+use cupld::{PropertyMap, RuntimeValue, Session, Value, json};
 
 use support::{TestDb, run, seed_person_graph};
 
@@ -611,6 +611,180 @@ fn cli_memory_check_outputs_json_report() {
             .and_then(|check| check.get("status"))
             .and_then(json::JsonValue::as_str),
         Some("pass")
+    );
+}
+
+#[test]
+fn cli_memory_check_reports_markdown_health_summary() {
+    let db = TestDb::new("cli_memory_check_health_summary");
+    let root = TempDir::new("cli_memory_check_health_summary_root");
+    for path in [
+        "changed.md",
+        "missing.md",
+        "duplicate.md",
+        "source.md",
+        "target.md",
+    ] {
+        fs::write(root.path().join(path), format!("# {path}\n")).unwrap();
+    }
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+    fs::write(root.path().join("changed.md"), "# Changed\n\nupdated\n").unwrap();
+    fs::remove_file(root.path().join("missing.md")).unwrap();
+
+    let mut session = db.open();
+    let mut engine = session.engine().clone();
+    let source_node = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("duplicate.md")))
+        .unwrap();
+    let source = source_node.id();
+    let source_hash = source_node.property("src.hash").unwrap().clone();
+    let duplicate = engine
+        .create_node(
+            ["MarkdownDocument"],
+            PropertyMap::from_pairs([
+                ("src.connector", Value::from("markdown")),
+                ("src.kind", Value::from("document")),
+                ("src.root", Value::from(root.path().display().to_string())),
+                ("src.path", Value::from("duplicate.md")),
+                ("src.hash", source_hash),
+                ("src.status", Value::from("current")),
+            ]),
+        )
+        .unwrap();
+    let target = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("target.md")))
+        .unwrap()
+        .id();
+    engine
+        .create_edge(
+            source,
+            target,
+            "MD_LINKS_TO",
+            PropertyMap::from_pairs([("src.connector", Value::from("markdown"))]),
+        )
+        .unwrap();
+    engine
+        .create_edge(
+            duplicate,
+            target,
+            "MD_LINKS_TO",
+            PropertyMap::from_pairs([("src.connector", Value::from("markdown"))]),
+        )
+        .unwrap();
+    let metadata_id = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("target.md")))
+        .unwrap()
+        .id();
+    engine
+        .remove_node_property(metadata_id, "src.hash")
+        .unwrap();
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
+    );
+    let summary = parsed.get("summary").unwrap();
+    assert_eq!(
+        summary
+            .get("missing_tombstoned_markdown_documents")
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get("stale_current_markdown_documents")
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get("markdown_documents_missing_source_metadata")
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get("duplicate_current_markdown_document_paths")
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get("duplicate_connector_owned_md_links_to_edges")
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get("schema_indexes")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+}
+
+#[test]
+fn cli_memory_check_strict_warn_exits_two() {
+    let db = TestDb::new("cli_memory_check_strict_warn");
+    let root = TempDir::new("cli_memory_check_strict_warn_root");
+    fs::write(root.path().join("note.md"), "# Original\n").unwrap();
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+    fs::write(root.path().join("note.md"), "# Changed\n").unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+        "--strict",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
     );
 }
 
