@@ -1301,6 +1301,9 @@ fn run_sync_markdown(
             upserted_documents: 0,
             tombstoned_documents: 0,
             link_edges: 0,
+            upserted_directories: 0,
+            tombstoned_directories: 0,
+            structural_edges: 0,
         })
     } else {
         sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?
