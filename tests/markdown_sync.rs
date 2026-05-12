@@ -135,6 +135,271 @@ Body with [[other]] and [deep](other.md#intro) and [misc](misc.md)
 }
 
 #[test]
+fn syncs_document_directory_and_parent_directory_edges_with_metadata() {
+    let db = TestDb::new("markdown_structural_edges");
+    let root = temp_dir("markdown_structural_edges");
+    fs::create_dir_all(root.join("guides/api")).unwrap();
+    fs::write(root.join("note.md"), "# Root").unwrap();
+    fs::write(root.join("guides/index.md"), "# Guides").unwrap();
+    fs::write(root.join("guides/api/ref.md"), "# Reference").unwrap();
+    let root_string = root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    sync_root_into_db(db.path(), &root);
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let in_directory = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN d.`src.path`, dir.`src.path`, e.`src.connector`, e.`src.kind`, e.`src.root`, e.`src.status`, e.`md.edge_source`, e.`md.edge_weight`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        in_directory.rows,
+        vec![
+            vec![
+                RuntimeValue::String("guides/api/ref.md".to_owned()),
+                RuntimeValue::String("guides/api".to_owned()),
+                RuntimeValue::String("markdown".to_owned()),
+                RuntimeValue::String("structural_edge".to_owned()),
+                RuntimeValue::String(root_string.clone()),
+                RuntimeValue::String("current".to_owned()),
+                RuntimeValue::String("filesystem".to_owned()),
+                RuntimeValue::Float(0.25),
+            ],
+            vec![
+                RuntimeValue::String("guides/index.md".to_owned()),
+                RuntimeValue::String("guides".to_owned()),
+                RuntimeValue::String("markdown".to_owned()),
+                RuntimeValue::String("structural_edge".to_owned()),
+                RuntimeValue::String(root_string.clone()),
+                RuntimeValue::String("current".to_owned()),
+                RuntimeValue::String("filesystem".to_owned()),
+                RuntimeValue::Float(0.25),
+            ],
+            vec![
+                RuntimeValue::String("note.md".to_owned()),
+                RuntimeValue::String(String::new()),
+                RuntimeValue::String("markdown".to_owned()),
+                RuntimeValue::String("structural_edge".to_owned()),
+                RuntimeValue::String(root_string),
+                RuntimeValue::String("current".to_owned()),
+                RuntimeValue::String("filesystem".to_owned()),
+                RuntimeValue::Float(0.25),
+            ],
+        ]
+    );
+
+    let parent_edges = run(
+        &mut reopened,
+        "MATCH (child:MarkdownDirectory)-[e:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+         RETURN child.`src.path`, parent.`src.path`, e.`src.kind`, e.`md.edge_source`, e.`md.edge_weight`
+         ORDER BY child.`src.path`",
+    );
+    assert_eq!(
+        parent_edges.rows,
+        vec![
+            vec![
+                RuntimeValue::String("guides".to_owned()),
+                RuntimeValue::String(String::new()),
+                RuntimeValue::String("structural_edge".to_owned()),
+                RuntimeValue::String("filesystem".to_owned()),
+                RuntimeValue::Float(0.25),
+            ],
+            vec![
+                RuntimeValue::String("guides/api".to_owned()),
+                RuntimeValue::String("guides".to_owned()),
+                RuntimeValue::String("structural_edge".to_owned()),
+                RuntimeValue::String("filesystem".to_owned()),
+                RuntimeValue::Float(0.25),
+            ],
+        ]
+    );
+
+    let root_parent_edges = run(
+        &mut reopened,
+        "MATCH (root:MarkdownDirectory {`src.path`: ''})-[e:MD_PARENT_DIRECTORY]->(:MarkdownDirectory)
+         RETURN count(e)",
+    );
+    assert_eq!(root_parent_edges.rows, vec![vec![RuntimeValue::Int(0)]]);
+
+    let structural_counts = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN count(e)",
+    );
+    assert_eq!(structural_counts.rows, vec![vec![RuntimeValue::Int(3)]]);
+    let parent_counts = run(
+        &mut reopened,
+        "MATCH (child:MarkdownDirectory)-[e:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+         RETURN count(e)",
+    );
+    assert_eq!(parent_counts.rows, vec![vec![RuntimeValue::Int(2)]]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn file_moves_do_not_leave_stale_directory_edges() {
+    let db = TestDb::new("markdown_file_move_structural_edges");
+    let root = temp_dir("markdown_file_move_structural_edges");
+    fs::create_dir_all(root.join("old")).unwrap();
+    fs::create_dir_all(root.join("new")).unwrap();
+    fs::write(root.join("old/note.md"), "# Note").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    fs::rename(root.join("old/note.md"), root.join("new/note.md")).unwrap();
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let moved = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'new/note.md'})-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN dir.`src.path`, e.`src.status`",
+    );
+    assert_eq!(
+        moved.rows,
+        vec![vec![
+            RuntimeValue::String("new".to_owned()),
+            RuntimeValue::String("current".to_owned()),
+        ]]
+    );
+
+    let stale = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'old/note.md'})-[e:MD_IN_DIRECTORY]->(:MarkdownDirectory)
+         RETURN count(e)",
+    );
+    assert_eq!(stale.rows, vec![vec![RuntimeValue::Int(0)]]);
+
+    let old_status = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument {`src.path`: 'old/note.md'})
+         RETURN d.`src.status`",
+    );
+    assert_eq!(
+        old_status.rows,
+        vec![vec![RuntimeValue::String("missing".to_owned())]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn folder_deletion_tombstones_directories_and_preserves_manual_edges() {
+    let db = TestDb::new("markdown_folder_delete_structural_edges");
+    let root = temp_dir("markdown_folder_delete_structural_edges");
+    fs::create_dir_all(root.join("docs/child")).unwrap();
+    fs::write(root.join("docs/child/note.md"), "# Note").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut session = db.open();
+    run(
+        &mut session,
+        "MATCH (dir:MarkdownDirectory {`src.path`: 'docs/child'})
+         CREATE (:Person {name: 'Ada'})-[:MD_PARENT_DIRECTORY {note: 'manual'}]->(dir)",
+    );
+    drop(session);
+
+    fs::remove_dir_all(root.join("docs/child")).unwrap();
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let status = run(
+        &mut reopened,
+        "MATCH (dir:MarkdownDirectory {`src.path`: 'docs/child'})
+         RETURN dir.`src.status`",
+    );
+    assert_eq!(
+        status.rows,
+        vec![vec![RuntimeValue::String("missing".to_owned())]]
+    );
+
+    let stale_doc_edges = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: 'docs/child'})
+         RETURN count(e)",
+    );
+    assert_eq!(stale_doc_edges.rows, vec![vec![RuntimeValue::Int(0)]]);
+
+    let stale_parent_edges = run(
+        &mut reopened,
+        "MATCH (dir:MarkdownDirectory {`src.path`: 'docs/child'})-[e:MD_PARENT_DIRECTORY]->(:MarkdownDirectory)
+         RETURN count(e)",
+    );
+    assert_eq!(stale_parent_edges.rows, vec![vec![RuntimeValue::Int(0)]]);
+
+    let manual_edge = run(
+        &mut reopened,
+        "MATCH (p:Person {name: 'Ada'})-[e:MD_PARENT_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: 'docs/child'})
+         RETURN p.name, e.note, dir.`src.status`",
+    );
+    assert_eq!(
+        manual_edge.rows,
+        vec![vec![
+            RuntimeValue::String("Ada".to_owned()),
+            RuntimeValue::String("manual".to_owned()),
+            RuntimeValue::String("missing".to_owned()),
+        ]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn same_folder_membership_does_not_create_or_cleanup_md_links() {
+    let db = TestDb::new("markdown_same_folder_not_links");
+    let root = temp_dir("markdown_same_folder_not_links");
+    fs::create_dir_all(root.join("folder")).unwrap();
+    fs::write(root.join("folder/a.md"), "# A").unwrap();
+    fs::write(root.join("folder/b.md"), "# B").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut session = db.open();
+    let link_count = run(
+        &mut session,
+        "MATCH (:MarkdownDocument)-[e:MD_LINKS_TO]->(:MarkdownDocument)
+         RETURN count(e)",
+    );
+    assert_eq!(link_count.rows, vec![vec![RuntimeValue::Int(0)]]);
+    run(
+        &mut session,
+        "MATCH (a:MarkdownDocument {`src.path`: 'folder/a.md'})-[:MD_IN_DIRECTORY]->(:MarkdownDirectory {`src.path`: 'folder'})<-[:MD_IN_DIRECTORY]-(b:MarkdownDocument {`src.path`: 'folder/b.md'})
+         CREATE (a)-[:MD_LINKS_TO {`src.connector`: 'manual'}]->(b)",
+    );
+    drop(session);
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let manual_link = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'folder/a.md'})-[e:MD_LINKS_TO]->(:MarkdownDocument {`src.path`: 'folder/b.md'})
+         RETURN e.`src.connector`",
+    );
+    assert_eq!(
+        manual_link.rows,
+        vec![vec![RuntimeValue::String("manual".to_owned())]]
+    );
+
+    let in_directory = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: 'folder'})
+         RETURN count(e)",
+    );
+    assert_eq!(in_directory.rows, vec![vec![RuntimeValue::Int(2)]]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn tombstones_missing_documents_without_breaking_native_edges() {
     let db = TestDb::new("markdown_tombstone");
     let root = temp_dir("markdown_tombstone");
