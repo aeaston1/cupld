@@ -360,6 +360,41 @@ cupld sync markdown --db default --include-fs-graph
 cupld source set-root --db default /absolute/path/to/notes
 ```
 
+Markdown memory maintenance:
+
+```bash
+cupld memory check --db default
+```
+
+```bash
+cupld memory check --db default --strict --output json
+```
+
+```bash
+cupld memory find-stale --db default --root /absolute/path/to/notes --output table
+```
+
+```bash
+cupld memory find-orphans --db default --output ndjson
+```
+
+```bash
+cupld memory reindex --db default --output json
+```
+
+Maintenance command behavior:
+
+- Root resolution for `memory check` and `memory find-stale` follows the same markdown order: explicit `--root`, `.cupld/config.toml`, the DB root set by `cupld source set-root`, then `./.cupld/data`. Relative roots resolve against the workspace package root.
+- `memory find-orphans` and `memory reindex` do not accept `--root`; machine output reports `root: null`.
+- `pass` means no issue was found, `warn` means stale or suspicious state was reported but the command completed, and `fail` is reserved for hard command failures.
+- `memory check --strict` exits with code 2 when the aggregate report status is `warn`. The emitted report still uses `status: "warn"` so automation can distinguish warnings from command failures.
+- `memory check` validates storage integrity, markdown freshness, required markdown metadata, duplicate current paths, duplicate connector-owned `MD_LINKS_TO` edges, schema index readiness, stale items, orphan items, and ambiguous markdown aliases.
+- `memory find-stale` reports filesystem freshness problems such as changed files, missing current files, tombstoned documents, incomplete metadata, and root mismatches.
+- `memory find-orphans` reports current markdown documents with no markdown or native graph connectivity.
+- `memory reindex` inspects existing schema index definitions and reports their current status; it does not create new indexes.
+- Use `cupld sync markdown --db default` or `cupld sync markdown --db default --root /absolute/path/to/notes` to refresh markdown-derived DB state after changing markdown files.
+- `cupld memory repair` and `cupld memory citation-audit` are deferred for a later implementation round.
+
 Document to directory traversal after an opt-in filesystem sync:
 
 ```bash
@@ -411,6 +446,7 @@ Markdown notes:
 - `cupld check --output json` includes storage integrity plus markdown alias diagnostics, including ambiguous alias counts and colliding paths.
 - `cupld memory check|find-stale|find-orphans|reindex --output json` writes one JSON envelope to stdout with `ok`, `command`, `status`, resolved `db_path`, resolved `root` where applicable, `summary`, `checks`, and `items`.
 - `cupld memory ... --output ndjson` writes one `memory_meta` line, one `memory_check` line per check, and one `memory_item` line per item.
+- `cupld memory ... --output table` is the default human-readable sectioned table format.
 - Memory maintenance `status` values are stable: `pass`, `warn`, and `fail`.
 - `query` and `context` failures in JSON or NDJSON mode write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
 - Memory maintenance failures in JSON or NDJSON mode also write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
