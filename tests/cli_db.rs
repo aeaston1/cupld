@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cupld::{RuntimeValue, Session, json};
 
-use support::{TestDb, seed_person_graph};
+use support::{TestDb, run, seed_person_graph};
 
 static NEXT_NEW_DB_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -673,6 +673,41 @@ fn cli_sync_markdown_persists_documents_into_db() {
 }
 
 #[test]
+fn cli_sync_markdown_include_fs_graph_persists_structural_graph() {
+    let db = TestDb::new("cli_markdown_sync_fs_graph");
+    let root = TempDir::new("cli_markdown_sync_fs_graph_root");
+    fs::create_dir_all(root.path().join("notes")).unwrap();
+    fs::write(root.path().join("notes").join("synced.md"), "# Synced").unwrap();
+
+    let output = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--include-fs-graph",
+    ]);
+
+    assert!(output.status.success());
+
+    let mut session = db.open();
+    let result = run(
+        &mut session,
+        "MATCH (doc:MarkdownDocument {`src.path`: 'notes/synced.md'})-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: 'notes'})
+         RETURN dir.name, doc.`src.path`, e.`md.edge_source`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::String("notes".to_owned()),
+            RuntimeValue::String("notes/synced.md".to_owned()),
+            RuntimeValue::String("filesystem".to_owned()),
+        ]]
+    );
+}
+
+#[test]
 fn cli_sync_markdown_watch_can_include_filesystem_graph() {
     let db = TestDb::new("cli_markdown_sync_fs_graph_watch");
     let root = TempDir::new("cli_markdown_sync_fs_graph_watch_root");
@@ -698,20 +733,46 @@ fn cli_sync_markdown_watch_can_include_filesystem_graph() {
     assert!(stdout.contains("scanned=1"));
 
     let mut session = db.open();
-    let result = session
-        .execute_script(
-            "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
-             RETURN d.`src.path`, dir.`src.path`
-             ORDER BY d.`src.path`",
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap()
-        .remove(0);
+    let result = run(
+        &mut session,
+        "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN d.`src.path`, dir.`src.path`
+         ORDER BY d.`src.path`",
+    );
     assert_eq!(
         result.rows,
         vec![vec![
             RuntimeValue::String("project/synced.md".to_owned()),
             RuntimeValue::String("project".to_owned()),
         ]]
+    );
+}
+
+#[test]
+fn cli_sync_markdown_reads_include_fs_graph_from_workspace_config() {
+    let workspace = TempDir::new("cli_markdown_sync_fs_graph_config");
+    let db_path = seed_workspace_default_db(workspace.path());
+    let notes_root = workspace.path().join("notes");
+    fs::create_dir_all(&notes_root).unwrap();
+    fs::write(notes_root.join("configured.md"), "# Configured").unwrap();
+    fs::write(
+        workspace.path().join(".cupld").join("config.toml"),
+        "version = 1\n\n[package]\nmarkdown_root = \"notes\"\n\n[markdown]\ninclude_fs_graph = true\n",
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(&["sync", "markdown", "--db", "default"], workspace.path());
+
+    assert!(output.status.success());
+
+    let mut session = Session::open(&db_path).unwrap();
+    let result = run(
+        &mut session,
+        "MATCH (doc:MarkdownDocument {`src.path`: 'configured.md'})-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: '.'})
+         RETURN doc.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![RuntimeValue::String("configured.md".to_owned())]]
     );
 }

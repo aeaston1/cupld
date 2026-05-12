@@ -49,6 +49,7 @@ Important constraints:
 - Passing a missing `path.cupld` to the REPL creates a new database file.
 - Opening or checking an older `.cupld` file may upgrade it in place to the current on-disk format.
 - Repo-local package defaults live in `.cupld/config.toml`.
+- `[markdown] include_fs_graph = true` enables filesystem structure sync for `cupld sync markdown` only.
 - `--db default` is an alias for `./.cupld/default.cupld`.
 - `install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in user config `install-state.toml`.
 - If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
