@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cupld::{RuntimeValue, Session, json};
+use cupld::{RuntimeValue, Session, Value, json};
 
 use support::{TestDb, run, seed_person_graph};
 
@@ -689,19 +689,135 @@ fn cli_memory_find_stale_ndjson_reports_changed_markdown() {
     );
     assert_eq!(
         item.get("item")
-            .and_then(|item| item.get("reason"))
+            .and_then(|item| item.get("kind"))
             .and_then(json::JsonValue::as_str),
         Some("hash_mismatch")
+    );
+    assert!(
+        item.get("item")
+            .and_then(|item| item.get("stored_hash"))
+            .and_then(json::JsonValue::as_str)
+            .is_some()
+    );
+    assert!(
+        item.get("item")
+            .and_then(|item| item.get("current_hash"))
+            .and_then(json::JsonValue::as_str)
+            .is_some()
     );
 }
 
 #[test]
-fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
+fn cli_memory_find_stale_json_reports_filesystem_freshness_kinds() {
+    let db = TestDb::new("cli_memory_find_stale_kinds");
+    let root = TempDir::new("cli_memory_find_stale_kinds_root");
+    for (path, title) in [
+        ("changed.md", "Changed"),
+        ("missing.md", "Missing"),
+        ("tombstone.md", "Tombstone"),
+        ("metadata.md", "Metadata"),
+        ("root.md", "Root"),
+    ] {
+        fs::write(root.path().join(path), format!("# {title}\n")).unwrap();
+    }
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+
+    fs::write(root.path().join("changed.md"), "# Changed\n\nupdated\n").unwrap();
+    fs::remove_file(root.path().join("missing.md")).unwrap();
+    let mut session = db.open();
+    let mut engine = session.engine().clone();
+    let tombstone_id = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("tombstone.md")))
+        .unwrap()
+        .id();
+    engine
+        .set_node_property(tombstone_id, "src.status", Value::from("missing"))
+        .unwrap();
+    let metadata_id = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("metadata.md")))
+        .unwrap()
+        .id();
+    engine
+        .remove_node_property(metadata_id, "src.hash")
+        .unwrap();
+    let root_id = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("root.md")))
+        .unwrap()
+        .id();
+    engine
+        .set_node_property(root_id, "src.root", Value::from("/tmp/other-root"))
+        .unwrap();
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "find-stale",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
+    );
+    let items = parsed
+        .get("items")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    for kind in [
+        "hash_mismatch",
+        "missing_file",
+        "tombstoned_document",
+        "metadata_incomplete",
+        "root_mismatch",
+    ] {
+        let item = items
+            .iter()
+            .find(|item| item.get("kind").and_then(json::JsonValue::as_str) == Some(kind))
+            .unwrap_or_else(|| panic!("missing stale item kind {kind}: {stdout}"));
+        assert!(item.get("path").is_some());
+        assert!(item.get("title").is_some());
+        assert!(item.get("status").is_some());
+        assert!(item.get("stored_hash").is_some());
+        assert!(item.get("current_hash").is_some());
+        assert!(
+            item.get("suggestion")
+                .and_then(json::JsonValue::as_str)
+                .unwrap()
+                .contains("cupld sync markdown --db ... --root")
+        );
+    }
+}
+
+#[test]
+fn cli_memory_find_orphans_json_reports_disconnected_current_markdown() {
     let db = TestDb::new("cli_memory_find_orphans");
     let root = TempDir::new("cli_memory_find_orphans_root");
-    fs::write(root.path().join("old.md"), "# Old").unwrap();
+    fs::write(root.path().join("b.md"), "# Bee").unwrap();
+    fs::write(root.path().join("a.md"), "# Aye").unwrap();
 
-    let first_sync = run_cli(&[
+    let sync = run_cli(&[
         "sync",
         "markdown",
         "--db",
@@ -709,17 +825,7 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
         "--root",
         root.path().to_str().unwrap(),
     ]);
-    assert!(first_sync.status.success());
-    fs::remove_file(root.path().join("old.md")).unwrap();
-    let second_sync = run_cli(&[
-        "sync",
-        "markdown",
-        "--db",
-        db.path().to_str().unwrap(),
-        "--root",
-        root.path().to_str().unwrap(),
-    ]);
-    assert!(second_sync.status.success());
+    assert!(sync.status.success());
 
     let output = run_cli(&[
         "memory",
@@ -742,20 +848,56 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
             .get("summary")
             .and_then(|summary| summary.get("orphan_items"))
             .and_then(json::JsonValue::as_i64),
-        Some(1)
+        Some(2)
     );
     let items = parsed
         .get("items")
         .and_then(json::JsonValue::as_array)
         .unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(
-        items[0].get("kind").and_then(json::JsonValue::as_str),
-        Some("document")
-    );
+    assert_eq!(items.len(), 2);
     assert_eq!(
         items[0].get("path").and_then(json::JsonValue::as_str),
-        Some("old.md")
+        Some("a.md")
+    );
+    assert_eq!(
+        items[0].get("title").and_then(json::JsonValue::as_str),
+        Some("Aye")
+    );
+    assert_eq!(
+        items[0].get("status").and_then(json::JsonValue::as_str),
+        Some("current")
+    );
+    assert_eq!(
+        items[0]
+            .get("markdown_inbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0]
+            .get("markdown_outbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0]
+            .get("native_inbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0]
+            .get("native_outbound_count")
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        items[0].get("reason").and_then(json::JsonValue::as_str),
+        Some("no_markdown_or_native_connectivity")
+    );
+    assert_eq!(
+        items[1].get("path").and_then(json::JsonValue::as_str),
+        Some("b.md")
     );
     let checks = parsed
         .get("checks")
@@ -769,6 +911,97 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
         checks[0].get("status").and_then(json::JsonValue::as_str),
         Some("warn")
     );
+}
+
+#[test]
+fn cli_memory_find_orphans_excludes_markdown_links_and_native_edges() {
+    let db = TestDb::new("cli_memory_find_orphans_connected");
+    let root = TempDir::new("cli_memory_find_orphans_connected_root");
+    fs::write(
+        root.path().join("linked-source.md"),
+        "[target](linked-target.md)",
+    )
+    .unwrap();
+    fs::write(root.path().join("linked-target.md"), "# Linked Target").unwrap();
+    fs::write(root.path().join("native-in.md"), "# Native In").unwrap();
+    fs::write(root.path().join("native-out.md"), "# Native Out").unwrap();
+    fs::write(root.path().join("directory-only.md"), "# Directory Only").unwrap();
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--filesystem-graph",
+    ]);
+    assert!(sync.status.success());
+
+    let mut session = db.open();
+    run(
+        &mut session,
+        "MATCH (d:MarkdownDocument {`src.path`: 'native-in.md'})
+         CREATE (:Person {name: 'Ada'})-[:REFERS_TO]->(d)",
+    );
+    run(
+        &mut session,
+        "MATCH (d:MarkdownDocument {`src.path`: 'native-out.md'})
+         CREATE (d)-[:DESCRIBES]->(:Topic {name: 'Graph'})",
+    );
+    session.save().unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "find-orphans",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut paths = Vec::new();
+    for line in stdout.lines() {
+        let parsed = json::parse(line).unwrap();
+        if parsed.get("kind").and_then(json::JsonValue::as_str) == Some("memory_item") {
+            paths.push(
+                parsed
+                    .get("item")
+                    .and_then(|item| item.get("path"))
+                    .and_then(json::JsonValue::as_str)
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(paths, vec!["directory-only.md"]);
+}
+
+#[test]
+fn cli_memory_reindex_reads_default_workspace_root() {
+    let workspace = TempDir::new("cli_memory_reindex_default_root");
+    fs::create_dir_all(workspace.path().join(".cupld")).unwrap();
+    fs::write(
+        workspace.path().join(".cupld").join("config.toml"),
+        "version = 1\n\n[package]\nmarkdown_root = \"notes\"\n",
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(
+        &["memory", "reindex", "--db", "default", "--output", "json"],
+        workspace.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("db_path").and_then(json::JsonValue::as_str),
+        workspace_default_db_path(workspace.path()).to_str()
+    );
+    assert_eq!(parsed.get("root"), Some(&json::JsonValue::Null));
 }
 
 #[test]

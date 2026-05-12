@@ -52,7 +52,9 @@ hooks:
         fi
       done
 agent:
-  max_concurrent_agents: 1
+  max_concurrent_agents: 5
+  max_concurrent_agents_by_state:
+    Merging: 1
   max_turns: 10
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=low --config 'service_tier="fast"' app-server
@@ -148,7 +150,7 @@ When the issue is in `Rework`:
 When the issue is in `Merging`:
 
 1. Find the open PR for the current branch.
-2. Confirm the PR is mergeable and has no unresolved actionable review feedback.
+2. Confirm the PR is mergeable and has no unresolved actionable review feedback. `Human Review` is the manual approval gate; do not treat an empty GitHub `reviewDecision` as blocking unless branch protection or explicit repo policy requires approval.
 3. Confirm required checks are passing:
    - `gh pr checks --repo aeaston1/cupld`
 4. If checks fail, inspect logs, fix the issue, rerun validation, commit, and push.
