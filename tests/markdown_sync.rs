@@ -8,8 +8,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cupld::{
-    MarkdownWatchOptions, RuntimeValue, Session, configured_markdown_root, set_markdown_root,
-    sync_markdown_root, watch_markdown_root,
+    MarkdownSyncOptions, MarkdownWatchOptions, RuntimeValue, Session, configured_markdown_root,
+    set_markdown_root, sync_markdown_root_with_options, watch_markdown_root_with_sync_options,
 };
 
 use support::{TestDb, run};
@@ -57,6 +57,49 @@ Body\n",
                 RuntimeValue::String("current".to_owned()),
             ],
         ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_sync_is_opt_in() {
+    let db = TestDb::new("markdown_fs_graph_opt_in");
+    let root = temp_dir("markdown_fs_graph_opt_in");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join("notes").join("one.md"), "# One").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut default_sync = db.open();
+    let directories = run(
+        &mut default_sync,
+        "MATCH (d:MarkdownDirectory) RETURN count(d)",
+    );
+    assert_eq!(directories.rows, vec![vec![RuntimeValue::Int(0)]]);
+    drop(default_sync);
+
+    sync_root_into_db_with_options(
+        db.path(),
+        &root,
+        MarkdownSyncOptions {
+            include_fs_graph: true,
+        },
+    );
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (dir:MarkdownDirectory {`src.path`: 'notes'})-[e:FS_CONTAINS]->(doc:MarkdownDocument)
+         RETURN dir.`fs.name`, doc.`src.path`, e.`fs.child_kind`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::String("notes".to_owned()),
+            RuntimeValue::String("notes/one.md".to_owned()),
+            RuntimeValue::String("document".to_owned()),
+        ]]
     );
 
     fs::remove_dir_all(root).unwrap();
@@ -491,6 +534,55 @@ fn watch_mode_coalesces_duplicate_events_and_partial_writes() {
 }
 
 #[test]
+fn watch_mode_preserves_filesystem_graph_option() {
+    let db = TestDb::new("markdown_watch_fs_graph");
+    let root = temp_dir("markdown_watch_fs_graph");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join("notes").join("start.md"), "# Start").unwrap();
+
+    let writer_root = root.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(40));
+        fs::write(writer_root.join("notes").join("later.md"), "# Later").unwrap();
+    });
+
+    let report = watch_root_into_db_with_sync_options(
+        db.path(),
+        &root,
+        MarkdownWatchOptions {
+            poll_interval: Duration::from_millis(10),
+            debounce: Duration::from_millis(40),
+            max_batch_window: Duration::from_millis(150),
+            idle_timeout: Some(Duration::from_millis(500)),
+            max_runs: Some(2),
+        },
+        MarkdownSyncOptions {
+            include_fs_graph: true,
+        },
+    );
+    writer.join().unwrap();
+
+    assert_eq!(report.sync_runs, 2);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (dir:MarkdownDirectory {`src.path`: 'notes'})-[:FS_CONTAINS]->(doc:MarkdownDocument)
+         RETURN doc.`src.path`
+         ORDER BY doc.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![RuntimeValue::String("notes/later.md".to_owned())],
+            vec![RuntimeValue::String("notes/start.md".to_owned())],
+        ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn watch_mode_handles_rename_save_restart_and_malformed_frontmatter() {
     let db = TestDb::new("markdown_watch_restart");
     let root = temp_dir("markdown_watch_restart");
@@ -546,9 +638,17 @@ fn watch_mode_handles_rename_save_restart_and_malformed_frontmatter() {
 }
 
 fn sync_root_into_db(db_path: &std::path::Path, root: &std::path::Path) {
+    sync_root_into_db_with_options(db_path, root, MarkdownSyncOptions::default());
+}
+
+fn sync_root_into_db_with_options(
+    db_path: &std::path::Path,
+    root: &std::path::Path,
+    options: MarkdownSyncOptions,
+) {
     let mut session = Session::open(db_path).unwrap();
     let mut engine = session.engine().clone();
-    let report = sync_markdown_root(&mut engine, root).unwrap();
+    let report = sync_markdown_root_with_options(&mut engine, root, &options).unwrap();
     assert!(report.upserted_documents > 0 || report.tombstoned_documents > 0);
     engine.commit().unwrap();
     session.replace_engine(engine).unwrap();
@@ -560,9 +660,19 @@ fn watch_root_into_db(
     root: &std::path::Path,
     options: MarkdownWatchOptions,
 ) -> cupld::MarkdownWatchReport {
+    watch_root_into_db_with_sync_options(db_path, root, options, MarkdownSyncOptions::default())
+}
+
+fn watch_root_into_db_with_sync_options(
+    db_path: &std::path::Path,
+    root: &std::path::Path,
+    options: MarkdownWatchOptions,
+    sync_options: MarkdownSyncOptions,
+) -> cupld::MarkdownWatchReport {
     let mut session = Session::open(db_path).unwrap();
     let mut engine = session.engine().clone();
-    let report = watch_markdown_root(&mut engine, root, &options).unwrap();
+    let report =
+        watch_markdown_root_with_sync_options(&mut engine, root, &options, &sync_options).unwrap();
     engine.commit().unwrap();
     session.replace_engine(engine).unwrap();
     session.save().unwrap();

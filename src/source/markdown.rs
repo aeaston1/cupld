@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -8,11 +8,13 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use crate::engine::{CupldEngine, GraphError, NodeId, PropertyMap, Value};
 
 const MARKDOWN_DOCUMENT_LABEL: &str = "MarkdownDocument";
+const MARKDOWN_DIRECTORY_LABEL: &str = "MarkdownDirectory";
 const CONFIG_LABEL: &str = "SystemConfig";
 const CONFIG_KIND: &str = "config";
 const CONFIG_NAME: &str = "markdown_source";
 const CONNECTOR_NAME: &str = "markdown";
 const LINK_EDGE_TYPE: &str = "MD_LINKS_TO";
+const FS_CONTAINS_EDGE_TYPE: &str = "FS_CONTAINS";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownDocument {
@@ -162,6 +164,11 @@ pub struct MarkdownSyncReport {
     pub link_edges: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkdownSyncOptions {
+    pub include_fs_graph: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownWatchOptions {
     pub poll_interval: Duration,
@@ -292,6 +299,14 @@ pub fn sync_markdown_root(
     engine: &mut CupldEngine,
     root: &Path,
 ) -> Result<MarkdownSyncReport, SourceError> {
+    sync_markdown_root_with_options(engine, root, &MarkdownSyncOptions::default())
+}
+
+pub fn sync_markdown_root_with_options(
+    engine: &mut CupldEngine,
+    root: &Path,
+    options: &MarkdownSyncOptions,
+) -> Result<MarkdownSyncReport, SourceError> {
     let root = normalize_root_path(root)?;
     let documents = scan_markdown_root(&root)?;
     let root_string = path_to_string(&root);
@@ -300,6 +315,9 @@ pub fn sync_markdown_root(
     let doc_node_ids = upsert_documents(engine, &root_string, &documents, &mut existing_docs)?;
     let link_edges = sync_link_edges(engine, &documents, &doc_node_ids)?;
     let tombstoned_documents = tombstone_missing_documents(engine, &existing_docs)?;
+    if options.include_fs_graph {
+        sync_filesystem_graph(engine, &root_string, &documents, &doc_node_ids)?;
+    }
 
     Ok(MarkdownSyncReport {
         root,
@@ -315,8 +333,21 @@ pub fn watch_markdown_root(
     root: &Path,
     options: &MarkdownWatchOptions,
 ) -> Result<MarkdownWatchReport, SourceError> {
+    watch_markdown_root_with_sync_options(engine, root, options, &MarkdownSyncOptions::default())
+}
+
+pub fn watch_markdown_root_with_sync_options(
+    engine: &mut CupldEngine,
+    root: &Path,
+    options: &MarkdownWatchOptions,
+    sync_options: &MarkdownSyncOptions,
+) -> Result<MarkdownWatchReport, SourceError> {
     let root = normalize_root_path(root)?;
-    let mut last_report = Some(sync_markdown_root(engine, &root)?);
+    let mut last_report = Some(sync_markdown_root_with_options(
+        engine,
+        &root,
+        sync_options,
+    )?);
     let mut report = MarkdownWatchReport {
         root: root.clone(),
         sync_runs: 1,
@@ -351,7 +382,7 @@ pub fn watch_markdown_root(
         }
 
         if batcher.should_flush(now, options) {
-            let sync_report = sync_markdown_root(engine, &root)?;
+            let sync_report = sync_markdown_root_with_options(engine, &root, sync_options)?;
             report.sync_runs += 1;
             last_report = Some(sync_report.clone());
             batcher.flush();
@@ -536,6 +567,203 @@ fn tombstone_missing_documents(
     Ok(existing_docs.len())
 }
 
+fn sync_filesystem_graph(
+    engine: &mut CupldEngine,
+    root: &str,
+    documents: &[MarkdownDocument],
+    document_node_ids: &BTreeMap<String, NodeId>,
+) -> Result<usize, SourceError> {
+    let directory_paths = collect_directory_paths(documents);
+    let mut existing_dirs = collect_existing_directories(engine, root);
+    let mut directory_node_ids = BTreeMap::new();
+
+    for directory in &directory_paths {
+        let relative = path_to_string(directory);
+        let node_id = match existing_dirs.remove(&relative) {
+            Some(node_id) => {
+                merge_directory_properties(engine, node_id, root, directory)?;
+                node_id
+            }
+            None => engine.create_node(
+                [MARKDOWN_DIRECTORY_LABEL],
+                directory_properties(root, directory),
+            )?,
+        };
+        directory_node_ids.insert(relative, node_id);
+    }
+
+    for node_id in directory_node_ids.values().copied() {
+        delete_connector_fs_edges(engine, node_id)?;
+    }
+    for node_id in existing_dirs.values().copied() {
+        engine.set_node_property(node_id, "src.status", Value::from("missing"))?;
+        delete_connector_fs_edges(engine, node_id)?;
+    }
+
+    let mut created_edges = 0usize;
+    for directory in &directory_paths {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let parent = parent_directory_path(directory);
+        let parent_key = path_to_string(&parent);
+        let child_key = path_to_string(directory);
+        let Some(parent_id) = directory_node_ids.get(&parent_key).copied() else {
+            continue;
+        };
+        let Some(child_id) = directory_node_ids.get(&child_key).copied() else {
+            continue;
+        };
+        create_filesystem_edge(engine, parent_id, child_id, "directory")?;
+        created_edges += 1;
+    }
+
+    for document in documents {
+        let document_key = path_to_string(&document.path);
+        let parent = parent_directory_path(&document.path);
+        let parent_key = path_to_string(&parent);
+        let Some(parent_id) = directory_node_ids.get(&parent_key).copied() else {
+            continue;
+        };
+        let Some(document_id) = document_node_ids.get(&document_key).copied() else {
+            continue;
+        };
+        create_filesystem_edge(engine, parent_id, document_id, "document")?;
+        created_edges += 1;
+    }
+
+    Ok(created_edges)
+}
+
+fn collect_existing_directories(engine: &CupldEngine, root: &str) -> BTreeMap<String, NodeId> {
+    let mut directories = BTreeMap::new();
+    for node in engine.nodes() {
+        let Some(Value::String(connector)) = node.property("src.connector") else {
+            continue;
+        };
+        if connector != CONNECTOR_NAME {
+            continue;
+        }
+        let Some(Value::String(kind)) = node.property("src.kind") else {
+            continue;
+        };
+        if kind != "directory" {
+            continue;
+        }
+        let Some(Value::String(node_root)) = node.property("src.root") else {
+            continue;
+        };
+        if node_root != root {
+            continue;
+        }
+        let Some(Value::String(path)) = node.property("src.path") else {
+            continue;
+        };
+        directories.insert(path.clone(), node.id());
+    }
+    directories
+}
+
+fn merge_directory_properties(
+    engine: &mut CupldEngine,
+    node_id: NodeId,
+    root: &str,
+    path: &Path,
+) -> Result<(), SourceError> {
+    let Some(node) = engine.node(node_id) else {
+        return Err(SourceError::new(
+            "node_not_found",
+            "directory node disappeared",
+        ));
+    };
+    let mut properties = node.properties().clone();
+    let removable = properties
+        .keys()
+        .filter(|key| key.starts_with("src.") || key.starts_with("fs."))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    for key in removable {
+        properties.remove(&key);
+    }
+    for (key, value) in directory_properties(root, path).into_iter() {
+        properties.insert(key, value);
+    }
+    engine.replace_node_properties(node_id, properties)?;
+    Ok(())
+}
+
+fn directory_properties(root: &str, path: &Path) -> PropertyMap {
+    PropertyMap::from_pairs([
+        ("src.connector", Value::from(CONNECTOR_NAME)),
+        ("src.kind", Value::from("directory")),
+        ("src.root", Value::from(root.to_owned())),
+        ("src.path", Value::from(path_to_string(path))),
+        ("src.status", Value::from("current")),
+        ("fs.name", Value::from(directory_name(path))),
+        ("fs.depth", Value::from(path_depth(path) as i64)),
+    ])
+}
+
+fn collect_directory_paths(documents: &[MarkdownDocument]) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    paths.insert(PathBuf::new());
+
+    for document in documents {
+        let parent = parent_directory_path(&document.path);
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            if let Component::Normal(segment) = component {
+                current.push(segment);
+                paths.insert(current.clone());
+            }
+        }
+    }
+
+    paths
+}
+
+fn parent_directory_path(path: &Path) -> PathBuf {
+    path.parent()
+        .and_then(normalize_relative_path)
+        .unwrap_or_default()
+}
+
+fn directory_name(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        return ".".to_owned();
+    }
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| path_to_string(path))
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count()
+}
+
+fn create_filesystem_edge(
+    engine: &mut CupldEngine,
+    from: NodeId,
+    to: NodeId,
+    child_kind: &str,
+) -> Result<(), SourceError> {
+    engine.create_edge(
+        from,
+        to,
+        FS_CONTAINS_EDGE_TYPE,
+        PropertyMap::from_pairs([
+            ("src.connector", Value::from(CONNECTOR_NAME)),
+            ("src.kind", Value::from("filesystem")),
+            ("src.status", Value::from("current")),
+            ("fs.child_kind", Value::from(child_kind)),
+        ]),
+    )?;
+    Ok(())
+}
+
 fn delete_connector_link_edges(
     engine: &mut CupldEngine,
     node_id: NodeId,
@@ -546,6 +774,25 @@ fn delete_connector_link_edges(
             continue;
         };
         let is_connector_edge = edge.edge_type() == LINK_EDGE_TYPE
+            && matches!(
+                edge.property("src.connector"),
+                Some(Value::String(connector)) if connector == CONNECTOR_NAME
+            );
+        if !is_connector_edge {
+            continue;
+        }
+        engine.delete_edge(edge_id)?;
+    }
+    Ok(())
+}
+
+fn delete_connector_fs_edges(engine: &mut CupldEngine, node_id: NodeId) -> Result<(), SourceError> {
+    let edge_ids = engine.outgoing_edge_ids(node_id);
+    for edge_id in edge_ids {
+        let Some(edge) = engine.edge(edge_id) else {
+            continue;
+        };
+        let is_connector_edge = edge.edge_type() == FS_CONTAINS_EDGE_TYPE
             && matches!(
                 edge.property("src.connector"),
                 Some(Value::String(connector)) if connector == CONNECTOR_NAME

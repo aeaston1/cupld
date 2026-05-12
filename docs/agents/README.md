@@ -35,7 +35,7 @@ cupld context --db <path.cupld|default> [--top-k <n>] [--output <table|json|ndjs
 cupld schema --db <path.cupld|default>
 cupld compact --db <path.cupld|default>
 cupld check --db <path.cupld|default>
-cupld sync markdown --db <path.cupld|default> [--root <path>] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
+cupld sync markdown --db <path.cupld|default> [--root <path>] [--include-fs-graph] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
 cupld source set-root --db <path.cupld|default> <path>
 cupld mcp serve --db <path.cupld|default> [--root <path>] [--read-only]
 cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld|default>] [--root <path>] [--force] [--yes]
@@ -49,6 +49,7 @@ Important constraints:
 - Passing a missing `path.cupld` to the REPL creates a new database file.
 - Opening or checking an older `.cupld` file may upgrade it in place to the current on-disk format.
 - Repo-local package defaults live in `.cupld/config.toml`.
+- `[markdown] include_fs_graph = true` enables filesystem structure sync for `cupld sync markdown` only.
 - `--db default` is an alias for `./.cupld/default.cupld`.
 - `install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in user config `install-state.toml`.
 - If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
@@ -328,6 +329,7 @@ Markdown behavior:
 
 - `cupld query --with-md` overlays markdown into a temporary query session and does not persist imported notes.
 - `cupld sync markdown` persists markdown documents and `:MD_LINKS_TO` edges from body links plus supported frontmatter relationship keys into the database.
+- `cupld sync markdown --include-fs-graph` also persists `MarkdownDirectory` nodes and `:FS_CONTAINS` edges for the current markdown file tree.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
 - `--poll-ms` controls the poll interval.
 - `--debounce-ms` controls the stable-change debounce window.
@@ -345,6 +347,10 @@ cupld query --db default --with-md \
 
 ```bash
 cupld sync markdown --db default --watch --idle-ms 500 --max-runs 2
+```
+
+```bash
+cupld sync markdown --db default --include-fs-graph
 ```
 
 ```bash
