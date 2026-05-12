@@ -435,9 +435,9 @@ fn cli_check_reports_generated_db_integrity() {
 }
 
 #[test]
-fn cli_check_json_reports_ambiguous_markdown_aliases_from_current_documents() {
-    let db = TestDb::new("cli_check_alias_diagnostics");
-    let root = TempDir::new("cli_check_alias_diagnostics_root");
+fn cli_memory_check_json_reports_ambiguous_markdown_aliases_from_current_documents() {
+    let db = TestDb::new("cli_memory_check_alias_diagnostics");
+    let root = TempDir::new("cli_memory_check_alias_diagnostics_root");
     fs::write(
         root.path().join("one.md"),
         "---\n\
@@ -474,9 +474,12 @@ aliases: [Unique]\n\
     assert!(sync.status.success());
 
     let output = run_cli(&[
+        "memory",
         "check",
         "--db",
         db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
         "--output",
         "json",
     ]);
@@ -489,7 +492,14 @@ aliases: [Unique]\n\
     );
     assert_eq!(
         parsed.get("command").and_then(json::JsonValue::as_str),
-        Some("check")
+        Some("memory.check")
+    );
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("ambiguous_markdown_aliases"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
     );
     assert_eq!(
         parsed
@@ -532,9 +542,12 @@ aliases: [Unique]\n\
     assert!(sync.status.success());
 
     let output = run_cli(&[
+        "memory",
         "check",
         "--db",
         db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
         "--output",
         "json",
     ]);
@@ -548,6 +561,208 @@ aliases: [Unique]\n\
             .and_then(json::JsonValue::as_i64),
         Some(0)
     );
+}
+
+#[test]
+fn cli_memory_check_outputs_json_report() {
+    let db = TestDb::new("cli_memory_check_json");
+
+    let output = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "json",
+        "--strict",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("ok").and_then(json::JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        parsed.get("command").and_then(json::JsonValue::as_str),
+        Some("memory.check")
+    );
+    assert_eq!(
+        parsed.get("strict").and_then(json::JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("status"))
+            .and_then(json::JsonValue::as_str),
+        Some("ok")
+    );
+}
+
+#[test]
+fn cli_memory_find_stale_ndjson_reports_changed_markdown() {
+    let db = TestDb::new("cli_memory_find_stale");
+    let root = TempDir::new("cli_memory_find_stale_root");
+    fs::write(root.path().join("note.md"), "# Original").unwrap();
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+    fs::write(root.path().join("note.md"), "# Changed").unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "find-stale",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    let meta = json::parse(lines[0]).unwrap();
+    assert_eq!(
+        meta.get("kind").and_then(json::JsonValue::as_str),
+        Some("memory_meta")
+    );
+    assert_eq!(
+        meta.get("item_count").and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    let item = json::parse(lines[1]).unwrap();
+    assert_eq!(
+        item.get("item")
+            .and_then(|item| item.get("path"))
+            .and_then(json::JsonValue::as_str),
+        Some("note.md")
+    );
+    assert_eq!(
+        item.get("item")
+            .and_then(|item| item.get("reason"))
+            .and_then(json::JsonValue::as_str),
+        Some("hash_mismatch")
+    );
+}
+
+#[test]
+fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
+    let db = TestDb::new("cli_memory_find_orphans");
+    let root = TempDir::new("cli_memory_find_orphans_root");
+    fs::write(root.path().join("old.md"), "# Old").unwrap();
+
+    let first_sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(first_sync.status.success());
+    fs::remove_file(root.path().join("old.md")).unwrap();
+    let second_sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(second_sync.status.success());
+
+    let output = run_cli(&[
+        "memory",
+        "find-orphans",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("orphan_items"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    let items = parsed
+        .get("items")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].get("kind").and_then(json::JsonValue::as_str),
+        Some("document")
+    );
+    assert_eq!(
+        items[0].get("path").and_then(json::JsonValue::as_str),
+        Some("old.md")
+    );
+}
+
+#[test]
+fn cli_memory_reindex_reads_default_workspace_root() {
+    let workspace = TempDir::new("cli_memory_reindex_default_root");
+    let notes_root = workspace.path().join("notes");
+    fs::create_dir_all(&notes_root).unwrap();
+    fs::write(notes_root.join("indexed.md"), "# Indexed").unwrap();
+    fs::create_dir_all(workspace.path().join(".cupld")).unwrap();
+    fs::write(
+        workspace.path().join(".cupld").join("config.toml"),
+        "version = 1\n\n[package]\nmarkdown_root = \"notes\"\n",
+    )
+    .unwrap();
+
+    let output = run_cli_in_dir(
+        &["memory", "reindex", "--db", "default", "--output", "json"],
+        workspace.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("command").and_then(json::JsonValue::as_str),
+        Some("memory.reindex")
+    );
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("scanned_documents"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert!(workspace_default_db_path(workspace.path()).exists());
+}
+
+#[test]
+fn cli_memory_deferred_and_unknown_subcommands_error_clearly() {
+    let repair = run_cli(&["memory", "repair", "--db", "default"]);
+    assert!(!repair.status.success());
+    let stderr = String::from_utf8(repair.stderr).unwrap();
+    assert!(stderr.contains("intentionally out of scope"));
+
+    let unknown = run_cli(&["memory", "wat"]);
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8(unknown.stderr).unwrap();
+    assert!(stderr.contains("unknown memory subcommand `wat`"));
 }
 
 #[test]
