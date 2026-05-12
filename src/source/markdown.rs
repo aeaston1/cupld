@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -8,15 +8,15 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use crate::engine::{CupldEngine, EdgeId, GraphError, NodeId, PropertyMap, Value};
 
 const MARKDOWN_DOCUMENT_LABEL: &str = "MarkdownDocument";
-const MARKDOWN_DIRECTORY_LABEL: &str = "MarkdownDirectory";
+pub const MARKDOWN_DIRECTORY_LABEL: &str = "MarkdownDirectory";
 const CONFIG_LABEL: &str = "SystemConfig";
 const CONFIG_KIND: &str = "config";
 const CONFIG_NAME: &str = "markdown_source";
 const CONNECTOR_NAME: &str = "markdown";
 const LINK_EDGE_TYPE: &str = "MD_LINKS_TO";
-const IN_DIRECTORY_EDGE_TYPE: &str = "MD_IN_DIRECTORY";
-const PARENT_DIRECTORY_EDGE_TYPE: &str = "MD_PARENT_DIRECTORY";
-const STRUCTURAL_EDGE_TYPES: [&str; 2] = [IN_DIRECTORY_EDGE_TYPE, PARENT_DIRECTORY_EDGE_TYPE];
+pub const MD_IN_DIRECTORY: &str = "MD_IN_DIRECTORY";
+pub const MD_PARENT_DIRECTORY: &str = "MD_PARENT_DIRECTORY";
+const STRUCTURAL_EDGE_TYPES: [&str; 2] = [MD_IN_DIRECTORY, MD_PARENT_DIRECTORY];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownDocument {
@@ -33,15 +33,9 @@ pub struct MarkdownDocument {
     pub has_frontmatter: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MarkdownDirectory {
-    path: PathBuf,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-struct MarkdownRootScan {
-    documents: Vec<MarkdownDocument>,
-    directories: Vec<MarkdownDirectory>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkdownSyncOptions {
+    pub filesystem_graph: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +169,9 @@ pub struct MarkdownSyncReport {
     pub upserted_documents: usize,
     pub tombstoned_documents: usize,
     pub link_edges: usize,
+    pub upserted_directories: usize,
+    pub tombstoned_directories: usize,
+    pub structural_edges: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,33 +304,49 @@ pub fn sync_markdown_root(
     engine: &mut CupldEngine,
     root: &Path,
 ) -> Result<MarkdownSyncReport, SourceError> {
+    sync_markdown_root_with_options(engine, root, &MarkdownSyncOptions::default())
+}
+
+pub fn sync_markdown_root_with_options(
+    engine: &mut CupldEngine,
+    root: &Path,
+    options: &MarkdownSyncOptions,
+) -> Result<MarkdownSyncReport, SourceError> {
     let root = normalize_root_path(root)?;
-    let scan = scan_markdown_root(&root)?;
+    let documents = scan_markdown_root(&root)?;
     let root_string = path_to_string(&root);
 
-    let mut existing_dirs = collect_existing_directories(engine, &root_string);
-    let dir_node_ids =
-        upsert_directories(engine, &root_string, &scan.directories, &mut existing_dirs)?;
     let mut existing_docs = collect_existing_documents(engine, &root_string);
-    let doc_node_ids = upsert_documents(engine, &root_string, &scan.documents, &mut existing_docs)?;
-    sync_structural_edges(
-        engine,
-        &root_string,
-        &scan.documents,
-        &doc_node_ids,
-        &scan.directories,
-        &dir_node_ids,
-    )?;
-    let link_edges = sync_link_edges(engine, &scan.documents, &doc_node_ids)?;
+    let mut upserted_directories = 0;
+    let mut tombstoned_directories = 0;
+    let mut structural_edges = 0;
+    let doc_node_ids = upsert_documents(engine, &root_string, &documents, &mut existing_docs)?;
+    if options.filesystem_graph {
+        let mut existing_dirs = collect_existing_directories(engine, &root_string);
+        let dir_node_ids =
+            upsert_directories(engine, &root_string, &documents, &mut existing_dirs)?;
+        upserted_directories = dir_node_ids.len();
+        structural_edges = sync_structural_edges(
+            engine,
+            &root_string,
+            &documents,
+            &doc_node_ids,
+            &dir_node_ids,
+        )?;
+        tombstoned_directories = tombstone_missing_directories(engine, &existing_dirs)?;
+    }
+    let link_edges = sync_link_edges(engine, &documents, &doc_node_ids)?;
     let tombstoned_documents = tombstone_missing_documents(engine, &existing_docs)?;
-    tombstone_missing_directories(engine, &existing_dirs)?;
 
     Ok(MarkdownSyncReport {
         root,
-        scanned_documents: scan.documents.len(),
+        scanned_documents: documents.len(),
         upserted_documents: doc_node_ids.len(),
         tombstoned_documents,
         link_edges,
+        upserted_directories,
+        tombstoned_directories,
+        structural_edges,
     })
 }
 
@@ -342,8 +355,21 @@ pub fn watch_markdown_root(
     root: &Path,
     options: &MarkdownWatchOptions,
 ) -> Result<MarkdownWatchReport, SourceError> {
+    watch_markdown_root_with_sync_options(engine, root, &MarkdownSyncOptions::default(), options)
+}
+
+pub fn watch_markdown_root_with_sync_options(
+    engine: &mut CupldEngine,
+    root: &Path,
+    sync_options: &MarkdownSyncOptions,
+    options: &MarkdownWatchOptions,
+) -> Result<MarkdownWatchReport, SourceError> {
     let root = normalize_root_path(root)?;
-    let mut last_report = Some(sync_markdown_root(engine, &root)?);
+    let mut last_report = Some(sync_markdown_root_with_options(
+        engine,
+        &root,
+        sync_options,
+    )?);
     let mut report = MarkdownWatchReport {
         root: root.clone(),
         sync_runs: 1,
@@ -378,7 +404,7 @@ pub fn watch_markdown_root(
         }
 
         if batcher.should_flush(now, options) {
-            let sync_report = sync_markdown_root(engine, &root)?;
+            let sync_report = sync_markdown_root_with_options(engine, &root, sync_options)?;
             report.sync_runs += 1;
             last_report = Some(sync_report.clone());
             batcher.flush();
@@ -393,35 +419,6 @@ pub fn watch_markdown_root(
             }
         }
     }
-}
-
-fn collect_existing_directories(engine: &CupldEngine, root: &str) -> BTreeMap<String, NodeId> {
-    let mut directories = BTreeMap::new();
-    for node in engine.nodes() {
-        let Some(Value::String(connector)) = node.property("src.connector") else {
-            continue;
-        };
-        if connector != CONNECTOR_NAME {
-            continue;
-        }
-        let Some(Value::String(kind)) = node.property("src.kind") else {
-            continue;
-        };
-        if kind != "directory" {
-            continue;
-        }
-        let Some(Value::String(node_root)) = node.property("src.root") else {
-            continue;
-        };
-        if node_root != root {
-            continue;
-        }
-        let Some(Value::String(path)) = node.property("src.path") else {
-            continue;
-        };
-        directories.insert(path.clone(), node.id());
-    }
-    directories
 }
 
 fn collect_existing_documents(engine: &CupldEngine, root: &str) -> BTreeMap<String, NodeId> {
@@ -453,30 +450,33 @@ fn collect_existing_documents(engine: &CupldEngine, root: &str) -> BTreeMap<Stri
     documents
 }
 
-fn upsert_directories(
-    engine: &mut CupldEngine,
-    root: &str,
-    directories: &[MarkdownDirectory],
-    existing_dirs: &mut BTreeMap<String, NodeId>,
-) -> Result<BTreeMap<String, NodeId>, SourceError> {
-    let mut node_ids = BTreeMap::new();
-
-    for directory in directories {
-        let relative = path_to_string(&directory.path);
-        let node_id = match existing_dirs.remove(&relative) {
-            Some(node_id) => {
-                merge_directory_properties(engine, node_id, root, directory)?;
-                node_id
-            }
-            None => {
-                let properties = directory_properties(root, directory);
-                engine.create_node([MARKDOWN_DIRECTORY_LABEL], properties)?
-            }
+fn collect_existing_directories(engine: &CupldEngine, root: &str) -> BTreeMap<String, NodeId> {
+    let mut directories = BTreeMap::new();
+    for node in engine.nodes() {
+        let Some(Value::String(connector)) = node.property("src.connector") else {
+            continue;
         };
-        node_ids.insert(relative, node_id);
+        if connector != CONNECTOR_NAME {
+            continue;
+        }
+        let Some(Value::String(kind)) = node.property("src.kind") else {
+            continue;
+        };
+        if kind != "directory" {
+            continue;
+        }
+        let Some(Value::String(node_root)) = node.property("src.root") else {
+            continue;
+        };
+        if node_root != root {
+            continue;
+        }
+        let Some(Value::String(path)) = node.property("src.path") else {
+            continue;
+        };
+        directories.insert(source_key(node_root, path), node.id());
     }
-
-    Ok(node_ids)
+    directories
 }
 
 fn upsert_documents(
@@ -505,32 +505,31 @@ fn upsert_documents(
     Ok(node_ids)
 }
 
-fn merge_directory_properties(
+fn upsert_directories(
     engine: &mut CupldEngine,
-    node_id: NodeId,
     root: &str,
-    directory: &MarkdownDirectory,
-) -> Result<(), SourceError> {
-    let Some(node) = engine.node(node_id) else {
-        return Err(SourceError::new(
-            "node_not_found",
-            "directory node disappeared",
-        ));
-    };
-    let mut properties = node.properties().clone();
-    let removable = properties
-        .keys()
-        .filter(|key| key.starts_with("src.") || key.starts_with("md."))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    for key in removable {
-        properties.remove(&key);
+    documents: &[MarkdownDocument],
+    existing_dirs: &mut BTreeMap<String, NodeId>,
+) -> Result<BTreeMap<String, NodeId>, SourceError> {
+    let mut node_ids = BTreeMap::new();
+
+    for directory in markdown_directories(documents) {
+        let relative = directory_path_string(&directory);
+        let key = source_key(root, &relative);
+        let node_id = match existing_dirs.remove(&key) {
+            Some(node_id) => {
+                merge_directory_properties(engine, node_id, root, &directory)?;
+                node_id
+            }
+            None => {
+                let properties = directory_properties(root, &directory);
+                engine.create_node([MARKDOWN_DIRECTORY_LABEL], properties)?
+            }
+        };
+        node_ids.insert(key, node_id);
     }
-    for (key, value) in directory_properties(root, directory).into_iter() {
-        properties.insert(key, value);
-    }
-    engine.replace_node_properties(node_id, properties)?;
-    Ok(())
+
+    Ok(node_ids)
 }
 
 fn merge_document_properties(
@@ -561,14 +560,32 @@ fn merge_document_properties(
     Ok(())
 }
 
-fn directory_properties(root: &str, directory: &MarkdownDirectory) -> PropertyMap {
-    PropertyMap::from_pairs([
-        ("src.connector", Value::from(CONNECTOR_NAME)),
-        ("src.kind", Value::from("directory")),
-        ("src.root", Value::from(root.to_owned())),
-        ("src.path", Value::from(path_to_string(&directory.path))),
-        ("src.status", Value::from("current")),
-    ])
+fn merge_directory_properties(
+    engine: &mut CupldEngine,
+    node_id: NodeId,
+    root: &str,
+    directory: &Path,
+) -> Result<(), SourceError> {
+    let Some(node) = engine.node(node_id) else {
+        return Err(SourceError::new(
+            "node_not_found",
+            "directory node disappeared",
+        ));
+    };
+    let mut properties = node.properties().clone();
+    let removable = properties
+        .keys()
+        .filter(|key| key.starts_with("src.") || *key == "name" || *key == "title")
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    for key in removable {
+        properties.remove(&key);
+    }
+    for (key, value) in directory_properties(root, directory).into_iter() {
+        properties.insert(key, value);
+    }
+    engine.replace_node_properties(node_id, properties)?;
+    Ok(())
 }
 
 fn document_properties(root: &str, document: &MarkdownDocument) -> PropertyMap {
@@ -594,33 +611,49 @@ fn document_properties(root: &str, document: &MarkdownDocument) -> PropertyMap {
     properties
 }
 
+fn directory_properties(root: &str, directory: &Path) -> PropertyMap {
+    let path = directory_path_string(directory);
+    let name = directory_name(directory);
+    let title = directory_title(&name);
+    PropertyMap::from_pairs([
+        ("src.connector", Value::from(CONNECTOR_NAME)),
+        ("src.kind", Value::from("directory")),
+        ("src.root", Value::from(root.to_owned())),
+        ("src.path", Value::from(path)),
+        ("src.status", Value::from("current")),
+        ("name", Value::from(name)),
+        ("title", Value::from(title)),
+    ])
+}
+
 fn sync_structural_edges(
     engine: &mut CupldEngine,
     root: &str,
     documents: &[MarkdownDocument],
     doc_node_ids: &BTreeMap<String, NodeId>,
-    directories: &[MarkdownDirectory],
     dir_node_ids: &BTreeMap<String, NodeId>,
 ) -> Result<usize, SourceError> {
     let mut created_edges = 0;
 
-    for directory in directories {
-        let directory_key = path_to_string(&directory.path);
-        let Some(directory_id) = dir_node_ids.get(&directory_key).copied() else {
+    for directory in markdown_directories(documents) {
+        let directory_key = directory_path_string(&directory);
+        let source_directory_key = source_key(root, &directory_key);
+        let Some(directory_id) = dir_node_ids.get(&source_directory_key).copied() else {
             continue;
         };
         delete_connector_edges_of_types(engine, directory_id, &STRUCTURAL_EDGE_TYPES)?;
 
-        let Some(parent_key) = parent_directory_key(&directory.path) else {
+        let Some(parent_key) = parent_directory_key(&directory) else {
             continue;
         };
-        let Some(parent_id) = dir_node_ids.get(&parent_key).copied() else {
+        let source_parent_key = source_key(root, &parent_key);
+        let Some(parent_id) = dir_node_ids.get(&source_parent_key).copied() else {
             continue;
         };
         engine.create_edge(
             directory_id,
             parent_id,
-            PARENT_DIRECTORY_EDGE_TYPE,
+            MD_PARENT_DIRECTORY,
             structural_edge_properties(root),
         )?;
         created_edges += 1;
@@ -634,13 +667,14 @@ fn sync_structural_edges(
         delete_connector_edges_of_types(engine, document_id, &STRUCTURAL_EDGE_TYPES)?;
 
         let directory_key = document_directory_key(&document.path);
-        let Some(directory_id) = dir_node_ids.get(&directory_key).copied() else {
+        let source_directory_key = source_key(root, &directory_key);
+        let Some(directory_id) = dir_node_ids.get(&source_directory_key).copied() else {
             continue;
         };
         engine.create_edge(
             document_id,
             directory_id,
-            IN_DIRECTORY_EDGE_TYPE,
+            MD_IN_DIRECTORY,
             structural_edge_properties(root),
         )?;
         created_edges += 1;
@@ -663,8 +697,8 @@ fn structural_edge_properties(root: &str) -> PropertyMap {
 fn document_directory_key(path: &Path) -> String {
     path.parent()
         .and_then(normalize_relative_path)
-        .map(|path| path_to_string(&path))
-        .unwrap_or_default()
+        .map(|path| directory_path_string(&path))
+        .unwrap_or_else(|| ".".to_owned())
 }
 
 fn parent_directory_key(path: &Path) -> Option<String> {
@@ -673,7 +707,7 @@ fn parent_directory_key(path: &Path) -> Option<String> {
     }
     path.parent()
         .and_then(normalize_relative_path)
-        .map(|path| path_to_string(&path))
+        .map(|path| directory_path_string(&path))
 }
 
 fn sync_link_edges(
@@ -742,12 +776,12 @@ fn tombstone_missing_documents(
 fn tombstone_missing_directories(
     engine: &mut CupldEngine,
     existing_dirs: &BTreeMap<String, NodeId>,
-) -> Result<(), SourceError> {
+) -> Result<usize, SourceError> {
     for node_id in existing_dirs.values().copied() {
         engine.set_node_property(node_id, "src.status", Value::from("missing"))?;
         delete_connector_edges_touching_of_types(engine, node_id, &STRUCTURAL_EDGE_TYPES)?;
     }
-    Ok(())
+    Ok(existing_dirs.len())
 }
 
 fn delete_connector_edges_of_types(
@@ -795,39 +829,26 @@ fn delete_connector_edge_ids_of_types(
     Ok(())
 }
 
-fn scan_markdown_root(root: &Path) -> Result<MarkdownRootScan, SourceError> {
+fn scan_markdown_root(root: &Path) -> Result<Vec<MarkdownDocument>, SourceError> {
     if !root.exists() {
-        return Ok(MarkdownRootScan::default());
+        return Ok(Vec::new());
     }
     let root = root.canonicalize()?;
     let mut paths = Vec::new();
-    let mut directory_paths = vec![PathBuf::new()];
-    collect_markdown_entries(&root, &root, &mut paths, &mut directory_paths)?;
+    collect_markdown_files(&root, &root, &mut paths)?;
     paths.sort();
-    directory_paths.sort();
 
     let mut documents = Vec::new();
     for path in paths {
         documents.push(read_markdown_document(&root, &path)?);
     }
-    let directories = directory_paths
-        .into_iter()
-        .map(|path| MarkdownDirectory {
-            path: normalize_relative_path(&path).unwrap_or(path),
-        })
-        .collect();
-
-    Ok(MarkdownRootScan {
-        documents,
-        directories,
-    })
+    Ok(documents)
 }
 
-fn collect_markdown_entries(
+fn collect_markdown_files(
     root: &Path,
     current: &Path,
     files: &mut Vec<PathBuf>,
-    directories: &mut Vec<PathBuf>,
 ) -> Result<(), SourceError> {
     let mut entries = fs::read_dir(current)?
         .collect::<Result<Vec<_>, _>>()?
@@ -838,8 +859,7 @@ fn collect_markdown_entries(
 
     for path in entries {
         if path.is_dir() {
-            directories.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
-            collect_markdown_entries(root, &path, files, directories)?;
+            collect_markdown_files(root, &path, files)?;
             continue;
         }
         if !path.is_file() {
@@ -858,7 +878,6 @@ fn collect_markdown_entries(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct MarkdownRootSnapshot {
     entries: BTreeMap<String, (u64, u128)>,
-    directories: Vec<String>,
 }
 
 fn snapshot_markdown_root(root: &Path) -> Result<MarkdownRootSnapshot, SourceError> {
@@ -867,10 +886,8 @@ fn snapshot_markdown_root(root: &Path) -> Result<MarkdownRootSnapshot, SourceErr
     }
     let root = root.canonicalize()?;
     let mut files = Vec::new();
-    let mut directory_paths = vec![PathBuf::new()];
-    collect_markdown_entries(&root, &root, &mut files, &mut directory_paths)?;
+    collect_markdown_files(&root, &root, &mut files)?;
     files.sort();
-    directory_paths.sort();
 
     let mut entries = BTreeMap::new();
     for relative in files {
@@ -884,14 +901,7 @@ fn snapshot_markdown_root(root: &Path) -> Result<MarkdownRootSnapshot, SourceErr
             .unwrap_or_default();
         entries.insert(path_to_string(&relative), (metadata.len(), modified));
     }
-    let directories = directory_paths
-        .into_iter()
-        .map(|relative| path_to_string(&relative))
-        .collect();
-    Ok(MarkdownRootSnapshot {
-        entries,
-        directories,
-    })
+    Ok(MarkdownRootSnapshot { entries })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -958,6 +968,28 @@ fn read_markdown_document(root: &Path, relative: &Path) -> Result<MarkdownDocume
         source_hash: stable_hash_hex(raw.as_bytes()),
         has_frontmatter,
     })
+}
+
+fn markdown_directories(documents: &[MarkdownDocument]) -> BTreeSet<PathBuf> {
+    let mut directories = BTreeSet::new();
+    if documents.is_empty() {
+        return directories;
+    }
+
+    directories.insert(PathBuf::new());
+    for document in documents {
+        let mut current = PathBuf::new();
+        let Some(parent) = document.path.parent() else {
+            continue;
+        };
+        for component in parent.components() {
+            if let Component::Normal(value) = component {
+                current.push(value);
+                directories.insert(current.clone());
+            }
+        }
+    }
+    directories
 }
 
 fn parse_frontmatter(raw: &str) -> (Option<PropertyMap>, String, bool) {
@@ -1611,6 +1643,49 @@ fn filename_title(path: &Path) -> String {
         .to_owned()
 }
 
+fn directory_path_string(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        path_to_string(path)
+    }
+}
+
+fn directory_name(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        return "root".to_owned();
+    }
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("untitled")
+        .to_owned()
+}
+
+fn directory_title(name: &str) -> String {
+    let mut title = String::new();
+    let mut capitalize_next = true;
+    for character in name.chars() {
+        match character {
+            '-' | '_' => {
+                if !title.is_empty() && !title.ends_with(' ') {
+                    title.push(' ');
+                }
+                capitalize_next = true;
+            }
+            value if capitalize_next => {
+                title.push(value.to_ascii_uppercase());
+                capitalize_next = false;
+            }
+            value => title.push(value),
+        }
+    }
+    if title.is_empty() {
+        "Untitled".to_owned()
+    } else {
+        title
+    }
+}
+
 fn list_value(values: &[String]) -> Value {
     Value::List(values.iter().cloned().map(Value::String).collect())
 }
@@ -1972,6 +2047,10 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn source_key(root: &str, path: &str) -> String {
+    format!("{root}\0{path}")
+}
+
 fn stable_hash_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
@@ -1989,10 +2068,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, LINK_EDGE_TYPE, MARKDOWN_DOCUMENT_LABEL,
-        MarkdownDocument, MarkdownLinkRef, MarkdownLinkSource, build_resolution_index,
+        CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, LINK_EDGE_TYPE, MARKDOWN_DIRECTORY_LABEL,
+        MARKDOWN_DOCUMENT_LABEL, MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, MarkdownDocument,
+        MarkdownLinkRef, MarkdownLinkSource, MarkdownSyncOptions, build_resolution_index,
         configured_markdown_root, extract_document_link_refs, read_markdown_document,
-        resolve_link_path, set_markdown_root, sync_markdown_root,
+        resolve_link_path, set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
     };
     use crate::engine::{CupldEngine, PropertyMap, Value};
 
@@ -2087,6 +2167,9 @@ Body with [[other]] and [deep](docs/page.md#intro) and #tagged
         assert_eq!(report.scanned_documents, 2);
         assert_eq!(report.upserted_documents, 2);
         assert_eq!(report.link_edges, 1);
+        assert_eq!(report.upserted_directories, 0);
+        assert_eq!(report.tombstoned_directories, 0);
+        assert_eq!(report.structural_edges, 0);
         assert_eq!(
             engine
                 .nodes()
@@ -2103,6 +2186,36 @@ Body with [[other]] and [deep](docs/page.md#intro) and #tagged
                 && node.property("src.status") == Some(&Value::from("missing"))
         });
         assert!(missing);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_graph_options_are_default_off() {
+        assert!(!MarkdownSyncOptions::default().filesystem_graph);
+        assert_eq!(MARKDOWN_DIRECTORY_LABEL, "MarkdownDirectory");
+        assert_eq!(MD_IN_DIRECTORY, "MD_IN_DIRECTORY");
+        assert_eq!(MD_PARENT_DIRECTORY, "MD_PARENT_DIRECTORY");
+
+        let root = temp_dir("sync_options");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested").join("note.md"), "# Note").unwrap();
+
+        let mut engine = CupldEngine::default();
+        let report =
+            sync_markdown_root_with_options(&mut engine, &root, &MarkdownSyncOptions::default())
+                .unwrap();
+        assert_eq!(report.upserted_directories, 0);
+        assert_eq!(report.tombstoned_directories, 0);
+        assert_eq!(report.structural_edges, 0);
+        assert!(
+            engine
+                .nodes()
+                .all(|node| !node.labels().contains(MARKDOWN_DIRECTORY_LABEL))
+        );
+        assert!(engine.edges().all(|edge| {
+            edge.edge_type() != MD_IN_DIRECTORY && edge.edge_type() != MD_PARENT_DIRECTORY
+        }));
 
         fs::remove_dir_all(root).unwrap();
     }

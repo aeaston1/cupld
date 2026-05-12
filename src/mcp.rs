@@ -776,6 +776,12 @@ fn report_json(report: &MarkdownSyncReport) -> JsonValue {
         ("upserted_documents", report.upserted_documents.into()),
         ("tombstoned_documents", report.tombstoned_documents.into()),
         ("link_edges", report.link_edges.into()),
+        ("upserted_directories", report.upserted_directories.into()),
+        (
+            "tombstoned_directories",
+            report.tombstoned_directories.into(),
+        ),
+        ("structural_edges", report.structural_edges.into()),
     ])
 }
 
