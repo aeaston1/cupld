@@ -35,7 +35,7 @@ cupld context --db <path.cupld|default> [--top-k <n>] [--output <table|json|ndjs
 cupld schema --db <path.cupld|default>
 cupld compact --db <path.cupld|default>
 cupld check --db <path.cupld|default>
-cupld sync markdown --db <path.cupld|default> [--root <path>] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
+cupld sync markdown --db <path.cupld|default> [--root <path>] [--include-fs-graph] [--watch] [--poll-ms <n>] [--debounce-ms <n>] [--batch-ms <n>] [--idle-ms <n>] [--max-runs <n>]
 cupld source set-root --db <path.cupld|default> <path>
 cupld mcp serve --db <path.cupld|default> [--root <path>] [--read-only]
 cupld install [--target <codex|claude|opencode> [--scope <cwd|home>] | --path <skills-root>] [--db <path.cupld|default>] [--root <path>] [--force] [--yes]
@@ -328,6 +328,10 @@ Markdown behavior:
 
 - `cupld query --with-md` overlays markdown into a temporary query session and does not persist imported notes.
 - `cupld sync markdown` persists markdown documents and `:MD_LINKS_TO` edges from body links plus supported frontmatter relationship keys into the database.
+- `cupld sync markdown --db default --include-fs-graph` opts in to persisted filesystem structure: `:MarkdownDirectory` nodes, `:MD_IN_DIRECTORY` document-to-directory edges, and `:MD_PARENT_DIRECTORY` child-to-parent directory edges.
+- `:MD_LINKS_TO` remains authored-only. Filesystem structure uses the filesystem edge types instead of link edges.
+- Filesystem sync does not create `:MD_SIBLING_OF` or other pairwise sibling edges.
+- Filesystem edges persist `md.edge_weight` for downstream context and retrieval work; core ranking does not consume that property in this issue.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
 - `--poll-ms` controls the poll interval.
 - `--debounce-ms` controls the stable-change debounce window.
@@ -348,7 +352,39 @@ cupld sync markdown --db default --watch --idle-ms 500 --max-runs 2
 ```
 
 ```bash
+cupld sync markdown --db default --include-fs-graph
+```
+
+```bash
 cupld source set-root --db default /absolute/path/to/notes
+```
+
+Document to directory traversal after an opt-in filesystem sync:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+   RETURN d.\`src.path\`, dir.\`src.path\`
+   ORDER BY d.\`src.path\`"
+```
+
+Child directory to parent directory traversal:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (child:MarkdownDirectory)-[:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+   RETURN child.\`src.path\`, parent.\`src.path\`
+   ORDER BY child.\`src.path\`"
+```
+
+Same-folder document discovery via two-hop traversal:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (source:MarkdownDocument { \`src.path\`: 'projects/cupld/plan.md' })-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)<-[:MD_IN_DIRECTORY]-(peer:MarkdownDocument)
+   WHERE peer.\`src.path\` != source.\`src.path\`
+   RETURN peer.\`src.path\`, peer.\`md.title\`
+   ORDER BY peer.\`src.path\`"
 ```
 
 Markdown notes:

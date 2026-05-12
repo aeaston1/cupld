@@ -22,7 +22,10 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 - `cupld install` and `source set-root` keep repo-local defaults in `.cupld/config.toml`.
 - The skill install location (`.agents/skills`, `.claude/skills`, or a custom path) is separate from the DB path and markdown root. Installing the skill elsewhere does not move `./.cupld/default.cupld` or `./.cupld/data/`.
 - `cupld query --with-md` overlays markdown into a temporary query session and does not persist the imported notes.
-- `cupld sync markdown` persists markdown documents and markdown link edges into the `.cupld` database.
+- `cupld sync markdown` persists markdown documents and authored markdown link edges into the `.cupld` database.
+- `cupld sync markdown --db default --include-fs-graph` opts in to persisted filesystem structure with `MarkdownDirectory`, `MD_IN_DIRECTORY`, and `MD_PARENT_DIRECTORY`.
+- `MD_LINKS_TO` remains authored-only; filesystem structure uses filesystem edge types and never pairwise `MD_SIBLING_OF` edges.
+- Filesystem edges persist `md.edge_weight` for downstream context and retrieval work. Core ranking does not consume it in this workflow.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes with `--poll-ms`, `--debounce-ms`, `--batch-ms`, `--idle-ms`, and `--max-runs`.
 - `cupld query --db ...` requires an existing database file. If the DB is missing, create it first with `cupld <path.cupld>`.
 - `cupld query` and `cupld context` support `--output table|json|ndjson` without using the REPL.
@@ -70,11 +73,15 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
    ```bash
    cupld sync markdown --db default
    ```
-9. For bounded continuous persisted sync, use watch mode after the initial sync.
+9. Persist filesystem structure when directory traversal matters.
+   ```bash
+   cupld sync markdown --db default --include-fs-graph
+   ```
+10. For bounded continuous persisted sync, use watch mode after the initial sync.
    ```bash
    cupld sync markdown --db default --watch --idle-ms 500 --max-runs 2
    ```
-10. Use maintenance commands before making assumptions about a DB.
+11. Use maintenance commands before making assumptions about a DB.
    ```bash
    cupld check --db default
    cupld schema --db default
@@ -153,6 +160,12 @@ Mental model:
 
 - Markdown documents are nodes with label `:MarkdownDocument`.
 - Body links and supported frontmatter relationship fields become `:MD_LINKS_TO` edges between markdown documents.
+- `MD_LINKS_TO` is authored-only. Directory structure is not encoded as link edges.
+- `cupld sync markdown --db default --include-fs-graph` also persists `:MarkdownDirectory` nodes.
+- Documents connect to their containing directory with `:MD_IN_DIRECTORY`.
+- Child directories connect to parent directories with `:MD_PARENT_DIRECTORY`.
+- Filesystem sync does not create `:MD_SIBLING_OF` or pairwise sibling edges.
+- Filesystem edges include `md.edge_weight` for downstream context and retrieval use. Core ranking does not consume it here.
 - Dotted keys must be backtick-quoted in queries, for example `d.\`src.path\`` and `d.\`md.title\``.
 - Useful document properties:
   - `src.root`
@@ -243,6 +256,35 @@ cupld query --db default --with-md \
   "MATCH (a:MarkdownDocument)-[:MD_LINKS_TO]->(b:MarkdownDocument { \`src.path\`: 'notes/schema-notes.md' })
    RETURN a.\`src.path\`
    ORDER BY a.\`src.path\`"
+```
+
+Document to directory traversal after opting into filesystem sync:
+
+```bash
+cupld sync markdown --db default --include-fs-graph
+cupld query --db default --with-md \
+  "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+   RETURN d.\`src.path\`, dir.\`src.path\`
+   ORDER BY d.\`src.path\`"
+```
+
+Child directory to parent directory traversal:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (child:MarkdownDirectory)-[:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+   RETURN child.\`src.path\`, parent.\`src.path\`
+   ORDER BY child.\`src.path\`"
+```
+
+Same-folder document discovery via two-hop traversal:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (source:MarkdownDocument { \`src.path\`: 'projects/cupld/plan.md' })-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)<-[:MD_IN_DIRECTORY]-(peer:MarkdownDocument)
+   WHERE peer.\`src.path\` != source.\`src.path\`
+   RETURN peer.\`src.path\`, peer.\`md.title\`
+   ORDER BY peer.\`src.path\`"
 ```
 
 Join native graph data to markdown notes:

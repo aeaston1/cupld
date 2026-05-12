@@ -8,7 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use cupld::{
-    MarkdownSyncReport, MarkdownWatchOptions, QueryResult, RuntimeValue, Session, Value,
+    MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, QueryResult, RuntimeValue,
+    Session, Value,
     automation::{
         AutomationError, AutomationPolicy, build_context_response, context_as_json,
         context_as_ndjson, format_error_json as machine_error_json,
@@ -17,7 +18,8 @@ use cupld::{
     configured_markdown_root, json,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
-    set_markdown_root, sync_markdown_root, watch_markdown_root,
+    set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
+    watch_markdown_root_with_options,
 };
 use skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
 
@@ -192,6 +194,7 @@ fn run() -> Result<(), String> {
             batch_window,
             idle_timeout,
             max_runs,
+            include_fs_graph,
         } => run_sync_markdown(
             db_path,
             root_override,
@@ -201,6 +204,7 @@ fn run() -> Result<(), String> {
             batch_window,
             idle_timeout,
             max_runs,
+            include_fs_graph,
         ),
         CliCommand::SourceSetRoot { db_path, root } => run_source_set_root(db_path, root),
         CliCommand::McpServe {
@@ -255,6 +259,7 @@ enum CliCommand {
         batch_window: Duration,
         idle_timeout: Option<Duration>,
         max_runs: Option<usize>,
+        include_fs_graph: bool,
     },
     SourceSetRoot {
         db_path: PathBuf,
@@ -534,7 +539,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
         Some("markdown") => {}
         _ => {
             return Err(format!(
-                "error: expected `sync markdown --db <path.cupld|default> [--root <path>] [--watch]`\n\n{}",
+                "error: expected `sync markdown --db <path.cupld|default> [--root <path>] [--include-fs-graph] [--watch]`\n\n{}",
                 cli_usage_text()
             ));
         }
@@ -548,6 +553,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
     let mut batch_window = Duration::from_secs(2);
     let mut idle_timeout = None;
     let mut max_runs = None;
+    let mut include_fs_graph = false;
     let mut index = 1;
 
     while index < args.len() {
@@ -579,6 +585,13 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
             }
             "--watch" => {
                 watch = true;
+                index += 1;
+            }
+            "--include-fs-graph" => {
+                if include_fs_graph {
+                    return Err("duplicate option `--include-fs-graph`".to_owned());
+                }
+                include_fs_graph = true;
                 index += 1;
             }
             "--poll-ms" => {
@@ -648,6 +661,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
         batch_window,
         idle_timeout,
         max_runs,
+        include_fs_graph,
     })
 }
 
@@ -1038,6 +1052,7 @@ Commands:
   context                 Build compact context rows (top-k nodes) for agent prompts.
   --with-md               Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
+  --include-fs-graph      Persist markdown directory nodes and filesystem structural edges during `sync markdown`.
   --watch                 Keep polling markdown for changes after the initial sync.
   --poll-ms               Poll interval for `sync markdown --watch`.
   --debounce-ms           Stable-change debounce window for `sync markdown --watch`.
@@ -1275,10 +1290,12 @@ fn run_sync_markdown(
     batch_window: Duration,
     idle_timeout: Option<Duration>,
     max_runs: Option<usize>,
+    include_fs_graph: bool,
 ) -> Result<(), String> {
     let mut session = open_initial_session(Some(db_path.clone()))?;
     let root = resolve_markdown_root(root_override.as_deref(), Some(&session))?;
     let mut engine = session.engine().clone();
+    let sync_options = MarkdownSyncOptions { include_fs_graph };
     let report = if watch {
         let options = MarkdownWatchOptions {
             poll_interval,
@@ -1287,8 +1304,8 @@ fn run_sync_markdown(
             idle_timeout,
             max_runs,
         };
-        let report =
-            watch_markdown_root(&mut engine, &root, &options).map_err(|error| error.to_string())?;
+        let report = watch_markdown_root_with_options(&mut engine, &root, &options, &sync_options)
+            .map_err(|error| error.to_string())?;
         println!(
             "watch root={} runs={} events={}",
             report.root.display(),
@@ -1303,7 +1320,8 @@ fn run_sync_markdown(
             link_edges: 0,
         })
     } else {
-        sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?
+        sync_markdown_root_with_options(&mut engine, &root, &sync_options)
+            .map_err(|error| error.to_string())?
     };
     engine.commit().map_err(|error| error.to_string())?;
     session
@@ -2399,6 +2417,35 @@ mod tests {
                 batch_window: std::time::Duration::from_secs(2),
                 idle_timeout: None,
                 max_runs: None,
+                include_fs_graph: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_sync_markdown_with_filesystem_graph_flag() {
+        let args = vec![
+            "sync".to_owned(),
+            "markdown".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "--include-fs-graph".to_owned(),
+            "--watch".to_owned(),
+            "--max-runs".to_owned(),
+            "1".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::SyncMarkdown {
+                db_path: default_alias_db_path(),
+                root_override: None,
+                watch: true,
+                poll_interval: std::time::Duration::from_millis(100),
+                debounce: std::time::Duration::from_millis(200),
+                batch_window: std::time::Duration::from_secs(2),
+                idle_timeout: None,
+                max_runs: Some(1),
+                include_fs_graph: true,
             })
         );
     }

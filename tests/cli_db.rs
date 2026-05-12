@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cupld::{Session, json};
+use cupld::{RuntimeValue, Session, json};
 
 use support::{TestDb, seed_person_graph};
 
@@ -670,4 +670,48 @@ fn cli_sync_markdown_persists_documents_into_db() {
     assert_eq!(result.rows.len(), 1);
     assert!(format!("{:?}", result.rows[0]).contains("Synced From CLI"));
     assert!(format!("{:?}", result.rows[0]).contains("current"));
+}
+
+#[test]
+fn cli_sync_markdown_watch_can_include_filesystem_graph() {
+    let db = TestDb::new("cli_markdown_sync_fs_graph_watch");
+    let root = TempDir::new("cli_markdown_sync_fs_graph_watch_root");
+    fs::create_dir_all(root.path().join("project")).unwrap();
+    fs::write(root.path().join("project").join("synced.md"), "# Synced").unwrap();
+
+    let output = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--include-fs-graph",
+        "--watch",
+        "--max-runs",
+        "1",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("runs=1"));
+    assert!(stdout.contains("scanned=1"));
+
+    let mut session = db.open();
+    let result = session
+        .execute_script(
+            "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+             RETURN d.`src.path`, dir.`src.path`
+             ORDER BY d.`src.path`",
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::String("project/synced.md".to_owned()),
+            RuntimeValue::String("project".to_owned()),
+        ]]
+    );
 }
