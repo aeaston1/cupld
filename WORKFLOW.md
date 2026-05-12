@@ -52,7 +52,9 @@ hooks:
         fi
       done
 agent:
-  max_concurrent_agents: 1
+  max_concurrent_agents: 5
+  max_concurrent_agents_by_state:
+    Merging: 1
   max_turns: 10
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=low --config 'service_tier="fast"' app-server
