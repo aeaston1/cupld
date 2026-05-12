@@ -8,8 +8,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cupld::{
-    MarkdownWatchOptions, RuntimeValue, Session, configured_markdown_root, set_markdown_root,
-    sync_markdown_root, watch_markdown_root,
+    MarkdownSyncOptions, MarkdownWatchOptions, RuntimeValue, Session, configured_markdown_root,
+    set_markdown_root, sync_markdown_root, sync_markdown_root_with_options, watch_markdown_root,
 };
 
 use support::{TestDb, run};
@@ -167,6 +167,170 @@ fn tombstones_missing_documents_without_breaking_native_edges() {
             RuntimeValue::String("missing".to_owned()),
         ]]
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn default_sync_does_not_create_markdown_directories() {
+    let db = TestDb::new("markdown_directories_default_off");
+    let root = temp_dir("markdown_directories_default_off");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/note.md"), "# Note").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let result = run(&mut reopened, "MATCH (d:MarkdownDirectory) RETURN count(d)");
+    assert_eq!(result.rows, vec![vec![RuntimeValue::Int(0)]]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_sync_creates_root_for_flat_markdown() {
+    let db = TestDb::new("markdown_directories_flat");
+    let root = temp_dir("markdown_directories_flat");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Note").unwrap();
+    fs::write(root.join("image.png"), "not markdown").unwrap();
+
+    sync_root_into_db_with_options(
+        db.path(),
+        &root,
+        MarkdownSyncOptions {
+            filesystem_graph: true,
+        },
+    );
+
+    let mut reopened = db.open();
+    let expected_root = root
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let result = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDirectory)
+         RETURN d.`src.path`, d.`src.connector`, d.`src.kind`, d.`src.root`, d.`src.status`, d.name, d.title
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::String(".".to_owned()),
+            RuntimeValue::String("markdown".to_owned()),
+            RuntimeValue::String("directory".to_owned()),
+            RuntimeValue::String(expected_root),
+            RuntimeValue::String("current".to_owned()),
+            RuntimeValue::String("root".to_owned()),
+            RuntimeValue::String("Root".to_owned()),
+        ]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_sync_creates_nested_markdown_directories() {
+    let db = TestDb::new("markdown_directories_nested");
+    let root = temp_dir("markdown_directories_nested");
+    fs::create_dir_all(root.join("docs/guides")).unwrap();
+    fs::create_dir_all(root.join("assets")).unwrap();
+    fs::write(root.join("docs/guides/install.md"), "# Install").unwrap();
+    fs::write(root.join("assets/logo.png"), "not markdown").unwrap();
+
+    sync_root_into_db_with_options(
+        db.path(),
+        &root,
+        MarkdownSyncOptions {
+            filesystem_graph: true,
+        },
+    );
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDirectory)
+         RETURN d.`src.path`, d.name, d.title, d.`src.status`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                RuntimeValue::String(".".to_owned()),
+                RuntimeValue::String("root".to_owned()),
+                RuntimeValue::String("Root".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("docs".to_owned()),
+                RuntimeValue::String("docs".to_owned()),
+                RuntimeValue::String("Docs".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("docs/guides".to_owned()),
+                RuntimeValue::String("guides".to_owned()),
+                RuntimeValue::String("Guides".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+        ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_directory_sync_is_idempotent() {
+    let db = TestDb::new("markdown_directories_idempotent");
+    let root = temp_dir("markdown_directories_idempotent");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/note.md"), "# Note").unwrap();
+
+    let options = MarkdownSyncOptions {
+        filesystem_graph: true,
+    };
+    sync_root_into_db_with_options(db.path(), &root, options);
+    sync_root_into_db_with_options(db.path(), &root, options);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDirectory)
+         RETURN d.`src.path`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![RuntimeValue::String(".".to_owned())],
+            vec![RuntimeValue::String("docs".to_owned())],
+        ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_sync_ignores_non_markdown_only_directories() {
+    let db = TestDb::new("markdown_directories_non_markdown_only");
+    let root = temp_dir("markdown_directories_non_markdown_only");
+    fs::create_dir_all(root.join("assets/icons")).unwrap();
+    fs::write(root.join("assets/icons/logo.svg"), "<svg />").unwrap();
+
+    sync_root_into_db_with_options(
+        db.path(),
+        &root,
+        MarkdownSyncOptions {
+            filesystem_graph: true,
+        },
+    );
+
+    let mut reopened = db.open();
+    let result = run(&mut reopened, "MATCH (d:MarkdownDirectory) RETURN count(d)");
+    assert_eq!(result.rows, vec![vec![RuntimeValue::Int(0)]]);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -553,6 +717,20 @@ fn sync_root_into_db(db_path: &std::path::Path, root: &std::path::Path) {
     engine.commit().unwrap();
     session.replace_engine(engine).unwrap();
     session.save().unwrap();
+}
+
+fn sync_root_into_db_with_options(
+    db_path: &std::path::Path,
+    root: &std::path::Path,
+    options: MarkdownSyncOptions,
+) -> cupld::MarkdownSyncReport {
+    let mut session = Session::open(db_path).unwrap();
+    let mut engine = session.engine().clone();
+    let report = sync_markdown_root_with_options(&mut engine, root, &options).unwrap();
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+    report
 }
 
 fn watch_root_into_db(
