@@ -8,14 +8,14 @@ use std::thread;
 use std::time::Duration;
 
 use cupld::{
-    MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, QueryResult, RuntimeValue,
-    Session, Value,
+    IntegrityReport, MarkdownAliasAmbiguity, MarkdownAliasDiagnostics, MarkdownSyncOptions,
+    MarkdownSyncReport, MarkdownWatchOptions, QueryResult, RuntimeValue, Session, Value,
     automation::{
         AutomationError, AutomationPolicy, build_context_response, context_as_json,
         context_as_ndjson, format_error_json as machine_error_json,
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
-    configured_markdown_root, json,
+    configured_markdown_root, json, markdown_alias_diagnostics,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
@@ -184,7 +184,7 @@ fn run() -> Result<(), String> {
         } => run_context(db_path, output, top_k),
         CliCommand::Schema { db_path } => run_schema(&db_path),
         CliCommand::Compact { db_path } => run_compact(db_path),
-        CliCommand::Check { db_path } => run_check(db_path),
+        CliCommand::Check { db_path, output } => run_check(db_path, output),
         CliCommand::SyncMarkdown {
             db_path,
             root_override,
@@ -249,6 +249,7 @@ enum CliCommand {
     },
     Check {
         db_path: PathBuf,
+        output: OutputFormat,
     },
     SyncMarkdown {
         db_path: PathBuf,
@@ -316,9 +317,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         Some("check") => {
             ensure_subcommand_has_no_option(&args[1..], "check", "--visualise")?;
             ensure_subcommand_has_no_option(&args[1..], "check", "--query")?;
-            Ok(CliCommand::Check {
-                db_path: parse_db_path(&args[1..], "check", false)?,
-            })
+            parse_check_command(&args[1..])
         }
         Some("sync") => parse_sync_command(&args[1..]),
         Some("source") => parse_source_command(&args[1..]),
@@ -520,6 +519,50 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
         output,
         top_k,
     })
+}
+
+fn parse_check_command(args: &[String]) -> Result<CliCommand, String> {
+    let mut db_path = None;
+    let mut output = OutputFormat::Table;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("expected --db <path.cupld|default> for `check` command".to_owned());
+                };
+                if db_path.is_some() {
+                    return Err(
+                        "expected exactly one --db <path.cupld|default> for `check` command"
+                            .to_owned(),
+                    );
+                }
+                db_path = Some(parse_db_flag_value(path)?);
+                index += 2;
+            }
+            "--output" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(
+                        "expected --output <table|json|ndjson> for `check` command".to_owned()
+                    );
+                };
+                output = parse_output_format(value)?;
+                index += 2;
+            }
+            value => {
+                return Err(format!(
+                    "error: unexpected argument `{value}`\n\n{}",
+                    cli_usage_text()
+                ));
+            }
+        }
+    }
+
+    let Some(db_path) = db_path else {
+        return Err("expected --db <path.cupld|default> for `check` command".to_owned());
+    };
+    Ok(CliCommand::Check { db_path, output })
 }
 
 fn parse_output_format(input: &str) -> Result<OutputFormat, String> {
@@ -1059,7 +1102,7 @@ Commands:
   --batch-ms              Max coalescing window before a forced watched sync.
   --idle-ms               Exit watched sync after this long with no pending changes.
   --max-runs              Stop watched sync after this many sync runs, including the initial run.
-  --output                Select output mode for query/context: table, json, ndjson.
+  --output                Select output mode for query/context/check: table, json, ndjson.
   --params-json           Provide named query parameters as a JSON object.
   --params-file           Read named query parameters from a JSON file.
   --max-rows              Hard cap result rows in non-interactive query mode.
@@ -1269,16 +1312,131 @@ fn run_compact(db_path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn run_check(db_path: PathBuf) -> Result<(), String> {
-    let report = Session::check(&db_path).map_err(|error| error.to_string())?;
-    println!(
-        "ok db={} last_tx_id={} wal_records={} recovered_tail={}",
-        db_path.display(),
-        report.last_tx_id,
-        report.wal_records,
-        report.recovered_tail
-    );
+fn run_check(db_path: PathBuf, output: OutputFormat) -> Result<(), String> {
+    let report = Session::check(&db_path)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    let session = Session::open(&db_path)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    let alias_diagnostics = markdown_alias_diagnostics(session.engine());
+    match output {
+        OutputFormat::Table => {
+            println!(
+                "ok db={} last_tx_id={} wal_records={} recovered_tail={} ambiguous_markdown_aliases={}",
+                db_path.display(),
+                report.last_tx_id,
+                report.wal_records,
+                report.recovered_tail,
+                alias_diagnostics.ambiguous_alias_count()
+            );
+        }
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                json::stringify(&check_json_value(&db_path, &report, &alias_diagnostics))
+            );
+        }
+        OutputFormat::Ndjson => {
+            for line in check_ndjson_lines(&db_path, &report, &alias_diagnostics) {
+                println!("{line}");
+            }
+        }
+    }
     Ok(())
+}
+
+fn check_json_value(
+    db_path: &Path,
+    report: &IntegrityReport,
+    alias_diagnostics: &MarkdownAliasDiagnostics,
+) -> json::JsonValue {
+    json::JsonValue::object([
+        ("ok", json::JsonValue::Bool(true)),
+        ("command", json::JsonValue::from("check")),
+        (
+            "db_path",
+            json::JsonValue::from(db_path.display().to_string()),
+        ),
+        ("integrity", integrity_json_value(report)),
+        (
+            "markdown",
+            markdown_alias_diagnostics_json_value(alias_diagnostics),
+        ),
+    ])
+}
+
+fn check_ndjson_lines(
+    db_path: &Path,
+    report: &IntegrityReport,
+    alias_diagnostics: &MarkdownAliasDiagnostics,
+) -> Vec<String> {
+    let mut lines = vec![json::stringify(&json::JsonValue::object([
+        ("kind", json::JsonValue::from("check_meta")),
+        ("ok", json::JsonValue::Bool(true)),
+        ("command", json::JsonValue::from("check")),
+        (
+            "db_path",
+            json::JsonValue::from(db_path.display().to_string()),
+        ),
+        ("integrity", integrity_json_value(report)),
+        (
+            "ambiguous_markdown_alias_count",
+            json::JsonValue::from(alias_diagnostics.ambiguous_alias_count()),
+        ),
+    ]))];
+    lines.extend(alias_diagnostics.ambiguous_aliases.iter().map(|ambiguity| {
+        json::stringify(&json::JsonValue::object([
+            ("kind", json::JsonValue::from("markdown_alias_ambiguity")),
+            ("alias", json::JsonValue::from(ambiguity.alias.clone())),
+            (
+                "paths",
+                json::JsonValue::array(ambiguity.paths.iter().cloned().map(json::JsonValue::from)),
+            ),
+        ]))
+    }));
+    lines
+}
+
+fn integrity_json_value(report: &IntegrityReport) -> json::JsonValue {
+    json::JsonValue::object([
+        ("last_tx_id", json::JsonValue::from(report.last_tx_id)),
+        ("wal_records", json::JsonValue::from(report.wal_records)),
+        (
+            "recovered_tail",
+            json::JsonValue::Bool(report.recovered_tail),
+        ),
+    ])
+}
+
+fn markdown_alias_diagnostics_json_value(
+    alias_diagnostics: &MarkdownAliasDiagnostics,
+) -> json::JsonValue {
+    json::JsonValue::object([
+        (
+            "ambiguous_alias_count",
+            json::JsonValue::from(alias_diagnostics.ambiguous_alias_count()),
+        ),
+        (
+            "ambiguous_aliases",
+            json::JsonValue::array(
+                alias_diagnostics
+                    .ambiguous_aliases
+                    .iter()
+                    .map(markdown_alias_ambiguity_json_value),
+            ),
+        ),
+    ])
+}
+
+fn markdown_alias_ambiguity_json_value(ambiguity: &MarkdownAliasAmbiguity) -> json::JsonValue {
+    json::JsonValue::object([
+        ("alias", json::JsonValue::from(ambiguity.alias.clone())),
+        (
+            "paths",
+            json::JsonValue::array(ambiguity.paths.iter().cloned().map(json::JsonValue::from)),
+        ),
+    ])
 }
 
 fn run_sync_markdown(
