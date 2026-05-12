@@ -431,6 +431,136 @@ fn cli_check_reports_generated_db_integrity() {
     assert!(stdout.contains("ok db="));
     assert!(stdout.contains("wal_records="));
     assert!(stdout.contains("recovered_tail=false"));
+    assert!(stdout.contains("ambiguous_markdown_aliases=0"));
+}
+
+#[test]
+fn cli_memory_check_json_reports_ambiguous_markdown_aliases_from_current_documents() {
+    let db = TestDb::new("cli_memory_check_alias_diagnostics");
+    let root = TempDir::new("cli_memory_check_alias_diagnostics_root");
+    fs::write(
+        root.path().join("one.md"),
+        "---\n\
+aliases: [Shared, Solo]\n\
+---\n\
+# One\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("two.md"),
+        "---\n\
+aliases: [Shared]\n\
+---\n\
+# Two\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("unique.md"),
+        "---\n\
+aliases: [Unique]\n\
+---\n\
+# Unique\n",
+    )
+    .unwrap();
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+
+    let output = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("ok").and_then(json::JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        parsed.get("command").and_then(json::JsonValue::as_str),
+        Some("memory.check")
+    );
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("ambiguous_markdown_aliases"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        parsed
+            .get("markdown")
+            .and_then(|markdown| markdown.get("ambiguous_alias_count"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    let aliases = parsed
+        .get("markdown")
+        .and_then(|markdown| markdown.get("ambiguous_aliases"))
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(
+        aliases[0].get("alias").and_then(json::JsonValue::as_str),
+        Some("Shared")
+    );
+    let paths = aliases[0]
+        .get("paths")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(
+        paths
+            .iter()
+            .map(|path| path.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["one.md", "two.md"]
+    );
+
+    fs::remove_file(root.path().join("two.md")).unwrap();
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+
+    let output = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed
+            .get("markdown")
+            .and_then(|markdown| markdown.get("ambiguous_alias_count"))
+            .and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
 }
 
 #[test]

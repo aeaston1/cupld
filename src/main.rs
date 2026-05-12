@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use cupld::{
-    MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, QueryResult, RuntimeValue,
-    Session, Value,
+    MarkdownAliasAmbiguity, MarkdownAliasDiagnostics, MarkdownSyncOptions, MarkdownSyncReport,
+    MarkdownWatchOptions, QueryResult, RuntimeValue, Session, Value,
     automation::{
         AutomationError, AutomationPolicy, build_context_response, context_as_json,
         context_as_ndjson, format_error_json as machine_error_json,
@@ -18,6 +18,7 @@ use cupld::{
     },
     configured_markdown_root, json,
     json::JsonValue,
+    markdown_alias_diagnostics,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
@@ -1282,7 +1283,7 @@ Commands:
   --batch-ms              Max coalescing window before a forced watched sync.
   --idle-ms               Exit watched sync after this long with no pending changes.
   --max-runs              Stop watched sync after this many sync runs, including the initial run.
-  --output                Select output mode for query/context: table, json, ndjson.
+  --output                Select output mode for query/context/memory: table, json, ndjson.
   --params-json           Provide named query parameters as a JSON object.
   --params-file           Read named query parameters from a JSON file.
   --max-rows              Hard cap result rows in non-interactive query mode.
@@ -1498,12 +1499,15 @@ fn run_compact(db_path: PathBuf) -> Result<(), String> {
 
 fn run_check(db_path: PathBuf) -> Result<(), String> {
     let report = Session::check(&db_path).map_err(|error| error.to_string())?;
+    let session = Session::open(&db_path).map_err(|error| error.to_string())?;
+    let alias_diagnostics = markdown_alias_diagnostics(session.engine());
     println!(
-        "ok db={} last_tx_id={} wal_records={} recovered_tail={}",
+        "ok db={} last_tx_id={} wal_records={} recovered_tail={} ambiguous_markdown_aliases={}",
         db_path.display(),
         report.last_tx_id,
         report.wal_records,
-        report.recovered_tail
+        report.recovered_tail,
+        alias_diagnostics.ambiguous_alias_count()
     );
     Ok(())
 }
@@ -1515,6 +1519,7 @@ struct MemoryReport {
     root: Option<PathBuf>,
     strict: Option<bool>,
     summary: Vec<(String, RuntimeValue)>,
+    markdown_alias_diagnostics: Option<MarkdownAliasDiagnostics>,
     items: QueryResult,
 }
 
@@ -1559,9 +1564,11 @@ fn run_memory_check(
         .map_err(|error| format_command_error(output, &error))?;
     let orphans =
         memory_orphan_items(&mut session).map_err(|error| format_command_error(output, &error))?;
+    let alias_diagnostics = markdown_alias_diagnostics(session.engine());
     let strict_failure =
         strict && (integrity.recovered_tail || !stale.rows.is_empty() || !orphans.rows.is_empty());
     let status = if strict_failure { "failed" } else { "ok" };
+    let ambiguous_aliases = alias_diagnostics.ambiguous_alias_count();
     let report = MemoryReport {
         command: "memory.check",
         db_path,
@@ -1589,7 +1596,12 @@ fn run_memory_check(
                 "orphan_items".to_owned(),
                 RuntimeValue::Int(orphans.rows.len() as i64),
             ),
+            (
+                "ambiguous_markdown_aliases".to_owned(),
+                RuntimeValue::Int(ambiguous_aliases as i64),
+            ),
         ],
+        markdown_alias_diagnostics: Some(alias_diagnostics),
         items: QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -1631,6 +1643,7 @@ fn run_memory_find_stale(
             "stale_items".to_owned(),
             RuntimeValue::Int(items.rows.len() as i64),
         )],
+        markdown_alias_diagnostics: None,
         items,
     };
     print_memory_report(&report, output);
@@ -1652,6 +1665,7 @@ fn run_memory_find_orphans(db_path: PathBuf, output: OutputFormat) -> Result<(),
             "orphan_items".to_owned(),
             RuntimeValue::Int(items.rows.len() as i64),
         )],
+        markdown_alias_diagnostics: None,
         items,
     };
     print_memory_report(&report, output);
@@ -1726,6 +1740,7 @@ fn run_memory_reindex(db_path: PathBuf, output: OutputFormat) -> Result<(), Stri
                 RuntimeValue::Int(sync_report.structural_edges as i64),
             ),
         ],
+        markdown_alias_diagnostics: None,
         items: QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -1930,6 +1945,12 @@ fn memory_report_fields(report: &MemoryReport, ndjson_meta: bool) -> Vec<(String
         fields.push(("strict".to_owned(), JsonValue::Bool(strict)));
     }
     fields.push(("summary".to_owned(), memory_summary_json(&report.summary)));
+    if let Some(alias_diagnostics) = &report.markdown_alias_diagnostics {
+        fields.push((
+            "markdown".to_owned(),
+            markdown_alias_diagnostics_json_value(alias_diagnostics),
+        ));
+    }
     if !ndjson_meta {
         fields.push((
             "items".to_owned(),
@@ -1946,6 +1967,36 @@ fn memory_summary_json(summary: &[(String, RuntimeValue)]) -> JsonValue {
             .map(|(key, value)| (key.clone(), json::runtime_value_to_json(value)))
             .collect(),
     )
+}
+
+fn markdown_alias_diagnostics_json_value(
+    alias_diagnostics: &MarkdownAliasDiagnostics,
+) -> JsonValue {
+    JsonValue::object([
+        (
+            "ambiguous_alias_count",
+            JsonValue::from(alias_diagnostics.ambiguous_alias_count()),
+        ),
+        (
+            "ambiguous_aliases",
+            JsonValue::array(
+                alias_diagnostics
+                    .ambiguous_aliases
+                    .iter()
+                    .map(markdown_alias_ambiguity_json_value),
+            ),
+        ),
+    ])
+}
+
+fn markdown_alias_ambiguity_json_value(ambiguity: &MarkdownAliasAmbiguity) -> JsonValue {
+    JsonValue::object([
+        ("alias", JsonValue::from(ambiguity.alias.clone())),
+        (
+            "paths",
+            JsonValue::array(ambiguity.paths.iter().cloned().map(JsonValue::from)),
+        ),
+    ])
 }
 
 fn string_column(

@@ -121,10 +121,9 @@ impl MarkdownResolutionIndex {
 }
 
 fn insert_collision_aware(map: &mut BTreeMap<String, Option<String>>, key: &str, target: &str) {
-    let trimmed = key.trim();
-    if trimmed.is_empty() {
+    let Some(trimmed) = normalize_markdown_alias(key) else {
         return;
-    }
+    };
     match map.get(trimmed) {
         Some(Some(existing)) if existing != target => {
             map.insert(trimmed.to_owned(), None);
@@ -138,6 +137,15 @@ fn insert_collision_aware(map: &mut BTreeMap<String, Option<String>>, key: &str,
 
 fn resolve_collision_aware(map: &BTreeMap<String, Option<String>>, key: &str) -> Option<String> {
     map.get(key.trim()).and_then(|target| target.clone())
+}
+
+fn normalize_markdown_alias(alias: &str) -> Option<&str> {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -167,6 +175,23 @@ pub struct MarkdownSyncReport {
     pub upserted_directories: usize,
     pub tombstoned_directories: usize,
     pub structural_edges: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownAliasAmbiguity {
+    pub alias: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MarkdownAliasDiagnostics {
+    pub ambiguous_aliases: Vec<MarkdownAliasAmbiguity>,
+}
+
+impl MarkdownAliasDiagnostics {
+    pub fn ambiguous_alias_count(&self) -> usize {
+        self.ambiguous_aliases.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -348,6 +373,49 @@ pub fn sync_markdown_root_with_options(
         tombstoned_directories,
         structural_edges,
     })
+}
+
+pub fn markdown_alias_diagnostics(engine: &CupldEngine) -> MarkdownAliasDiagnostics {
+    let mut aliases = BTreeMap::<String, BTreeSet<String>>::new();
+    for node in engine.nodes() {
+        if !node.labels().contains(MARKDOWN_DOCUMENT_LABEL) {
+            continue;
+        }
+        if !matches!(node.property("src.status"), Some(Value::String(status)) if status == "current")
+        {
+            continue;
+        }
+        let Some(Value::String(path)) = node.property("src.path") else {
+            continue;
+        };
+        let Some(Value::List(values)) = node.property("md.aliases") else {
+            continue;
+        };
+        for value in values {
+            let Value::String(alias) = value else {
+                continue;
+            };
+            let Some(alias) = normalize_markdown_alias(alias) else {
+                continue;
+            };
+            aliases
+                .entry(alias.to_owned())
+                .or_default()
+                .insert(path.clone());
+        }
+    }
+
+    MarkdownAliasDiagnostics {
+        ambiguous_aliases: aliases
+            .into_iter()
+            .filter_map(|(alias, paths)| {
+                (paths.len() > 1).then(|| MarkdownAliasAmbiguity {
+                    alias,
+                    paths: paths.into_iter().collect(),
+                })
+            })
+            .collect(),
+    }
 }
 
 pub fn watch_markdown_root(
@@ -2069,9 +2137,10 @@ mod tests {
 
     use super::{
         CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, LINK_EDGE_TYPE, MARKDOWN_DIRECTORY_LABEL,
-        MARKDOWN_DOCUMENT_LABEL, MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, MarkdownDocument,
-        MarkdownLinkRef, MarkdownLinkSource, MarkdownSyncOptions, build_resolution_index,
-        configured_markdown_root, extract_document_link_refs, read_markdown_document,
+        MARKDOWN_DOCUMENT_LABEL, MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, MarkdownAliasAmbiguity,
+        MarkdownAliasDiagnostics, MarkdownDocument, MarkdownLinkRef, MarkdownLinkSource,
+        MarkdownSyncOptions, build_resolution_index, configured_markdown_root,
+        extract_document_link_refs, markdown_alias_diagnostics, read_markdown_document,
         resolve_link_path, set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
     };
     use crate::engine::{CupldEngine, PropertyMap, Value};
@@ -2323,6 +2392,61 @@ Body with [[other]] and [deep](other.md#intro) and [misc](misc.md)
             resolve_link_path(Path::new("source.md"), "/en-US/docs/docs/topic", &index),
             None
         );
+    }
+
+    #[test]
+    fn alias_diagnostics_report_current_collisions_and_ignore_tombstones() {
+        let root = temp_dir("alias_diagnostics");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("one.md"),
+            "---\n\
+aliases: [Shared, Solo]\n\
+---\n\
+# One\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("two.md"),
+            "---\n\
+aliases: [Shared]\n\
+---\n\
+# Two\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("unique.md"),
+            "---\n\
+aliases: [Unique]\n\
+---\n\
+# Unique\n",
+        )
+        .unwrap();
+
+        let mut engine = CupldEngine::default();
+        sync_markdown_root(&mut engine, &root).unwrap();
+
+        assert_eq!(
+            markdown_alias_diagnostics(&engine),
+            MarkdownAliasDiagnostics {
+                ambiguous_aliases: vec![MarkdownAliasAmbiguity {
+                    alias: "Shared".to_owned(),
+                    paths: vec!["one.md".to_owned(), "two.md".to_owned()],
+                }],
+            }
+        );
+
+        fs::remove_file(root.join("two.md")).unwrap();
+        sync_markdown_root(&mut engine, &root).unwrap();
+
+        assert_eq!(
+            markdown_alias_diagnostics(&engine),
+            MarkdownAliasDiagnostics {
+                ambiguous_aliases: Vec::new(),
+            }
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
