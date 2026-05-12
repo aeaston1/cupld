@@ -110,6 +110,12 @@ cupld sync markdown --db default --root notes
 cupld source set-root --db default notes
 ```
 
+Opt in to persisted filesystem structure during sync:
+
+```bash
+cupld sync markdown --db default --root notes --include-fs-graph
+```
+
 Watch markdown after the initial persisted sync:
 
 ```bash
@@ -132,6 +138,7 @@ The interactive installer asks for a skill location, DB path, and markdown root.
 `install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in the user config `install-state.toml`. That state lets REPL startup reuse saved paths for refresh prompts. If the state file is corrupt or points at the wrong install, rerun `cupld install ...` with the desired target/path, DB, and root to rewrite it.
 
 Repo-local package settings live in `.cupld/config.toml`. `install` and markdown-aware commands use it as the workspace default for DB path and markdown root.
+Use `[markdown] include_fs_graph = true` to enable filesystem graph sync for `cupld sync markdown` by default.
 
 ## Documentation
 

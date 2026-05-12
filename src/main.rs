@@ -18,7 +18,7 @@ use cupld::{
     configured_markdown_root, json,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
-    set_markdown_root, sync_markdown_root, sync_markdown_root_with_options, watch_markdown_root,
+    set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
     watch_markdown_root_with_sync_options,
 };
 use skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
@@ -194,7 +194,7 @@ fn run() -> Result<(), String> {
             batch_window,
             idle_timeout,
             max_runs,
-            filesystem_graph,
+            include_fs_graph,
         } => run_sync_markdown(
             db_path,
             root_override,
@@ -204,7 +204,7 @@ fn run() -> Result<(), String> {
             batch_window,
             idle_timeout,
             max_runs,
-            filesystem_graph,
+            include_fs_graph,
         ),
         CliCommand::SourceSetRoot { db_path, root } => run_source_set_root(db_path, root),
         CliCommand::McpServe {
@@ -259,7 +259,7 @@ enum CliCommand {
         batch_window: Duration,
         idle_timeout: Option<Duration>,
         max_runs: Option<usize>,
-        filesystem_graph: bool,
+        include_fs_graph: bool,
     },
     SourceSetRoot {
         db_path: PathBuf,
@@ -539,7 +539,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
         Some("markdown") => {}
         _ => {
             return Err(format!(
-                "error: expected `sync markdown --db <path.cupld|default> [--root <path>] [--watch] [--filesystem-graph]`\n\n{}",
+                "error: expected `sync markdown --db <path.cupld|default> [--root <path>] [--watch] [--include-fs-graph]`\n\n{}",
                 cli_usage_text()
             ));
         }
@@ -553,7 +553,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
     let mut batch_window = Duration::from_secs(2);
     let mut idle_timeout = None;
     let mut max_runs = None;
-    let mut filesystem_graph = false;
+    let mut include_fs_graph = false;
     let mut index = 1;
 
     while index < args.len() {
@@ -587,8 +587,11 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
                 watch = true;
                 index += 1;
             }
-            "--filesystem-graph" => {
-                filesystem_graph = true;
+            "--include-fs-graph" | "--filesystem-graph" => {
+                if include_fs_graph {
+                    return Err("duplicate option `--include-fs-graph`".to_owned());
+                }
+                include_fs_graph = true;
                 index += 1;
             }
             "--poll-ms" => {
@@ -658,7 +661,7 @@ fn parse_sync_command(args: &[String]) -> Result<CliCommand, String> {
         batch_window,
         idle_timeout,
         max_runs,
-        filesystem_graph,
+        include_fs_graph,
     })
 }
 
@@ -1050,7 +1053,7 @@ Commands:
   --with-md               Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
   --watch                 Keep polling markdown for changes after the initial sync.
-  --filesystem-graph      Persist MarkdownDirectory nodes for Markdown-containing paths.
+  --include-fs-graph      Include markdown filesystem directory nodes and containment edges.
   --poll-ms               Poll interval for `sync markdown --watch`.
   --debounce-ms           Stable-change debounce window for `sync markdown --watch`.
   --batch-ms              Max coalescing window before a forced watched sync.
@@ -1287,12 +1290,14 @@ fn run_sync_markdown(
     batch_window: Duration,
     idle_timeout: Option<Duration>,
     max_runs: Option<usize>,
-    filesystem_graph: bool,
+    include_fs_graph: bool,
 ) -> Result<(), String> {
     let mut session = open_initial_session(Some(db_path.clone()))?;
     let root = resolve_markdown_root(root_override.as_deref(), Some(&session))?;
+    let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
+    let include_fs_graph = include_fs_graph || package.configured_markdown_include_fs_graph();
+    let sync_options = MarkdownSyncOptions { include_fs_graph };
     let mut engine = session.engine().clone();
-    let sync_options = MarkdownSyncOptions { filesystem_graph };
     let report = if watch {
         let options = MarkdownWatchOptions {
             poll_interval,
@@ -1301,12 +1306,9 @@ fn run_sync_markdown(
             idle_timeout,
             max_runs,
         };
-        let report = if filesystem_graph {
+        let report =
             watch_markdown_root_with_sync_options(&mut engine, &root, &sync_options, &options)
-                .map_err(|error| error.to_string())?
-        } else {
-            watch_markdown_root(&mut engine, &root, &options).map_err(|error| error.to_string())?
-        };
+                .map_err(|error| error.to_string())?;
         println!(
             "watch root={} runs={} events={}",
             report.root.display(),
@@ -1323,7 +1325,7 @@ fn run_sync_markdown(
             tombstoned_directories: 0,
             structural_edges: 0,
         })
-    } else if filesystem_graph {
+    } else if include_fs_graph {
         sync_markdown_root_with_options(&mut engine, &root, &sync_options)
             .map_err(|error| error.to_string())?
     } else {
@@ -2144,6 +2146,20 @@ mod tests {
     }
 
     #[test]
+    fn query_does_not_accept_include_fs_graph() {
+        let args = vec![
+            "query".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "--include-fs-graph".to_owned(),
+        ];
+        assert!(matches!(
+            parse_cli_command(&args),
+            Err(error) if error.contains("unknown option `--include-fs-graph`")
+        ));
+    }
+
+    #[test]
     fn parses_schema_with_default_db_alias() {
         let args = vec!["schema".to_owned(), "--db".to_owned(), "default".to_owned()];
         assert_eq!(
@@ -2423,13 +2439,38 @@ mod tests {
                 batch_window: std::time::Duration::from_secs(2),
                 idle_timeout: None,
                 max_runs: None,
-                filesystem_graph: false,
+                include_fs_graph: false,
             })
         );
     }
 
     #[test]
-    fn parses_sync_markdown_with_filesystem_graph() {
+    fn parses_sync_markdown_include_fs_graph() {
+        let args = vec![
+            "sync".to_owned(),
+            "markdown".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "--include-fs-graph".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::SyncMarkdown {
+                db_path: default_alias_db_path(),
+                root_override: None,
+                watch: false,
+                poll_interval: std::time::Duration::from_millis(100),
+                debounce: std::time::Duration::from_millis(200),
+                batch_window: std::time::Duration::from_secs(2),
+                idle_timeout: None,
+                max_runs: None,
+                include_fs_graph: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_sync_markdown_filesystem_graph_alias() {
         let args = vec![
             "sync".to_owned(),
             "markdown".to_owned(),
@@ -2448,7 +2489,61 @@ mod tests {
                 batch_window: std::time::Duration::from_secs(2),
                 idle_timeout: None,
                 max_runs: None,
-                filesystem_graph: true,
+                include_fs_graph: true,
+            })
+        );
+    }
+
+    #[test]
+    fn errors_for_duplicate_sync_markdown_include_fs_graph() {
+        let args = vec![
+            "sync".to_owned(),
+            "markdown".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "--include-fs-graph".to_owned(),
+            "--include-fs-graph".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Err("duplicate option `--include-fs-graph`".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_sync_markdown_include_fs_graph_with_watch_options() {
+        let args = vec![
+            "sync".to_owned(),
+            "markdown".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "--root".to_owned(),
+            "notes".to_owned(),
+            "--include-fs-graph".to_owned(),
+            "--watch".to_owned(),
+            "--poll-ms".to_owned(),
+            "10".to_owned(),
+            "--debounce-ms".to_owned(),
+            "20".to_owned(),
+            "--batch-ms".to_owned(),
+            "30".to_owned(),
+            "--idle-ms".to_owned(),
+            "40".to_owned(),
+            "--max-runs".to_owned(),
+            "2".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::SyncMarkdown {
+                db_path: default_alias_db_path(),
+                root_override: Some(PathBuf::from("notes")),
+                watch: true,
+                poll_interval: std::time::Duration::from_millis(10),
+                debounce: std::time::Duration::from_millis(20),
+                batch_window: std::time::Duration::from_millis(30),
+                idle_timeout: Some(std::time::Duration::from_millis(40)),
+                max_runs: Some(2),
+                include_fs_graph: true,
             })
         );
     }
@@ -2572,6 +2667,7 @@ mod tests {
         ));
         assert!(help.contains("Seed the scene with one read-only RETURN query."));
         assert!(help.contains("Run a query against --db using inline text or stdin."));
+        assert!(help.contains("--include-fs-graph"));
         assert!(help.contains("Run .help inside the REPL for interactive commands."));
         assert_eq!(help.matches("Usage:").count(), 1);
         assert_eq!(help.matches("Commands:").count(), 1);

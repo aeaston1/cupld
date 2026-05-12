@@ -33,11 +33,6 @@ pub struct MarkdownDocument {
     pub has_frontmatter: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MarkdownSyncOptions {
-    pub filesystem_graph: bool,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MarkdownLinkRef {
     raw_target: String,
@@ -172,6 +167,11 @@ pub struct MarkdownSyncReport {
     pub upserted_directories: usize,
     pub tombstoned_directories: usize,
     pub structural_edges: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkdownSyncOptions {
+    pub include_fs_graph: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,7 +321,7 @@ pub fn sync_markdown_root_with_options(
     let mut tombstoned_directories = 0;
     let mut structural_edges = 0;
     let doc_node_ids = upsert_documents(engine, &root_string, &documents, &mut existing_docs)?;
-    if options.filesystem_graph {
+    if options.include_fs_graph {
         let mut existing_dirs = collect_existing_directories(engine, &root_string);
         let dir_node_ids =
             upsert_directories(engine, &root_string, &documents, &mut existing_dirs)?;
@@ -2192,7 +2192,7 @@ Body with [[other]] and [deep](docs/page.md#intro) and #tagged
 
     #[test]
     fn filesystem_graph_options_are_default_off() {
-        assert!(!MarkdownSyncOptions::default().filesystem_graph);
+        assert!(!MarkdownSyncOptions::default().include_fs_graph);
         assert_eq!(MARKDOWN_DIRECTORY_LABEL, "MarkdownDirectory");
         assert_eq!(MD_IN_DIRECTORY, "MD_IN_DIRECTORY");
         assert_eq!(MD_PARENT_DIRECTORY, "MD_PARENT_DIRECTORY");

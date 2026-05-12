@@ -46,10 +46,16 @@ pub struct PackageLayoutConfig {
     pub markdown_root: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageMarkdownConfig {
+    pub include_fs_graph: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageConfig {
     pub version: u32,
     pub package: PackageLayoutConfig,
+    pub markdown: PackageMarkdownConfig,
 }
 
 impl Default for PackageConfig {
@@ -57,6 +63,7 @@ impl Default for PackageConfig {
         Self {
             version: PACKAGE_CONFIG_VERSION,
             package: PackageLayoutConfig::default(),
+            markdown: PackageMarkdownConfig::default(),
         }
     }
 }
@@ -126,6 +133,10 @@ impl WorkspacePackage {
             .markdown_root
             .as_deref()
             .map(|path| self.resolve_package_path(path))
+    }
+
+    pub fn configured_markdown_include_fs_graph(&self) -> bool {
+        self.config.markdown.include_fs_graph
     }
 
     pub fn default_db_path(&self) -> PathBuf {
@@ -214,13 +225,16 @@ fn parse_config(input: &str) -> Result<PackageConfig, PackageError> {
     enum Section {
         Root,
         Package,
+        Markdown,
     }
 
     let mut config = PackageConfig::default();
     let mut saw_version = false;
     let mut saw_package_table = false;
+    let mut saw_markdown_table = false;
     let mut saw_db_path = false;
     let mut saw_markdown_root = false;
+    let mut saw_include_fs_graph = false;
     let mut section = Section::Root;
 
     for (index, raw_line) in input.lines().enumerate() {
@@ -241,6 +255,13 @@ fn parse_config(input: &str) -> Result<PackageConfig, PackageError> {
                     }
                     saw_package_table = true;
                     section = Section::Package;
+                }
+                "markdown" => {
+                    if saw_markdown_table {
+                        return Err(parse_error(line_number, "duplicate `[markdown]` table"));
+                    }
+                    saw_markdown_table = true;
+                    section = Section::Markdown;
                 }
                 unknown => {
                     return Err(parse_error(
@@ -299,6 +320,25 @@ fn parse_config(input: &str) -> Result<PackageConfig, PackageError> {
                 return Err(parse_error(
                     line_number,
                     format!("unknown package key `{unknown}`"),
+                ));
+            }
+            (Section::Markdown, "include_fs_graph") => {
+                if saw_include_fs_graph {
+                    return Err(parse_error(line_number, "duplicate `include_fs_graph`"));
+                }
+                saw_include_fs_graph = true;
+                config.markdown.include_fs_graph =
+                    parse_bool_value(&parsed_value).map_err(|message| {
+                        parse_error(
+                            line_number,
+                            format!("invalid `include_fs_graph`: {message}"),
+                        )
+                    })?;
+            }
+            (Section::Markdown, unknown) => {
+                return Err(parse_error(
+                    line_number,
+                    format!("unknown markdown key `{unknown}`"),
                 ));
             }
         }
@@ -377,6 +417,13 @@ fn parse_path_value(value: &JsonValue) -> Result<PathBuf, &'static str> {
     }
 }
 
+fn parse_bool_value(value: &JsonValue) -> Result<bool, &'static str> {
+    match value {
+        JsonValue::Bool(value) => Ok(*value),
+        _ => Err("value must be a boolean"),
+    }
+}
+
 fn render_config(config: &PackageConfig) -> String {
     let mut output = String::new();
     output.push_str("version = ");
@@ -395,6 +442,11 @@ fn render_config(config: &PackageConfig) -> String {
             json::write_quoted_string(&mut output, &path.display().to_string());
             output.push('\n');
         }
+    }
+    if config.markdown.include_fs_graph {
+        output.push('\n');
+        output.push_str("[markdown]\n");
+        output.push_str("include_fs_graph = true\n");
     }
     output
 }
@@ -480,6 +532,29 @@ mod tests {
         assert_eq!(
             config,
             "version = 1\n\n[package]\ndb_path = \".cupld/graph.cupld\"\nmarkdown_root = \"notes\"\n"
+        );
+    }
+
+    #[test]
+    fn package_config_reads_markdown_include_fs_graph() {
+        let config = parse_config("version = 1\n\n[markdown]\ninclude_fs_graph = true\n").unwrap();
+
+        assert!(config.markdown.include_fs_graph);
+        assert_eq!(
+            render_config(&config),
+            "version = 1\n\n[markdown]\ninclude_fs_graph = true\n"
+        );
+
+        let duplicate =
+            parse_config("[markdown]\ninclude_fs_graph = true\ninclude_fs_graph = false\n")
+                .unwrap_err();
+        assert!(duplicate.message().contains("duplicate `include_fs_graph`"));
+
+        let invalid = parse_config("[markdown]\ninclude_fs_graph = \"yes\"\n").unwrap_err();
+        assert!(
+            invalid
+                .message()
+                .contains("invalid `include_fs_graph`: value must be a boolean")
         );
     }
 
