@@ -615,6 +615,43 @@ fn cli_memory_check_outputs_json_report() {
 }
 
 #[test]
+fn cli_memory_check_empty_db_passes_in_table_output() {
+    let db = TestDb::new("cli_memory_check_empty_table");
+
+    let output = run_cli(&["memory", "check", "--db", db.path().to_str().unwrap()]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("command | memory.check"));
+    assert!(stdout.contains("status  | pass"));
+    assert!(stdout.contains("stale_items"));
+    assert!(stdout.contains("orphan_items"));
+}
+
+#[test]
+fn cli_memory_check_default_alias_uses_workspace_db() {
+    let workspace = TempDir::new("cli_memory_check_default_alias");
+    seed_workspace_default_db(workspace.path());
+
+    let output = run_cli_in_dir(
+        &["memory", "check", "--db", "default", "--output", "json"],
+        workspace.path(),
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("db_path").and_then(json::JsonValue::as_str),
+        workspace_default_db_path(workspace.path()).to_str()
+    );
+    assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("pass")
+    );
+}
+
+#[test]
 fn cli_memory_check_reports_markdown_health_summary() {
     let db = TestDb::new("cli_memory_check_health_summary");
     let root = TempDir::new("cli_memory_check_health_summary_root");
@@ -749,6 +786,91 @@ fn cli_memory_check_reports_markdown_health_summary() {
             .and_then(json::JsonValue::as_i64),
         Some(0)
     );
+}
+
+#[test]
+fn cli_memory_check_counts_duplicate_markdown_links_without_repairing() {
+    let db = TestDb::new("cli_memory_check_duplicate_links_preserved");
+    let root = TempDir::new("cli_memory_check_duplicate_links_preserved_root");
+    fs::write(root.path().join("source.md"), "[target](target.md)\n").unwrap();
+    fs::write(root.path().join("target.md"), "# Target\n").unwrap();
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+
+    let mut session = db.open();
+    let mut engine = session.engine().clone();
+    let source_node = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("source.md")))
+        .unwrap();
+    let source_hash = source_node.property("src.hash").unwrap().clone();
+    let duplicate = engine
+        .create_node(
+            ["MarkdownDocument"],
+            PropertyMap::from_pairs([
+                ("src.connector", Value::from("markdown")),
+                ("src.kind", Value::from("document")),
+                ("src.root", Value::from(root.path().display().to_string())),
+                ("src.path", Value::from("source.md")),
+                ("src.hash", source_hash),
+                ("src.status", Value::from("current")),
+            ]),
+        )
+        .unwrap();
+    let target = engine
+        .nodes()
+        .find(|node| node.property("src.path") == Some(&Value::from("target.md")))
+        .unwrap()
+        .id();
+    engine
+        .create_edge(
+            duplicate,
+            target,
+            "MD_LINKS_TO",
+            PropertyMap::from_pairs([("src.connector", Value::from("markdown"))]),
+        )
+        .unwrap();
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("duplicate_connector_owned_md_links_to_edges"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    let session = db.open();
+    let duplicate_edges = session
+        .engine()
+        .edges()
+        .filter(|edge| edge.edge_type() == "MD_LINKS_TO")
+        .filter(|edge| edge.property("src.connector") == Some(&Value::from("markdown")))
+        .count();
+    assert_eq!(duplicate_edges, 2);
 }
 
 #[test]
@@ -982,6 +1104,41 @@ fn cli_memory_find_stale_json_reports_filesystem_freshness_kinds() {
                 .contains("cupld sync markdown --db ... --root")
         );
     }
+}
+
+#[test]
+fn cli_memory_find_stale_table_reports_missing_current_file() {
+    let db = TestDb::new("cli_memory_find_stale_missing_table");
+    let root = TempDir::new("cli_memory_find_stale_missing_table_root");
+    fs::write(root.path().join("gone.md"), "# Gone\n").unwrap();
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+    fs::remove_file(root.path().join("gone.md")).unwrap();
+
+    let output = run_cli(&[
+        "memory",
+        "find-stale",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "table",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("status  | warn"));
+    assert!(stdout.contains("gone.md"));
+    assert!(stdout.contains("missing_file"));
 }
 
 #[test]
@@ -1385,6 +1542,12 @@ fn cli_memory_deferred_and_unknown_subcommands_error_clearly() {
     assert!(!repair.status.success());
     let stderr = String::from_utf8(repair.stderr).unwrap();
     assert!(stderr.contains("intentionally out of scope"));
+
+    let citation_audit = run_cli(&["memory", "citation-audit", "--db", "default"]);
+    assert!(!citation_audit.status.success());
+    let stderr = String::from_utf8(citation_audit.stderr).unwrap();
+    assert!(stderr.contains("intentionally out of scope"));
+    assert!(stderr.contains("citation-audit"));
 
     let unknown = run_cli(&["memory", "wat"]);
     assert!(!unknown.status.success());
