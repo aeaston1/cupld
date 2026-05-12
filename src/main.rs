@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,6 +17,7 @@ use cupld::{
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
     configured_markdown_root, json,
+    json::JsonValue,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
@@ -185,6 +187,7 @@ fn run() -> Result<(), String> {
         CliCommand::Schema { db_path } => run_schema(&db_path),
         CliCommand::Compact { db_path } => run_compact(db_path),
         CliCommand::Check { db_path } => run_check(db_path),
+        CliCommand::Memory(command) => run_memory(command),
         CliCommand::SyncMarkdown {
             db_path,
             root_override,
@@ -250,6 +253,7 @@ enum CliCommand {
     Check {
         db_path: PathBuf,
     },
+    Memory(MemoryCommand),
     SyncMarkdown {
         db_path: PathBuf,
         root_override: Option<PathBuf>,
@@ -271,6 +275,46 @@ enum CliCommand {
         read_only: bool,
     },
     Install(InstallCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MemoryCommand {
+    Check {
+        db_path: PathBuf,
+        root_override: Option<PathBuf>,
+        output: OutputFormat,
+        strict: bool,
+    },
+    FindStale {
+        db_path: PathBuf,
+        root_override: Option<PathBuf>,
+        output: OutputFormat,
+    },
+    FindOrphans {
+        db_path: PathBuf,
+        output: OutputFormat,
+    },
+    Reindex {
+        db_path: PathBuf,
+        output: OutputFormat,
+    },
+    Deferred {
+        subcommand: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryAction {
+    Check,
+    FindStale,
+    FindOrphans,
+    Reindex,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MemoryOptionSpec {
+    allow_root: bool,
+    allow_strict: bool,
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
@@ -320,6 +364,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
                 db_path: parse_db_path(&args[1..], "check", false)?,
             })
         }
+        Some("memory") => parse_memory_command(&args[1..]),
         Some("sync") => parse_sync_command(&args[1..]),
         Some("source") => parse_source_command(&args[1..]),
         Some("mcp") => parse_mcp_command(&args[1..]),
@@ -339,6 +384,184 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
             ))
         }
         None => Ok(CliCommand::ReplMemory),
+    }
+}
+
+fn parse_memory_command(args: &[String]) -> Result<CliCommand, String> {
+    ensure_subcommand_has_no_option(args, "memory", "--visualise")?;
+    ensure_subcommand_has_no_option(args, "memory", "--query")?;
+
+    let Some(subcommand) = args.first() else {
+        return Err(format!(
+            "error: expected `memory <check|find-stale|find-orphans|reindex|repair|citation-audit>`\n\n{}",
+            cli_usage_text()
+        ));
+    };
+
+    match subcommand.as_str() {
+        "check" => parse_memory_included_command(
+            &args[1..],
+            MemoryAction::Check,
+            MemoryOptionSpec {
+                allow_root: true,
+                allow_strict: true,
+            },
+        ),
+        "find-stale" => parse_memory_included_command(
+            &args[1..],
+            MemoryAction::FindStale,
+            MemoryOptionSpec {
+                allow_root: true,
+                allow_strict: false,
+            },
+        ),
+        "find-orphans" => parse_memory_included_command(
+            &args[1..],
+            MemoryAction::FindOrphans,
+            MemoryOptionSpec {
+                allow_root: false,
+                allow_strict: false,
+            },
+        ),
+        "reindex" => parse_memory_included_command(
+            &args[1..],
+            MemoryAction::Reindex,
+            MemoryOptionSpec {
+                allow_root: false,
+                allow_strict: false,
+            },
+        ),
+        "repair" | "citation-audit" => Ok(CliCommand::Memory(MemoryCommand::Deferred {
+            subcommand: subcommand.clone(),
+        })),
+        value if value.starts_with('-') => Err(format!(
+            "error: expected memory subcommand before option `{value}`\n\n{}",
+            cli_usage_text()
+        )),
+        value => Err(format!(
+            "error: unknown memory subcommand `{value}`; expected one of check, find-stale, find-orphans, reindex, repair, citation-audit\n\n{}",
+            cli_usage_text()
+        )),
+    }
+}
+
+fn parse_memory_included_command(
+    args: &[String],
+    action: MemoryAction,
+    spec: MemoryOptionSpec,
+) -> Result<CliCommand, String> {
+    let mut db_path = None;
+    let mut root_override = None;
+    let mut output = OutputFormat::Table;
+    let mut strict = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--db" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err(format!(
+                        "expected --db <path.cupld|default> for `memory {}` command",
+                        action.as_str()
+                    ));
+                };
+                if db_path.is_some() {
+                    return Err(format!(
+                        "expected exactly one --db <path.cupld|default> for `memory {}` command",
+                        action.as_str()
+                    ));
+                }
+                db_path = Some(parse_db_flag_value(path)?);
+                index += 2;
+            }
+            "--root" if spec.allow_root => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("expected a path after `--root`".to_owned());
+                };
+                if root_override.is_some() {
+                    return Err("duplicate option `--root`".to_owned());
+                }
+                root_override = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--root" => {
+                return Err(format!(
+                    "error: `memory {}` does not accept `--root`\n\n{}",
+                    action.as_str(),
+                    cli_usage_text()
+                ));
+            }
+            "--output" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!(
+                        "expected --output <table|json|ndjson> for `memory {}` command",
+                        action.as_str()
+                    ));
+                };
+                output = parse_output_format(value)?;
+                index += 2;
+            }
+            "--strict" if spec.allow_strict => {
+                if strict {
+                    return Err("duplicate option `--strict`".to_owned());
+                }
+                strict = true;
+                index += 1;
+            }
+            "--strict" => {
+                return Err(format!(
+                    "error: `memory {}` does not accept `--strict`\n\n{}",
+                    action.as_str(),
+                    cli_usage_text()
+                ));
+            }
+            value if value.starts_with('-') => {
+                return Err(format!(
+                    "error: unknown option `{value}`\n\n{}",
+                    cli_usage_text()
+                ));
+            }
+            value => {
+                return Err(format!(
+                    "error: unexpected argument `{value}`\n\n{}",
+                    cli_usage_text()
+                ));
+            }
+        }
+    }
+
+    let Some(db_path) = db_path else {
+        return Err(format!(
+            "expected --db <path.cupld|default> for `memory {}` command",
+            action.as_str()
+        ));
+    };
+
+    Ok(CliCommand::Memory(match action {
+        MemoryAction::Check => MemoryCommand::Check {
+            db_path,
+            root_override,
+            output,
+            strict,
+        },
+        MemoryAction::FindStale => MemoryCommand::FindStale {
+            db_path,
+            root_override,
+            output,
+        },
+        MemoryAction::FindOrphans => MemoryCommand::FindOrphans { db_path, output },
+        MemoryAction::Reindex => MemoryCommand::Reindex { db_path, output },
+    }))
+}
+
+impl MemoryAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::FindStale => "find-stale",
+            Self::FindOrphans => "find-orphans",
+            Self::Reindex => "reindex",
+        }
     }
 }
 
@@ -1066,6 +1289,10 @@ Commands:
   schema                  Print SHOW SCHEMA for --db.
   compact                 Rewrite --db and reset its WAL.
   check                   Validate --db and print recovery metadata.
+  memory check            Validate memory DB health and markdown maintenance status.
+  memory find-stale       List indexed markdown documents that differ from the filesystem.
+  memory find-orphans     List tombstoned markdown documents and directories retained in memory.
+  memory reindex          Rebuild markdown memory state from the configured root.
   sync markdown           Materialize markdown documents into --db and optionally watch for changes.
   source set-root         Persist the default markdown root in --db.
   mcp serve               Run the stdio MCP memory server for --db.
@@ -1279,6 +1506,493 @@ fn run_check(db_path: PathBuf) -> Result<(), String> {
         report.recovered_tail
     );
     Ok(())
+}
+
+#[derive(Debug)]
+struct MemoryReport {
+    command: &'static str,
+    db_path: PathBuf,
+    root: Option<PathBuf>,
+    strict: Option<bool>,
+    summary: Vec<(String, RuntimeValue)>,
+    items: QueryResult,
+}
+
+fn run_memory(command: MemoryCommand) -> Result<(), String> {
+    match command {
+        MemoryCommand::Check {
+            db_path,
+            root_override,
+            output,
+            strict,
+        } => run_memory_check(db_path, root_override, output, strict),
+        MemoryCommand::FindStale {
+            db_path,
+            root_override,
+            output,
+        } => run_memory_find_stale(db_path, root_override, output),
+        MemoryCommand::FindOrphans { db_path, output } => run_memory_find_orphans(db_path, output),
+        MemoryCommand::Reindex { db_path, output } => run_memory_reindex(db_path, output),
+        MemoryCommand::Deferred { subcommand } => Err(format!(
+            "unsupported: `cupld memory {subcommand}` is intentionally out of scope for this round"
+        )),
+    }
+}
+
+fn run_memory_check(
+    db_path: PathBuf,
+    root_override: Option<PathBuf>,
+    output: OutputFormat,
+    strict: bool,
+) -> Result<(), String> {
+    let integrity = Session::check(&db_path)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    let mut session = Session::open(&db_path)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    let root =
+        resolve_markdown_root(root_override.as_deref(), Some(&session)).map_err(|message| {
+            format_command_error(output, &AutomationError::new("memory_root", message))
+        })?;
+    let stale = memory_stale_items(&mut session, &root)
+        .map_err(|error| format_command_error(output, &error))?;
+    let orphans =
+        memory_orphan_items(&mut session).map_err(|error| format_command_error(output, &error))?;
+    let strict_failure =
+        strict && (integrity.recovered_tail || !stale.rows.is_empty() || !orphans.rows.is_empty());
+    let status = if strict_failure { "failed" } else { "ok" };
+    let report = MemoryReport {
+        command: "memory.check",
+        db_path,
+        root: Some(root),
+        strict: Some(strict),
+        summary: vec![
+            ("status".to_owned(), RuntimeValue::String(status.to_owned())),
+            (
+                "last_tx_id".to_owned(),
+                RuntimeValue::Int(integrity.last_tx_id as i64),
+            ),
+            (
+                "wal_records".to_owned(),
+                RuntimeValue::Int(integrity.wal_records as i64),
+            ),
+            (
+                "recovered_tail".to_owned(),
+                RuntimeValue::Bool(integrity.recovered_tail),
+            ),
+            (
+                "stale_items".to_owned(),
+                RuntimeValue::Int(stale.rows.len() as i64),
+            ),
+            (
+                "orphan_items".to_owned(),
+                RuntimeValue::Int(orphans.rows.len() as i64),
+            ),
+        ],
+        items: QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        },
+    };
+    print_memory_report(&report, output);
+    if strict_failure {
+        return Err(format_command_error(
+            output,
+            &AutomationError::new(
+                "memory_check_strict",
+                "strict memory check failed because stale or orphaned items were found",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn run_memory_find_stale(
+    db_path: PathBuf,
+    root_override: Option<PathBuf>,
+    output: OutputFormat,
+) -> Result<(), String> {
+    let mut session = Session::open(&db_path)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    let root =
+        resolve_markdown_root(root_override.as_deref(), Some(&session)).map_err(|message| {
+            format_command_error(output, &AutomationError::new("memory_root", message))
+        })?;
+    let items = memory_stale_items(&mut session, &root)
+        .map_err(|error| format_command_error(output, &error))?;
+    let report = MemoryReport {
+        command: "memory.find-stale",
+        db_path,
+        root: Some(root),
+        strict: None,
+        summary: vec![(
+            "stale_items".to_owned(),
+            RuntimeValue::Int(items.rows.len() as i64),
+        )],
+        items,
+    };
+    print_memory_report(&report, output);
+    Ok(())
+}
+
+fn run_memory_find_orphans(db_path: PathBuf, output: OutputFormat) -> Result<(), String> {
+    let mut session = Session::open(&db_path)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    let items =
+        memory_orphan_items(&mut session).map_err(|error| format_command_error(output, &error))?;
+    let report = MemoryReport {
+        command: "memory.find-orphans",
+        db_path,
+        root: None,
+        strict: None,
+        summary: vec![(
+            "orphan_items".to_owned(),
+            RuntimeValue::Int(items.rows.len() as i64),
+        )],
+        items,
+    };
+    print_memory_report(&report, output);
+    Ok(())
+}
+
+fn run_memory_reindex(db_path: PathBuf, output: OutputFormat) -> Result<(), String> {
+    let mut session = open_initial_session(Some(db_path.clone())).map_err(|message| {
+        format_command_error(output, &AutomationError::new("memory_db", message))
+    })?;
+    let root = resolve_markdown_root(None, Some(&session)).map_err(|message| {
+        format_command_error(output, &AutomationError::new("memory_root", message))
+    })?;
+    let package = WorkspacePackage::discover_current().map_err(|error| {
+        format_command_error(output, &AutomationError::new(error.code(), error.message()))
+    })?;
+    let sync_options = MarkdownSyncOptions {
+        include_fs_graph: package.configured_markdown_include_fs_graph(),
+    };
+    let mut engine = session.engine().clone();
+    let sync_report = sync_markdown_root_with_options(&mut engine, &root, &sync_options)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    engine
+        .commit()
+        .map_err(|error| AutomationError::new(error.code(), error.to_string()))
+        .map_err(|error| format_command_error(output, &error))?;
+    session
+        .replace_engine(engine)
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    session
+        .save()
+        .map_err(AutomationError::from)
+        .map_err(|error| format_command_error(output, &error))?;
+    let report = MemoryReport {
+        command: "memory.reindex",
+        db_path,
+        root: Some(root),
+        strict: None,
+        summary: vec![
+            (
+                "include_fs_graph".to_owned(),
+                RuntimeValue::Bool(sync_options.include_fs_graph),
+            ),
+            (
+                "scanned_documents".to_owned(),
+                RuntimeValue::Int(sync_report.scanned_documents as i64),
+            ),
+            (
+                "upserted_documents".to_owned(),
+                RuntimeValue::Int(sync_report.upserted_documents as i64),
+            ),
+            (
+                "tombstoned_documents".to_owned(),
+                RuntimeValue::Int(sync_report.tombstoned_documents as i64),
+            ),
+            (
+                "link_edges".to_owned(),
+                RuntimeValue::Int(sync_report.link_edges as i64),
+            ),
+            (
+                "upserted_directories".to_owned(),
+                RuntimeValue::Int(sync_report.upserted_directories as i64),
+            ),
+            (
+                "tombstoned_directories".to_owned(),
+                RuntimeValue::Int(sync_report.tombstoned_directories as i64),
+            ),
+            (
+                "structural_edges".to_owned(),
+                RuntimeValue::Int(sync_report.structural_edges as i64),
+            ),
+        ],
+        items: QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        },
+    };
+    print_memory_report(&report, output);
+    Ok(())
+}
+
+fn memory_stale_items(session: &mut Session, root: &Path) -> Result<QueryResult, AutomationError> {
+    let result = session
+        .execute_script(
+            "MATCH (d:MarkdownDocument)
+             RETURN d.`src.path` AS path, d.`src.hash` AS source_hash, d.`src.status` AS status
+             ORDER BY d.`src.path`",
+            &BTreeMap::new(),
+        )
+        .map_err(AutomationError::from)?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        });
+    let mut rows = Vec::new();
+    for row in result.rows {
+        let path = string_column(&result.columns, &row, "path")?;
+        let source_hash = optional_string_column(&result.columns, &row, "source_hash")?;
+        let status = optional_string_column(&result.columns, &row, "status")?
+            .unwrap_or_else(|| "unknown".to_owned());
+        let disk_path = root.join(&path);
+        match fs::read(&disk_path) {
+            Ok(bytes) => {
+                let disk_hash = stable_hash_hex(&bytes);
+                if status == "missing" {
+                    rows.push(vec![
+                        RuntimeValue::String(path),
+                        RuntimeValue::String("present_but_tombstoned".to_owned()),
+                        RuntimeValue::String(status),
+                        RuntimeValue::String("present".to_owned()),
+                    ]);
+                } else if source_hash.as_deref() != Some(disk_hash.as_str()) {
+                    rows.push(vec![
+                        RuntimeValue::String(path),
+                        RuntimeValue::String("hash_mismatch".to_owned()),
+                        RuntimeValue::String(status),
+                        RuntimeValue::String("changed".to_owned()),
+                    ]);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if status == "current" {
+                    rows.push(vec![
+                        RuntimeValue::String(path),
+                        RuntimeValue::String("missing_on_disk".to_owned()),
+                        RuntimeValue::String(status),
+                        RuntimeValue::String("missing".to_owned()),
+                    ]);
+                }
+            }
+            Err(error) => {
+                return Err(AutomationError::new(
+                    "memory_file_read",
+                    format!("failed to read {}: {error}", disk_path.display()),
+                ));
+            }
+        }
+    }
+    Ok(QueryResult {
+        columns: vec![
+            "path".to_owned(),
+            "reason".to_owned(),
+            "db_status".to_owned(),
+            "filesystem_status".to_owned(),
+        ],
+        rows,
+    })
+}
+
+fn memory_orphan_items(session: &mut Session) -> Result<QueryResult, AutomationError> {
+    let mut rows = Vec::new();
+    collect_missing_markdown_entities(session, "MarkdownDocument", "document", &mut rows)?;
+    collect_missing_markdown_entities(session, "MarkdownDirectory", "directory", &mut rows)?;
+    rows.sort_by(|left, right| {
+        let left_key = (value_string(&left[0]), value_string(&left[1]));
+        let right_key = (value_string(&right[0]), value_string(&right[1]));
+        left_key.cmp(&right_key)
+    });
+    Ok(QueryResult {
+        columns: vec!["kind".to_owned(), "path".to_owned(), "status".to_owned()],
+        rows,
+    })
+}
+
+fn collect_missing_markdown_entities(
+    session: &mut Session,
+    label: &str,
+    kind: &str,
+    rows: &mut Vec<Vec<RuntimeValue>>,
+) -> Result<(), AutomationError> {
+    let query = format!(
+        "MATCH (n:{label})
+         WHERE n.`src.status` = 'missing'
+         RETURN n.`src.path` AS path, n.`src.status` AS status
+         ORDER BY n.`src.path`"
+    );
+    let result = session
+        .execute_script(&query, &BTreeMap::new())
+        .map_err(AutomationError::from)?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        });
+    for row in result.rows {
+        rows.push(vec![
+            RuntimeValue::String(kind.to_owned()),
+            RuntimeValue::String(string_column(&result.columns, &row, "path")?),
+            RuntimeValue::String(
+                optional_string_column(&result.columns, &row, "status")?
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            ),
+        ]);
+    }
+    Ok(())
+}
+
+fn print_memory_report(report: &MemoryReport, output: OutputFormat) {
+    match output {
+        OutputFormat::Table => print_memory_table(report),
+        OutputFormat::Json => println!("{}", memory_report_as_json(report)),
+        OutputFormat::Ndjson => {
+            for line in memory_report_as_ndjson(report) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+fn print_memory_table(report: &MemoryReport) {
+    println!("command {}", report.command);
+    println!("db {}", report.db_path.display());
+    if let Some(root) = &report.root {
+        println!("root {}", root.display());
+    }
+    if let Some(strict) = report.strict {
+        println!("strict {strict}");
+    }
+    for (key, value) in &report.summary {
+        println!("{key} {}", value_string(value));
+    }
+    if report.items.rows.is_empty() {
+        println!("items 0");
+    } else {
+        print_results(std::slice::from_ref(&report.items), OutputFormat::Table);
+    }
+}
+
+fn memory_report_as_json(report: &MemoryReport) -> String {
+    json::stringify(&JsonValue::object(memory_report_fields(report, false)))
+}
+
+fn memory_report_as_ndjson(report: &MemoryReport) -> Vec<String> {
+    let mut meta = memory_report_fields(report, true);
+    meta.push((
+        "item_count".to_owned(),
+        JsonValue::from(report.items.rows.len()),
+    ));
+    let mut lines = vec![json::stringify(&JsonValue::Object(meta))];
+    for (index, row) in report.items.rows.iter().enumerate() {
+        lines.push(json::stringify(&JsonValue::object([
+            ("kind", JsonValue::from("memory_item")),
+            ("command", JsonValue::from(report.command)),
+            ("item_index", JsonValue::from(index)),
+            ("item", json::row_to_json_object(&report.items.columns, row)),
+        ])));
+    }
+    lines
+}
+
+fn memory_report_fields(report: &MemoryReport, ndjson_meta: bool) -> Vec<(String, JsonValue)> {
+    let mut fields = Vec::new();
+    if ndjson_meta {
+        fields.push(("kind".to_owned(), JsonValue::from("memory_meta")));
+    }
+    fields.push(("ok".to_owned(), JsonValue::Bool(true)));
+    fields.push(("command".to_owned(), JsonValue::from(report.command)));
+    fields.push((
+        "db_path".to_owned(),
+        JsonValue::from(report.db_path.display().to_string()),
+    ));
+    fields.push((
+        "root".to_owned(),
+        report
+            .root
+            .as_ref()
+            .map(|root| JsonValue::from(root.display().to_string()))
+            .unwrap_or(JsonValue::Null),
+    ));
+    if let Some(strict) = report.strict {
+        fields.push(("strict".to_owned(), JsonValue::Bool(strict)));
+    }
+    fields.push(("summary".to_owned(), memory_summary_json(&report.summary)));
+    if !ndjson_meta {
+        fields.push((
+            "items".to_owned(),
+            json::query_result_rows_to_json(&report.items),
+        ));
+    }
+    fields
+}
+
+fn memory_summary_json(summary: &[(String, RuntimeValue)]) -> JsonValue {
+    JsonValue::Object(
+        summary
+            .iter()
+            .map(|(key, value)| (key.clone(), json::runtime_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn string_column(
+    columns: &[String],
+    row: &[RuntimeValue],
+    column: &str,
+) -> Result<String, AutomationError> {
+    optional_string_column(columns, row, column)?.ok_or_else(|| {
+        AutomationError::new(
+            "memory_query_contract",
+            format!("missing expected `{column}` string in memory query result"),
+        )
+    })
+}
+
+fn optional_string_column(
+    columns: &[String],
+    row: &[RuntimeValue],
+    column: &str,
+) -> Result<Option<String>, AutomationError> {
+    let Some(index) = columns.iter().position(|name| name == column) else {
+        return Err(AutomationError::new(
+            "memory_query_contract",
+            format!("missing expected `{column}` column in memory query result"),
+        ));
+    };
+    match row.get(index) {
+        Some(RuntimeValue::String(value)) => Ok(Some(value.clone())),
+        Some(RuntimeValue::Null) => Ok(None),
+        Some(other) => Err(AutomationError::new(
+            "memory_query_contract",
+            format!("expected `{column}` to be a string, found {other:?}"),
+        )),
+        None => Err(AutomationError::new(
+            "memory_query_contract",
+            format!("missing value for `{column}` in memory query result row"),
+        )),
+    }
+}
+
+fn stable_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn run_sync_markdown(
@@ -1756,6 +2470,7 @@ fn is_registered_command(input: &str) -> bool {
             | "schema"
             | "compact"
             | "check"
+            | "memory"
             | "sync"
             | "source"
             | "mcp"
@@ -1878,9 +2593,9 @@ fn value_string(value: &RuntimeValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, InputEvent, OutputFormat, ReplInput, cap_results, cli_usage_text,
-        format_error_json, parse_cli_command, parse_params_json, result_as_json, result_as_ndjson,
-        should_offer_skill_install_prompt, table_value, version_text,
+        CliCommand, InputEvent, MemoryCommand, OutputFormat, ReplInput, cap_results,
+        cli_usage_text, format_error_json, parse_cli_command, parse_params_json, result_as_json,
+        result_as_ndjson, should_offer_skill_install_prompt, table_value, version_text,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
     use cupld::{QueryResult, RuntimeValue, Value, json};
@@ -2087,6 +2802,122 @@ mod tests {
                 top_k: 20,
             })
         );
+    }
+
+    #[test]
+    fn parses_memory_check_options() {
+        let args = vec![
+            "memory".to_owned(),
+            "check".to_owned(),
+            "--db".to_owned(),
+            "default".to_owned(),
+            "--root".to_owned(),
+            "notes".to_owned(),
+            "--output".to_owned(),
+            "json".to_owned(),
+            "--strict".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::Memory(MemoryCommand::Check {
+                db_path: default_alias_db_path(),
+                root_override: Some(PathBuf::from("notes")),
+                output: OutputFormat::Json,
+                strict: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_memory_maintenance_commands() {
+        assert_eq!(
+            parse_cli_command(&[
+                "memory".to_owned(),
+                "find-stale".to_owned(),
+                "--db".to_owned(),
+                "db.cupld".to_owned(),
+                "--root".to_owned(),
+                "notes".to_owned(),
+                "--output".to_owned(),
+                "ndjson".to_owned(),
+            ]),
+            Ok(CliCommand::Memory(MemoryCommand::FindStale {
+                db_path: PathBuf::from("db.cupld"),
+                root_override: Some(PathBuf::from("notes")),
+                output: OutputFormat::Ndjson,
+            }))
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "memory".to_owned(),
+                "find-orphans".to_owned(),
+                "--db".to_owned(),
+                "db.cupld".to_owned(),
+                "--output".to_owned(),
+                "json".to_owned(),
+            ]),
+            Ok(CliCommand::Memory(MemoryCommand::FindOrphans {
+                db_path: PathBuf::from("db.cupld"),
+                output: OutputFormat::Json,
+            }))
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "memory".to_owned(),
+                "reindex".to_owned(),
+                "--db".to_owned(),
+                "db.cupld".to_owned(),
+            ]),
+            Ok(CliCommand::Memory(MemoryCommand::Reindex {
+                db_path: PathBuf::from("db.cupld"),
+                output: OutputFormat::Table,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_deferred_memory_commands() {
+        assert_eq!(
+            parse_cli_command(&["memory".to_owned(), "repair".to_owned()]),
+            Ok(CliCommand::Memory(MemoryCommand::Deferred {
+                subcommand: "repair".to_owned(),
+            }))
+        );
+        assert_eq!(
+            parse_cli_command(&["memory".to_owned(), "citation-audit".to_owned()]),
+            Ok(CliCommand::Memory(MemoryCommand::Deferred {
+                subcommand: "citation-audit".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn errors_for_unknown_memory_subcommands_and_unsupported_options() {
+        assert!(matches!(
+            parse_cli_command(&["memory".to_owned(), "wat".to_owned()]),
+            Err(error) if error.contains("unknown memory subcommand `wat`")
+        ));
+        assert!(matches!(
+            parse_cli_command(&[
+                "memory".to_owned(),
+                "find-orphans".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+                "--root".to_owned(),
+                "notes".to_owned(),
+            ]),
+            Err(error) if error.contains("does not accept `--root`")
+        ));
+        assert!(matches!(
+            parse_cli_command(&[
+                "memory".to_owned(),
+                "find-stale".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+                "--strict".to_owned(),
+            ]),
+            Err(error) if error.contains("does not accept `--strict`")
+        ));
     }
 
     #[test]
