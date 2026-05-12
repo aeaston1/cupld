@@ -9,15 +9,14 @@ use std::thread;
 use std::time::Duration;
 
 use cupld::{
-    MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, QueryResult, RuntimeValue,
-    Session, Value,
+    MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, MemoryMaintenanceCheck,
+    MemoryMaintenanceReport, MemoryMaintenanceStatus, QueryResult, RuntimeValue, Session, Value,
     automation::{
         AutomationError, AutomationPolicy, build_context_response, context_as_json,
         context_as_ndjson, format_error_json as machine_error_json,
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
     configured_markdown_root, json,
-    json::JsonValue,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
@@ -1508,14 +1507,45 @@ fn run_check(db_path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct MemoryReport {
-    command: &'static str,
-    db_path: PathBuf,
-    root: Option<PathBuf>,
-    strict: Option<bool>,
-    summary: Vec<(String, RuntimeValue)>,
-    items: QueryResult,
+fn resolved_report_db_path(db_path: &Path, output: OutputFormat) -> Result<PathBuf, String> {
+    if db_path.is_absolute() {
+        return Ok(db_path.to_path_buf());
+    }
+    env::current_dir()
+        .map(|cwd| cwd.join(db_path))
+        .map_err(|error| {
+            format_command_error(
+                output,
+                &AutomationError::new(
+                    "memory_db_path",
+                    format!("failed to resolve database path: {error}"),
+                ),
+            )
+        })
+}
+
+fn maintenance_status_for_problem(problem: bool, strict: bool) -> MemoryMaintenanceStatus {
+    match (problem, strict) {
+        (true, true) => MemoryMaintenanceStatus::Fail,
+        (true, false) => MemoryMaintenanceStatus::Warn,
+        (false, _) => MemoryMaintenanceStatus::Pass,
+    }
+}
+
+fn maintenance_report_status(checks: &[MemoryMaintenanceCheck]) -> MemoryMaintenanceStatus {
+    if checks
+        .iter()
+        .any(|check| check.status == MemoryMaintenanceStatus::Fail)
+    {
+        MemoryMaintenanceStatus::Fail
+    } else if checks
+        .iter()
+        .any(|check| check.status == MemoryMaintenanceStatus::Warn)
+    {
+        MemoryMaintenanceStatus::Warn
+    } else {
+        MemoryMaintenanceStatus::Pass
+    }
 }
 
 fn run_memory(command: MemoryCommand) -> Result<(), String> {
@@ -1545,6 +1575,7 @@ fn run_memory_check(
     output: OutputFormat,
     strict: bool,
 ) -> Result<(), String> {
+    let report_db_path = resolved_report_db_path(&db_path, output)?;
     let integrity = Session::check(&db_path)
         .map_err(AutomationError::from)
         .map_err(|error| format_command_error(output, &error))?;
@@ -1561,35 +1592,53 @@ fn run_memory_check(
         memory_orphan_items(&mut session).map_err(|error| format_command_error(output, &error))?;
     let strict_failure =
         strict && (integrity.recovered_tail || !stale.rows.is_empty() || !orphans.rows.is_empty());
-    let status = if strict_failure { "failed" } else { "ok" };
-    let report = MemoryReport {
+    let aggregate_status = if strict_failure {
+        MemoryMaintenanceStatus::Fail
+    } else if integrity.recovered_tail || !stale.rows.is_empty() || !orphans.rows.is_empty() {
+        MemoryMaintenanceStatus::Warn
+    } else {
+        MemoryMaintenanceStatus::Pass
+    };
+    let checks = vec![
+        MemoryMaintenanceCheck::new(
+            "status",
+            aggregate_status,
+            RuntimeValue::String(aggregate_status.as_str().to_owned()),
+        ),
+        MemoryMaintenanceCheck::new(
+            "last_tx_id",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(integrity.last_tx_id as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "wal_records",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(integrity.wal_records as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "recovered_tail",
+            maintenance_status_for_problem(integrity.recovered_tail, strict),
+            RuntimeValue::Bool(integrity.recovered_tail),
+        ),
+        MemoryMaintenanceCheck::new(
+            "stale_items",
+            maintenance_status_for_problem(!stale.rows.is_empty(), strict),
+            RuntimeValue::Int(stale.rows.len() as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "orphan_items",
+            maintenance_status_for_problem(!orphans.rows.is_empty(), strict),
+            RuntimeValue::Int(orphans.rows.len() as i64),
+        ),
+    ];
+    let status = maintenance_report_status(&checks);
+    let report = MemoryMaintenanceReport {
         command: "memory.check",
-        db_path,
+        db_path: report_db_path,
         root: Some(root),
         strict: Some(strict),
-        summary: vec![
-            ("status".to_owned(), RuntimeValue::String(status.to_owned())),
-            (
-                "last_tx_id".to_owned(),
-                RuntimeValue::Int(integrity.last_tx_id as i64),
-            ),
-            (
-                "wal_records".to_owned(),
-                RuntimeValue::Int(integrity.wal_records as i64),
-            ),
-            (
-                "recovered_tail".to_owned(),
-                RuntimeValue::Bool(integrity.recovered_tail),
-            ),
-            (
-                "stale_items".to_owned(),
-                RuntimeValue::Int(stale.rows.len() as i64),
-            ),
-            (
-                "orphan_items".to_owned(),
-                RuntimeValue::Int(orphans.rows.len() as i64),
-            ),
-        ],
+        status,
+        checks,
         items: QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -1613,6 +1662,7 @@ fn run_memory_find_stale(
     root_override: Option<PathBuf>,
     output: OutputFormat,
 ) -> Result<(), String> {
+    let report_db_path = resolved_report_db_path(&db_path, output)?;
     let mut session = Session::open(&db_path)
         .map_err(AutomationError::from)
         .map_err(|error| format_command_error(output, &error))?;
@@ -1622,15 +1672,18 @@ fn run_memory_find_stale(
         })?;
     let items = memory_stale_items(&mut session, &root)
         .map_err(|error| format_command_error(output, &error))?;
-    let report = MemoryReport {
+    let checks = vec![MemoryMaintenanceCheck::new(
+        "stale_items",
+        maintenance_status_for_problem(!items.rows.is_empty(), false),
+        RuntimeValue::Int(items.rows.len() as i64),
+    )];
+    let report = MemoryMaintenanceReport {
         command: "memory.find-stale",
-        db_path,
+        db_path: report_db_path,
         root: Some(root),
         strict: None,
-        summary: vec![(
-            "stale_items".to_owned(),
-            RuntimeValue::Int(items.rows.len() as i64),
-        )],
+        status: maintenance_report_status(&checks),
+        checks,
         items,
     };
     print_memory_report(&report, output);
@@ -1638,20 +1691,24 @@ fn run_memory_find_stale(
 }
 
 fn run_memory_find_orphans(db_path: PathBuf, output: OutputFormat) -> Result<(), String> {
+    let report_db_path = resolved_report_db_path(&db_path, output)?;
     let mut session = Session::open(&db_path)
         .map_err(AutomationError::from)
         .map_err(|error| format_command_error(output, &error))?;
     let items =
         memory_orphan_items(&mut session).map_err(|error| format_command_error(output, &error))?;
-    let report = MemoryReport {
+    let checks = vec![MemoryMaintenanceCheck::new(
+        "orphan_items",
+        maintenance_status_for_problem(!items.rows.is_empty(), false),
+        RuntimeValue::Int(items.rows.len() as i64),
+    )];
+    let report = MemoryMaintenanceReport {
         command: "memory.find-orphans",
-        db_path,
+        db_path: report_db_path,
         root: None,
         strict: None,
-        summary: vec![(
-            "orphan_items".to_owned(),
-            RuntimeValue::Int(items.rows.len() as i64),
-        )],
+        status: maintenance_report_status(&checks),
+        checks,
         items,
     };
     print_memory_report(&report, output);
@@ -1659,6 +1716,7 @@ fn run_memory_find_orphans(db_path: PathBuf, output: OutputFormat) -> Result<(),
 }
 
 fn run_memory_reindex(db_path: PathBuf, output: OutputFormat) -> Result<(), String> {
+    let report_db_path = resolved_report_db_path(&db_path, output)?;
     let mut session = open_initial_session(Some(db_path.clone())).map_err(|message| {
         format_command_error(output, &AutomationError::new("memory_db", message))
     })?;
@@ -1687,45 +1745,55 @@ fn run_memory_reindex(db_path: PathBuf, output: OutputFormat) -> Result<(), Stri
         .save()
         .map_err(AutomationError::from)
         .map_err(|error| format_command_error(output, &error))?;
-    let report = MemoryReport {
+    let checks = vec![
+        MemoryMaintenanceCheck::new(
+            "include_fs_graph",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Bool(sync_options.include_fs_graph),
+        ),
+        MemoryMaintenanceCheck::new(
+            "scanned_documents",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(sync_report.scanned_documents as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "upserted_documents",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(sync_report.upserted_documents as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "tombstoned_documents",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(sync_report.tombstoned_documents as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "link_edges",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(sync_report.link_edges as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "upserted_directories",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(sync_report.upserted_directories as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "tombstoned_directories",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(sync_report.tombstoned_directories as i64),
+        ),
+        MemoryMaintenanceCheck::new(
+            "structural_edges",
+            MemoryMaintenanceStatus::Pass,
+            RuntimeValue::Int(sync_report.structural_edges as i64),
+        ),
+    ];
+    let report = MemoryMaintenanceReport {
         command: "memory.reindex",
-        db_path,
+        db_path: report_db_path,
         root: Some(root),
         strict: None,
-        summary: vec![
-            (
-                "include_fs_graph".to_owned(),
-                RuntimeValue::Bool(sync_options.include_fs_graph),
-            ),
-            (
-                "scanned_documents".to_owned(),
-                RuntimeValue::Int(sync_report.scanned_documents as i64),
-            ),
-            (
-                "upserted_documents".to_owned(),
-                RuntimeValue::Int(sync_report.upserted_documents as i64),
-            ),
-            (
-                "tombstoned_documents".to_owned(),
-                RuntimeValue::Int(sync_report.tombstoned_documents as i64),
-            ),
-            (
-                "link_edges".to_owned(),
-                RuntimeValue::Int(sync_report.link_edges as i64),
-            ),
-            (
-                "upserted_directories".to_owned(),
-                RuntimeValue::Int(sync_report.upserted_directories as i64),
-            ),
-            (
-                "tombstoned_directories".to_owned(),
-                RuntimeValue::Int(sync_report.tombstoned_directories as i64),
-            ),
-            (
-                "structural_edges".to_owned(),
-                RuntimeValue::Int(sync_report.structural_edges as i64),
-            ),
-        ],
+        status: maintenance_report_status(&checks),
+        checks,
         items: QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -1854,98 +1922,16 @@ fn collect_missing_markdown_entities(
     Ok(())
 }
 
-fn print_memory_report(report: &MemoryReport, output: OutputFormat) {
+fn print_memory_report(report: &MemoryMaintenanceReport, output: OutputFormat) {
     match output {
-        OutputFormat::Table => print_memory_table(report),
-        OutputFormat::Json => println!("{}", memory_report_as_json(report)),
+        OutputFormat::Table => print!("{}", report.as_table()),
+        OutputFormat::Json => println!("{}", report.as_json()),
         OutputFormat::Ndjson => {
-            for line in memory_report_as_ndjson(report) {
+            for line in report.as_ndjson() {
                 println!("{line}");
             }
         }
     }
-}
-
-fn print_memory_table(report: &MemoryReport) {
-    println!("command {}", report.command);
-    println!("db {}", report.db_path.display());
-    if let Some(root) = &report.root {
-        println!("root {}", root.display());
-    }
-    if let Some(strict) = report.strict {
-        println!("strict {strict}");
-    }
-    for (key, value) in &report.summary {
-        println!("{key} {}", value_string(value));
-    }
-    if report.items.rows.is_empty() {
-        println!("items 0");
-    } else {
-        print_results(std::slice::from_ref(&report.items), OutputFormat::Table);
-    }
-}
-
-fn memory_report_as_json(report: &MemoryReport) -> String {
-    json::stringify(&JsonValue::object(memory_report_fields(report, false)))
-}
-
-fn memory_report_as_ndjson(report: &MemoryReport) -> Vec<String> {
-    let mut meta = memory_report_fields(report, true);
-    meta.push((
-        "item_count".to_owned(),
-        JsonValue::from(report.items.rows.len()),
-    ));
-    let mut lines = vec![json::stringify(&JsonValue::Object(meta))];
-    for (index, row) in report.items.rows.iter().enumerate() {
-        lines.push(json::stringify(&JsonValue::object([
-            ("kind", JsonValue::from("memory_item")),
-            ("command", JsonValue::from(report.command)),
-            ("item_index", JsonValue::from(index)),
-            ("item", json::row_to_json_object(&report.items.columns, row)),
-        ])));
-    }
-    lines
-}
-
-fn memory_report_fields(report: &MemoryReport, ndjson_meta: bool) -> Vec<(String, JsonValue)> {
-    let mut fields = Vec::new();
-    if ndjson_meta {
-        fields.push(("kind".to_owned(), JsonValue::from("memory_meta")));
-    }
-    fields.push(("ok".to_owned(), JsonValue::Bool(true)));
-    fields.push(("command".to_owned(), JsonValue::from(report.command)));
-    fields.push((
-        "db_path".to_owned(),
-        JsonValue::from(report.db_path.display().to_string()),
-    ));
-    fields.push((
-        "root".to_owned(),
-        report
-            .root
-            .as_ref()
-            .map(|root| JsonValue::from(root.display().to_string()))
-            .unwrap_or(JsonValue::Null),
-    ));
-    if let Some(strict) = report.strict {
-        fields.push(("strict".to_owned(), JsonValue::Bool(strict)));
-    }
-    fields.push(("summary".to_owned(), memory_summary_json(&report.summary)));
-    if !ndjson_meta {
-        fields.push((
-            "items".to_owned(),
-            json::query_result_rows_to_json(&report.items),
-        ));
-    }
-    fields
-}
-
-fn memory_summary_json(summary: &[(String, RuntimeValue)]) -> JsonValue {
-    JsonValue::Object(
-        summary
-            .iter()
-            .map(|(key, value)| (key.clone(), json::runtime_value_to_json(value)))
-            .collect(),
-    )
 }
 
 fn string_column(
