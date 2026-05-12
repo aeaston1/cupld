@@ -1052,8 +1052,8 @@ Commands:
   context                 Build compact context rows (top-k nodes) for agent prompts.
   --with-md               Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
+  --include-fs-graph      Persist markdown directory nodes and filesystem structural edges during `sync markdown`.
   --watch                 Keep polling markdown for changes after the initial sync.
-  --include-fs-graph      Include markdown filesystem directory nodes and containment edges.
   --poll-ms               Poll interval for `sync markdown --watch`.
   --debounce-ms           Stable-change debounce window for `sync markdown --watch`.
   --batch-ms              Max coalescing window before a forced watched sync.
@@ -1329,7 +1329,8 @@ fn run_sync_markdown(
         sync_markdown_root_with_options(&mut engine, &root, &sync_options)
             .map_err(|error| error.to_string())?
     } else {
-        sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?
+        sync_markdown_root_with_options(&mut engine, &root, &sync_options)
+            .map_err(|error| error.to_string())?
     };
     engine.commit().map_err(|error| error.to_string())?;
     session

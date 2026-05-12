@@ -329,7 +329,10 @@ Markdown behavior:
 
 - `cupld query --with-md` overlays markdown into a temporary query session and does not persist imported notes.
 - `cupld sync markdown` persists markdown documents and `:MD_LINKS_TO` edges from body links plus supported frontmatter relationship keys into the database.
-- `cupld sync markdown --include-fs-graph` also persists `MarkdownDirectory` nodes and `:FS_CONTAINS` edges for the current markdown file tree.
+- `cupld sync markdown --db default --include-fs-graph` opts in to persisted filesystem structure: `:MarkdownDirectory` nodes, `:MD_IN_DIRECTORY` document-to-directory edges, and `:MD_PARENT_DIRECTORY` child-to-parent directory edges.
+- `:MD_LINKS_TO` remains authored-only. Filesystem structure uses the filesystem edge types instead of link edges.
+- Filesystem sync does not create `:MD_SIBLING_OF` or other pairwise sibling edges.
+- Filesystem edges persist `md.edge_weight` for downstream context and retrieval work; core ranking does not consume that property in this issue.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
 - `--poll-ms` controls the poll interval.
 - `--debounce-ms` controls the stable-change debounce window.
@@ -355,6 +358,34 @@ cupld sync markdown --db default --include-fs-graph
 
 ```bash
 cupld source set-root --db default /absolute/path/to/notes
+```
+
+Document to directory traversal after an opt-in filesystem sync:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+   RETURN d.\`src.path\`, dir.\`src.path\`
+   ORDER BY d.\`src.path\`"
+```
+
+Child directory to parent directory traversal:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (child:MarkdownDirectory)-[:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+   RETURN child.\`src.path\`, parent.\`src.path\`
+   ORDER BY child.\`src.path\`"
+```
+
+Same-folder document discovery via two-hop traversal:
+
+```bash
+cupld query --db default --with-md \
+  "MATCH (source:MarkdownDocument { \`src.path\`: 'projects/cupld/plan.md' })-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)<-[:MD_IN_DIRECTORY]-(peer:MarkdownDocument)
+   WHERE peer.\`src.path\` != source.\`src.path\`
+   RETURN peer.\`src.path\`, peer.\`md.title\`
+   ORDER BY peer.\`src.path\`"
 ```
 
 Markdown notes:

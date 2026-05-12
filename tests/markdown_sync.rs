@@ -63,44 +63,366 @@ Body\n",
 }
 
 #[test]
-fn filesystem_graph_sync_is_opt_in() {
-    let db = TestDb::new("markdown_fs_graph_opt_in");
-    let root = temp_dir("markdown_fs_graph_opt_in");
-    fs::create_dir_all(root.join("notes")).unwrap();
-    fs::write(root.join("notes").join("one.md"), "# One").unwrap();
+fn default_sync_does_not_create_filesystem_graph_data() {
+    let db = TestDb::new("markdown_fs_default_off");
+    let root = temp_dir("markdown_fs_default_off");
+    fs::create_dir_all(root.join("project")).unwrap();
+    fs::write(root.join("note.md"), "# Root Note").unwrap();
+    fs::write(root.join("project").join("plan.md"), "# Plan").unwrap();
 
     sync_root_into_db(db.path(), &root);
 
-    let mut default_sync = db.open();
-    let directories = run(
-        &mut default_sync,
-        "MATCH (d:MarkdownDirectory) RETURN count(d)",
-    );
+    let mut reopened = db.open();
+    let directories = run(&mut reopened, "MATCH (d:MarkdownDirectory) RETURN count(d)");
     assert_eq!(directories.rows, vec![vec![RuntimeValue::Int(0)]]);
-    drop(default_sync);
+    assert_edge_count(&mut reopened, "MD_IN_DIRECTORY", 0);
+    assert_edge_count(&mut reopened, "MD_PARENT_DIRECTORY", 0);
+    assert_no_sibling_edges(&mut reopened);
 
-    sync_root_into_db_with_options(
-        db.path(),
-        &root,
-        MarkdownSyncOptions {
-            include_fs_graph: true,
-        },
-    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_syncs_flat_root_level_note() {
+    let db = TestDb::new("markdown_fs_flat");
+    let root = temp_dir("markdown_fs_flat");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Root Note").unwrap();
+
+    sync_root_into_db_with_fs_graph(db.path(), &root);
 
     let mut reopened = db.open();
     let result = run(
         &mut reopened,
-        "MATCH (doc:MarkdownDocument {`src.path`: 'notes/one.md'})-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory {`src.path`: 'notes'})
-         RETURN dir.name, doc.`src.path`, e.`md.edge_source`",
+        "MATCH (d:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN d.`src.path`, dir.`src.path`, e.`md.edge_weight`
+         ORDER BY d.`src.path`",
     );
     assert_eq!(
         result.rows,
         vec![vec![
-            RuntimeValue::String("notes".to_owned()),
-            RuntimeValue::String("notes/one.md".to_owned()),
-            RuntimeValue::String("filesystem".to_owned()),
+            RuntimeValue::String("note.md".to_owned()),
+            RuntimeValue::String(".".to_owned()),
+            RuntimeValue::Float(0.25),
         ]]
     );
+    assert_edge_count(&mut reopened, "MD_PARENT_DIRECTORY", 0);
+    assert_no_sibling_edges(&mut reopened);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_syncs_nested_project_directories() {
+    let db = TestDb::new("markdown_fs_nested");
+    let root = temp_dir("markdown_fs_nested");
+    fs::create_dir_all(root.join("projects/alpha")).unwrap();
+    fs::create_dir_all(root.join("projects/beta")).unwrap();
+    fs::write(root.join("projects/alpha/note.md"), "# Alpha").unwrap();
+    fs::write(root.join("projects/beta/plan.md"), "# Beta").unwrap();
+
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    let mut reopened = db.open();
+    let directories = run(
+        &mut reopened,
+        "MATCH (dir:MarkdownDirectory)
+         RETURN dir.`src.path`, dir.`src.status`
+         ORDER BY dir.`src.path`",
+    );
+    assert_eq!(
+        directories.rows,
+        vec![
+            vec![
+                RuntimeValue::String(".".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("projects".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("projects/alpha".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("projects/beta".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+        ]
+    );
+
+    let parents = run(
+        &mut reopened,
+        "MATCH (child:MarkdownDirectory)-[:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+         RETURN child.`src.path`, parent.`src.path`
+         ORDER BY child.`src.path`",
+    );
+    assert_eq!(
+        parents.rows,
+        vec![
+            vec![
+                RuntimeValue::String("projects".to_owned()),
+                RuntimeValue::String(".".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("projects/alpha".to_owned()),
+                RuntimeValue::String("projects".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("projects/beta".to_owned()),
+                RuntimeValue::String("projects".to_owned()),
+            ],
+        ]
+    );
+    assert_no_sibling_edges(&mut reopened);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_sync_is_idempotent() {
+    let db = TestDb::new("markdown_fs_idempotent");
+    let root = temp_dir("markdown_fs_idempotent");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join("notes/a.md"), "# A").unwrap();
+    fs::write(root.join("notes/b.md"), "# B").unwrap();
+
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    let mut reopened = db.open();
+    let directories = run(
+        &mut reopened,
+        "MATCH (dir:MarkdownDirectory) RETURN count(dir)",
+    );
+    assert_eq!(directories.rows, vec![vec![RuntimeValue::Int(2)]]);
+    assert_edge_count(&mut reopened, "MD_IN_DIRECTORY", 2);
+    assert_edge_count(&mut reopened, "MD_PARENT_DIRECTORY", 1);
+    assert_no_sibling_edges(&mut reopened);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_tracks_file_moves() {
+    let db = TestDb::new("markdown_fs_move");
+    let root = temp_dir("markdown_fs_move");
+    fs::create_dir_all(root.join("project")).unwrap();
+    fs::write(root.join("project/old.md"), "# Old").unwrap();
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    fs::create_dir_all(root.join("project/archive")).unwrap();
+    fs::rename(
+        root.join("project/old.md"),
+        root.join("project/archive/new.md"),
+    )
+    .unwrap();
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    let mut reopened = db.open();
+    let documents = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument)
+         RETURN d.`src.path`, d.`src.status`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        documents.rows,
+        vec![
+            vec![
+                RuntimeValue::String("project/archive/new.md".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("project/old.md".to_owned()),
+                RuntimeValue::String("missing".to_owned()),
+            ],
+        ]
+    );
+
+    let current_location = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         WHERE d.`src.status` = 'current'
+         RETURN d.`src.path`, dir.`src.path`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        current_location.rows,
+        vec![vec![
+            RuntimeValue::String("project/archive/new.md".to_owned()),
+            RuntimeValue::String("project/archive".to_owned()),
+        ]]
+    );
+    let old_edges = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'project/old.md'})-[e:MD_IN_DIRECTORY]->(:MarkdownDirectory)
+         RETURN count(e)",
+    );
+    assert_eq!(old_edges.rows, vec![vec![RuntimeValue::Int(0)]]);
+    assert_no_sibling_edges(&mut reopened);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_tombstones_deleted_folders() {
+    let db = TestDb::new("markdown_fs_deleted_folder");
+    let root = temp_dir("markdown_fs_deleted_folder");
+    fs::create_dir_all(root.join("project/alpha")).unwrap();
+    fs::write(root.join("project/alpha/note.md"), "# Alpha").unwrap();
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    fs::remove_dir_all(root.join("project")).unwrap();
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    let mut reopened = db.open();
+    let directories = run(
+        &mut reopened,
+        "MATCH (dir:MarkdownDirectory)
+         RETURN dir.`src.path`, dir.`src.status`
+         ORDER BY dir.`src.path`",
+    );
+    assert_eq!(
+        directories.rows,
+        vec![
+            vec![
+                RuntimeValue::String(".".to_owned()),
+                RuntimeValue::String("missing".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("project".to_owned()),
+                RuntimeValue::String("missing".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("project/alpha".to_owned()),
+                RuntimeValue::String("missing".to_owned()),
+            ],
+        ]
+    );
+    assert_edge_count(&mut reopened, "MD_IN_DIRECTORY", 0);
+    assert_edge_count(&mut reopened, "MD_PARENT_DIRECTORY", 0);
+    assert_no_sibling_edges(&mut reopened);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_large_folder_has_no_sibling_edge_explosion() {
+    let db = TestDb::new("markdown_fs_large_folder");
+    let root = temp_dir("markdown_fs_large_folder");
+    fs::create_dir_all(root.join("bulk")).unwrap();
+    for index in 0..40 {
+        fs::write(
+            root.join("bulk").join(format!("note-{index:02}.md")),
+            format!("# Note {index}"),
+        )
+        .unwrap();
+    }
+
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    let mut reopened = db.open();
+    assert_edge_count(&mut reopened, "MD_IN_DIRECTORY", 40);
+    assert_edge_count(&mut reopened, "MD_PARENT_DIRECTORY", 1);
+    assert_no_sibling_edges(&mut reopened);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn filesystem_graph_keeps_authored_links_separate_from_structure() {
+    let db = TestDb::new("markdown_fs_links_separate");
+    let root = temp_dir("markdown_fs_links_separate");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("source.md"), "[[target]]").unwrap();
+    fs::write(root.join("target.md"), "# Target").unwrap();
+
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    let mut reopened = db.open();
+    let authored = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        authored.rows,
+        vec![vec![RuntimeValue::String("target.md".to_owned())]]
+    );
+    let structural = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN dir.`src.path`",
+    );
+    assert_eq!(
+        structural.rows,
+        vec![vec![RuntimeValue::String(".".to_owned())]]
+    );
+    let bad_authored_target = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_LINKS_TO]->(:MarkdownDirectory)
+         RETURN count(e)",
+    );
+    assert_eq!(bad_authored_target.rows, vec![vec![RuntimeValue::Int(0)]]);
+    let bad_structural_target = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_IN_DIRECTORY]->(:MarkdownDocument)
+         RETURN count(e)",
+    );
+    assert_eq!(bad_structural_target.rows, vec![vec![RuntimeValue::Int(0)]]);
+    assert_no_sibling_edges(&mut reopened);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn watch_mode_can_include_filesystem_graph() {
+    let db = TestDb::new("markdown_fs_watch");
+    let root = temp_dir("markdown_fs_watch");
+    fs::create_dir_all(root.join("watch")).unwrap();
+    fs::write(root.join("watch/note.md"), "# Watched").unwrap();
+
+    let mut session = db.open();
+    let mut engine = session.engine().clone();
+    let report = watch_markdown_root_with_sync_options(
+        &mut engine,
+        &root,
+        &MarkdownSyncOptions {
+            include_fs_graph: true,
+        },
+        &MarkdownWatchOptions {
+            poll_interval: Duration::from_millis(10),
+            debounce: Duration::from_millis(20),
+            max_batch_window: Duration::from_millis(50),
+            idle_timeout: Some(Duration::from_millis(100)),
+            max_runs: Some(1),
+        },
+    )
+    .unwrap();
+    assert_eq!(report.sync_runs, 1);
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+    drop(session);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument)-[:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN d.`src.path`, dir.`src.path`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::String("watch/note.md".to_owned()),
+            RuntimeValue::String("watch".to_owned()),
+        ]]
+    );
+    assert_no_sibling_edges(&mut reopened);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -1096,6 +1418,16 @@ fn sync_root_into_db_with_options(
     report
 }
 
+fn sync_root_into_db_with_fs_graph(db_path: &std::path::Path, root: &std::path::Path) {
+    sync_root_into_db_with_options(
+        db_path,
+        root,
+        MarkdownSyncOptions {
+            include_fs_graph: true,
+        },
+    );
+}
+
 fn watch_root_into_db(
     db_path: &std::path::Path,
     root: &std::path::Path,
@@ -1118,6 +1450,22 @@ fn watch_root_into_db_with_sync_options(
     session.replace_engine(engine).unwrap();
     session.save().unwrap();
     report
+}
+
+fn assert_edge_count(session: &mut Session, edge_type: &str, expected: i64) {
+    let result = run(
+        session,
+        &format!("MATCH ()-[e:{edge_type}]->() RETURN count(e)"),
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![RuntimeValue::Int(expected)]],
+        "unexpected {edge_type} count"
+    );
+}
+
+fn assert_no_sibling_edges(session: &mut Session) {
+    assert_edge_count(session, "MD_SIBLING_OF", 0);
 }
 
 fn temp_dir(prefix: &str) -> PathBuf {

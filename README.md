@@ -110,10 +110,10 @@ cupld sync markdown --db default --root notes
 cupld source set-root --db default notes
 ```
 
-Opt in to persisted filesystem structure during sync:
+Opt in to persisted filesystem structure when directory traversal matters:
 
 ```bash
-cupld sync markdown --db default --root notes --include-fs-graph
+cupld sync markdown --db default --include-fs-graph
 ```
 
 Watch markdown after the initial persisted sync:
@@ -122,7 +122,7 @@ Watch markdown after the initial persisted sync:
 cupld sync markdown --db default --root notes --watch --idle-ms 500 --max-runs 2
 ```
 
-Use `cupld query --with-md` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state.
+Use `cupld query --with-md` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state. By default sync persists markdown documents and authored `MD_LINKS_TO` edges only. `--include-fs-graph` also persists `MarkdownDirectory` nodes plus `MD_IN_DIRECTORY` and `MD_PARENT_DIRECTORY` edges; it does not create `MD_SIBLING_OF` pairwise sibling edges.
 
 Install into a provider-specific skills directory or a custom path:
 
