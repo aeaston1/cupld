@@ -9,6 +9,10 @@ cargo-dist-version = "0.31.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew", "msi"]
+# Publish package-manager channels after GitHub Release assets are hosted
+publish-jobs = ["./publish-homebrew", "./publish-crates"]
+# Custom crates.io publish job only needs repository read access
+github-custom-job-permissions = { "publish-homebrew" = { contents = "read" }, "publish-crates" = { contents = "read" } }
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in

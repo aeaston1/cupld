@@ -1,0 +1,112 @@
+name: Publish Homebrew formula
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: true
+
+jobs:
+  publish-homebrew:
+    name: publish Homebrew formula
+    runs-on: ubuntu-22.04
+    env:
+      PLAN: ${{ inputs.plan }}
+      GITHUB_USER: "axo bot"
+      GITHUB_EMAIL: "admin+bot@axo.dev"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          repository: "aeaston1/homebrew-tap"
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Fetch generated formula
+        uses: actions/download-artifact@v7
+        with:
+          pattern: artifacts-*
+          path: Formula/
+          merge-multiple: true
+
+      - name: Locate formula
+        id: formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          formula="$(find Formula -maxdepth 1 -name '*.rb' -print -quit)"
+          if [ -z "$formula" ]; then
+            echo "No generated Homebrew formula found"
+            exit 1
+          fi
+          name="$(basename "$formula" .rb)"
+          version="$(echo "$PLAN" | jq -r '.releases[] | select([.artifacts[] | endswith(".rb")] | any) | .app_version' | head -n1)"
+          echo "path=$formula" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate generated formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -c "${{ steps.formula.outputs.path }}"
+          grep -q 'url "https://github.com/aeaston1/cupld/releases/download/' "${{ steps.formula.outputs.path }}"
+          grep -q 'sha256 "' "${{ steps.formula.outputs.path }}"
+
+      - name: Add formula test
+        shell: bash
+        run: |
+          ruby - "${{ steps.formula.outputs.path }}" <<'RUBY'
+          path = ARGV.fetch(0)
+          text = File.read(path)
+          exit 0 if text.include?("\n  test do\n")
+
+          test_block = <<~'FORMULA'
+
+            test do
+              assert_match "local graph database CLI and REPL", shell_output("#{bin}/cupld --help")
+            end
+          FORMULA
+
+          text = text.sub(/\nend\s*\z/, "#{test_block}\nend\n")
+          File.write(path, text)
+          RUBY
+
+      - name: Register local tap
+        run: |
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew tap --custom-remote aeaston1/tap "$GITHUB_WORKSPACE"
+
+      - name: Style formula
+        run: |
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew update
+          brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "${{ steps.formula.outputs.path }}" || true
+
+      - name: Audit formula
+        run: |
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew audit aeaston1/tap/${{ steps.formula.outputs.name }}
+
+      - name: Install and test formula
+        run: |
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          brew install aeaston1/tap/${{ steps.formula.outputs.name }}
+          brew test aeaston1/tap/${{ steps.formula.outputs.name }}
+
+      - name: Commit formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_EMAIL}"
+          git add "${{ steps.formula.outputs.path }}"
+          if git diff --cached --quiet; then
+            echo "No Homebrew formula changes to publish"
+            exit 0
+          fi
+          git commit -m "${{ steps.formula.outputs.name }} ${{ steps.formula.outputs.version }}"
+          git push
