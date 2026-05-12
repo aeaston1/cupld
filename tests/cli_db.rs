@@ -597,7 +597,20 @@ fn cli_memory_check_outputs_json_report() {
             .get("summary")
             .and_then(|summary| summary.get("status"))
             .and_then(json::JsonValue::as_str),
-        Some("ok")
+        Some("pass")
+    );
+    assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("pass")
+    );
+    assert_eq!(
+        parsed
+            .get("checks")
+            .and_then(json::JsonValue::as_array)
+            .and_then(|checks| checks.first())
+            .and_then(|check| check.get("status"))
+            .and_then(json::JsonValue::as_str),
+        Some("pass")
     );
 }
 
@@ -632,17 +645,42 @@ fn cli_memory_find_stale_ndjson_reports_changed_markdown() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 3);
     let meta = json::parse(lines[0]).unwrap();
     assert_eq!(
         meta.get("kind").and_then(json::JsonValue::as_str),
         Some("memory_meta")
     );
     assert_eq!(
+        meta.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
+    );
+    assert_eq!(
+        meta.get("check_count").and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
         meta.get("item_count").and_then(json::JsonValue::as_i64),
         Some(1)
     );
-    let item = json::parse(lines[1]).unwrap();
+    let check = json::parse(lines[1]).unwrap();
+    assert_eq!(
+        check.get("kind").and_then(json::JsonValue::as_str),
+        Some("memory_check")
+    );
+    assert_eq!(
+        check.get("name").and_then(json::JsonValue::as_str),
+        Some("stale_items")
+    );
+    assert_eq!(
+        check.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
+    );
+    let item = json::parse(lines[2]).unwrap();
+    assert_eq!(
+        item.get("kind").and_then(json::JsonValue::as_str),
+        Some("memory_item")
+    );
     assert_eq!(
         item.get("item")
             .and_then(|item| item.get("path"))
@@ -696,6 +734,10 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed = json::parse(&stdout).unwrap();
     assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
+    );
+    assert_eq!(
         parsed
             .get("summary")
             .and_then(|summary| summary.get("orphan_items"))
@@ -714,6 +756,18 @@ fn cli_memory_find_orphans_json_reports_tombstoned_markdown() {
     assert_eq!(
         items[0].get("path").and_then(json::JsonValue::as_str),
         Some("old.md")
+    );
+    let checks = parsed
+        .get("checks")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(
+        checks[0].get("name").and_then(json::JsonValue::as_str),
+        Some("orphan_items")
+    );
+    assert_eq!(
+        checks[0].get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
     );
 }
 
@@ -743,6 +797,18 @@ fn cli_memory_reindex_reads_default_workspace_root() {
         Some("memory.reindex")
     );
     assert_eq!(
+        parsed.get("status").and_then(json::JsonValue::as_str),
+        Some("pass")
+    );
+    assert_eq!(
+        parsed.get("db_path").and_then(json::JsonValue::as_str),
+        workspace_default_db_path(workspace.path()).to_str()
+    );
+    assert_eq!(
+        parsed.get("root").and_then(json::JsonValue::as_str),
+        notes_root.to_str()
+    );
+    assert_eq!(
         parsed
             .get("summary")
             .and_then(|summary| summary.get("scanned_documents"))
@@ -750,6 +816,37 @@ fn cli_memory_reindex_reads_default_workspace_root() {
         Some(1)
     );
     assert!(workspace_default_db_path(workspace.path()).exists());
+}
+
+#[test]
+fn cli_memory_json_errors_use_machine_envelope() {
+    let dir = TempDir::new("cli_memory_json_error");
+    let missing_db = dir.path().join("missing.cupld");
+    let missing_db = missing_db.to_str().unwrap().to_owned();
+
+    let output = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        missing_db.as_str(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let parsed = json::parse(&stderr).unwrap();
+    assert_eq!(
+        parsed.get("ok").and_then(json::JsonValue::as_bool),
+        Some(false)
+    );
+    assert!(
+        parsed
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(json::JsonValue::as_str)
+            .is_some()
+    );
 }
 
 #[test]

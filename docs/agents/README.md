@@ -409,7 +409,11 @@ Markdown notes:
 - `cupld context --output json` writes one JSON envelope to stdout with `ok`, `command`, `policy`, `retrieval_usage`, `provenance`, and `items`.
 - `cupld context --output ndjson` writes one `context_meta` line plus one `context_item` line per item.
 - `cupld check --output json` includes storage integrity plus markdown alias diagnostics, including ambiguous alias counts and colliding paths.
-- `query`, `context`, and `check` failures in JSON or NDJSON mode write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
+- `cupld memory check|find-stale|find-orphans|reindex --output json` writes one JSON envelope to stdout with `ok`, `command`, `status`, resolved `db_path`, resolved `root` where applicable, `summary`, `checks`, and `items`.
+- `cupld memory ... --output ndjson` writes one `memory_meta` line, one `memory_check` line per check, and one `memory_item` line per item.
+- Memory maintenance `status` values are stable: `pass`, `warn`, and `fail`.
+- `query` and `context` failures in JSON or NDJSON mode write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
+- Memory maintenance failures in JSON or NDJSON mode also write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
 
 Current automation controls:
 

@@ -2,6 +2,7 @@ pub mod automation;
 pub mod engine;
 pub mod json;
 pub mod mcp;
+pub mod memory_report;
 pub mod package;
 pub mod query;
 mod regex_lite;
@@ -14,6 +15,7 @@ pub use engine::{
     GraphStats, IndexKind, IndexRow, Node, NodeId, PropertyMap, PropertyType, SchemaCatalog,
     SchemaObjectOptions, SchemaRow, SchemaTarget, TargetKind, TxId, Value,
 };
+pub use memory_report::{MemoryMaintenanceCheck, MemoryMaintenanceReport, MemoryMaintenanceStatus};
 pub use query::{
     BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, HopRange, NodePattern, OrderItem,
     ParamValue, Pattern, PatternSegment, PropertyTarget, Query, QueryError, RemoveTarget,
