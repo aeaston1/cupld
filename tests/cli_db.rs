@@ -341,7 +341,9 @@ fn cli_context_ndjson_outputs_budgeted_contract() {
         db.path().to_str().unwrap(),
         "--output",
         "ndjson",
-        "--top-k",
+        "--node",
+        "1",
+        "--max-nodes",
         "2",
     ]);
 

@@ -3,6 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::{IndexKind, IndexStatus, PropertyType, SchemaTarget, TargetKind};
 
+pub const MAX_TRAVERSAL_DEPTH: u8 = 10;
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
@@ -923,11 +925,13 @@ impl Parser {
             let min = self.expect_u8()?;
             self.expect_token(TokenDiscriminant::Range)?;
             let max = self.expect_u8()?;
-            if max > 10 || min > max {
+            if max > MAX_TRAVERSAL_DEPTH || min > max {
                 let token = self.previous_or_current();
                 return Err(QueryError::new(
                     "parse_hop_range",
-                    "bounded traversal must satisfy 0 <= min <= max <= 10",
+                    format!(
+                        "bounded traversal must satisfy 0 <= min <= max <= {MAX_TRAVERSAL_DEPTH}"
+                    ),
                     token.line,
                     token.column,
                 ));

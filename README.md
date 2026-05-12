@@ -74,7 +74,7 @@ cupld query --db default --output json 'MATCH (n) RETURN n LIMIT 10'
 Build compact context rows for agent prompts:
 
 ```bash
-cupld context --db default --top-k 25
+cupld context --db default --path notes/example.md --depth 2 --max-nodes 25
 ```
 
 Inspect, validate, and compact a database:
