@@ -8,12 +8,14 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use crate::engine::{CupldEngine, GraphError, NodeId, PropertyMap, Value};
 
 const MARKDOWN_DOCUMENT_LABEL: &str = "MarkdownDocument";
-const MARKDOWN_DIRECTORY_LABEL: &str = "MarkdownDirectory";
+pub const MARKDOWN_DIRECTORY_LABEL: &str = "MarkdownDirectory";
 const CONFIG_LABEL: &str = "SystemConfig";
 const CONFIG_KIND: &str = "config";
 const CONFIG_NAME: &str = "markdown_source";
 const CONNECTOR_NAME: &str = "markdown";
 const LINK_EDGE_TYPE: &str = "MD_LINKS_TO";
+pub const MD_IN_DIRECTORY: &str = "MD_IN_DIRECTORY";
+pub const MD_PARENT_DIRECTORY: &str = "MD_PARENT_DIRECTORY";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownDocument {
@@ -166,6 +168,9 @@ pub struct MarkdownSyncReport {
     pub upserted_documents: usize,
     pub tombstoned_documents: usize,
     pub link_edges: usize,
+    pub upserted_directories: usize,
+    pub tombstoned_directories: usize,
+    pub structural_edges: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,10 +316,14 @@ pub fn sync_markdown_root_with_options(
     let root_string = path_to_string(&root);
 
     let mut existing_docs = collect_existing_documents(engine, &root_string);
+    let mut upserted_directories = 0;
+    let mut tombstoned_directories = 0;
     if options.filesystem_graph {
         let mut existing_dirs = collect_existing_directories(engine, &root_string);
-        upsert_directories(engine, &root_string, &documents, &mut existing_dirs)?;
-        tombstone_missing_directories(engine, &existing_dirs)?;
+        let dir_node_ids =
+            upsert_directories(engine, &root_string, &documents, &mut existing_dirs)?;
+        upserted_directories = dir_node_ids.len();
+        tombstoned_directories = tombstone_missing_directories(engine, &existing_dirs)?;
     }
     let doc_node_ids = upsert_documents(engine, &root_string, &documents, &mut existing_docs)?;
     let link_edges = sync_link_edges(engine, &documents, &doc_node_ids)?;
@@ -326,6 +335,9 @@ pub fn sync_markdown_root_with_options(
         upserted_documents: doc_node_ids.len(),
         tombstoned_documents,
         link_edges,
+        upserted_directories,
+        tombstoned_directories,
+        structural_edges: 0,
     })
 }
 
@@ -1938,10 +1950,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, LINK_EDGE_TYPE, MARKDOWN_DOCUMENT_LABEL,
-        MarkdownDocument, MarkdownLinkRef, MarkdownLinkSource, build_resolution_index,
+        CONFIG_KIND, CONFIG_NAME, CONNECTOR_NAME, LINK_EDGE_TYPE, MARKDOWN_DIRECTORY_LABEL,
+        MARKDOWN_DOCUMENT_LABEL, MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, MarkdownDocument,
+        MarkdownLinkRef, MarkdownLinkSource, MarkdownSyncOptions, build_resolution_index,
         configured_markdown_root, extract_document_link_refs, read_markdown_document,
-        resolve_link_path, set_markdown_root, sync_markdown_root,
+        resolve_link_path, set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
     };
     use crate::engine::{CupldEngine, PropertyMap, Value};
 
@@ -2036,6 +2049,9 @@ Body with [[other]] and [deep](docs/page.md#intro) and #tagged
         assert_eq!(report.scanned_documents, 2);
         assert_eq!(report.upserted_documents, 2);
         assert_eq!(report.link_edges, 1);
+        assert_eq!(report.upserted_directories, 0);
+        assert_eq!(report.tombstoned_directories, 0);
+        assert_eq!(report.structural_edges, 0);
         assert_eq!(
             engine
                 .nodes()
@@ -2052,6 +2068,36 @@ Body with [[other]] and [deep](docs/page.md#intro) and #tagged
                 && node.property("src.status") == Some(&Value::from("missing"))
         });
         assert!(missing);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_graph_options_are_default_off() {
+        assert!(!MarkdownSyncOptions::default().filesystem_graph);
+        assert_eq!(MARKDOWN_DIRECTORY_LABEL, "MarkdownDirectory");
+        assert_eq!(MD_IN_DIRECTORY, "MD_IN_DIRECTORY");
+        assert_eq!(MD_PARENT_DIRECTORY, "MD_PARENT_DIRECTORY");
+
+        let root = temp_dir("sync_options");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested").join("note.md"), "# Note").unwrap();
+
+        let mut engine = CupldEngine::default();
+        let report =
+            sync_markdown_root_with_options(&mut engine, &root, &MarkdownSyncOptions::default())
+                .unwrap();
+        assert_eq!(report.upserted_directories, 0);
+        assert_eq!(report.tombstoned_directories, 0);
+        assert_eq!(report.structural_edges, 0);
+        assert!(
+            engine
+                .nodes()
+                .all(|node| !node.labels().contains(MARKDOWN_DIRECTORY_LABEL))
+        );
+        assert!(engine.edges().all(|edge| {
+            edge.edge_type() != MD_IN_DIRECTORY && edge.edge_type() != MD_PARENT_DIRECTORY
+        }));
 
         fs::remove_dir_all(root).unwrap();
     }

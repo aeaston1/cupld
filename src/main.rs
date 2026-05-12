@@ -1319,6 +1319,9 @@ fn run_sync_markdown(
             upserted_documents: 0,
             tombstoned_documents: 0,
             link_edges: 0,
+            upserted_directories: 0,
+            tombstoned_directories: 0,
+            structural_edges: 0,
         })
     } else if filesystem_graph {
         sync_markdown_root_with_options(&mut engine, &root, &sync_options)
