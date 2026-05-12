@@ -28,6 +28,11 @@ mod install_mcp;
 mod skill_install;
 mod visualise;
 
+const MARKDOWN_DOCUMENT_LABEL: &str = "MarkdownDocument";
+const MD_LINKS_TO: &str = "MD_LINKS_TO";
+const MD_IN_DIRECTORY: &str = "MD_IN_DIRECTORY";
+const MD_PARENT_DIRECTORY: &str = "MD_PARENT_DIRECTORY";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
     Table,
@@ -2021,51 +2026,91 @@ fn string_or_null(value: &str) -> RuntimeValue {
 
 fn memory_orphan_items(session: &mut Session) -> Result<QueryResult, AutomationError> {
     let mut rows = Vec::new();
-    collect_missing_markdown_entities(session, "MarkdownDocument", "document", &mut rows)?;
-    collect_missing_markdown_entities(session, "MarkdownDirectory", "directory", &mut rows)?;
-    rows.sort_by(|left, right| {
-        let left_key = (value_string(&left[0]), value_string(&left[1]));
-        let right_key = (value_string(&right[0]), value_string(&right[1]));
-        left_key.cmp(&right_key)
-    });
+    for node in session
+        .engine()
+        .nodes()
+        .filter(|node| node.labels().contains(MARKDOWN_DOCUMENT_LABEL))
+    {
+        let status = string_property(node.property("src.status")).unwrap_or("unknown");
+        if status != "current" {
+            continue;
+        }
+        let node_id = node.id();
+        let mut markdown_inbound_count = 0;
+        let mut markdown_outbound_count = 0;
+        let mut native_inbound_count = 0;
+        let mut native_outbound_count = 0;
+        for edge in session.engine().edges() {
+            let touches_node = edge.from() == node_id || edge.to() == node_id;
+            if !touches_node {
+                continue;
+            }
+            if edge.edge_type() == MD_LINKS_TO {
+                if edge.to() == node_id {
+                    markdown_inbound_count += 1;
+                }
+                if edge.from() == node_id {
+                    markdown_outbound_count += 1;
+                }
+            } else if !is_markdown_structural_edge(edge.edge_type()) {
+                if edge.to() == node_id {
+                    native_inbound_count += 1;
+                }
+                if edge.from() == node_id {
+                    native_outbound_count += 1;
+                }
+            }
+        }
+        if markdown_inbound_count == 0
+            && markdown_outbound_count == 0
+            && native_inbound_count == 0
+            && native_outbound_count == 0
+        {
+            rows.push(vec![
+                RuntimeValue::String(
+                    string_property(node.property("src.path"))
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                ),
+                RuntimeValue::String(
+                    string_property(node.property("md.title"))
+                        .unwrap_or("")
+                        .to_owned(),
+                ),
+                RuntimeValue::String(status.to_owned()),
+                RuntimeValue::Int(markdown_inbound_count),
+                RuntimeValue::Int(markdown_outbound_count),
+                RuntimeValue::Int(native_inbound_count),
+                RuntimeValue::Int(native_outbound_count),
+                RuntimeValue::String("no_markdown_or_native_connectivity".to_owned()),
+            ]);
+        }
+    }
+    rows.sort_by(|left, right| value_string(&left[0]).cmp(&value_string(&right[0])));
     Ok(QueryResult {
-        columns: vec!["kind".to_owned(), "path".to_owned(), "status".to_owned()],
+        columns: vec![
+            "path".to_owned(),
+            "title".to_owned(),
+            "status".to_owned(),
+            "markdown_inbound_count".to_owned(),
+            "markdown_outbound_count".to_owned(),
+            "native_inbound_count".to_owned(),
+            "native_outbound_count".to_owned(),
+            "reason".to_owned(),
+        ],
         rows,
     })
 }
 
-fn collect_missing_markdown_entities(
-    session: &mut Session,
-    label: &str,
-    kind: &str,
-    rows: &mut Vec<Vec<RuntimeValue>>,
-) -> Result<(), AutomationError> {
-    let query = format!(
-        "MATCH (n:{label})
-         WHERE n.`src.status` = 'missing'
-         RETURN n.`src.path` AS path, n.`src.status` AS status
-         ORDER BY n.`src.path`"
-    );
-    let result = session
-        .execute_script(&query, &BTreeMap::new())
-        .map_err(AutomationError::from)?
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| QueryResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-        });
-    for row in result.rows {
-        rows.push(vec![
-            RuntimeValue::String(kind.to_owned()),
-            RuntimeValue::String(string_column(&result.columns, &row, "path")?),
-            RuntimeValue::String(
-                optional_string_column(&result.columns, &row, "status")?
-                    .unwrap_or_else(|| "unknown".to_owned()),
-            ),
-        ]);
+fn is_markdown_structural_edge(edge_type: &str) -> bool {
+    edge_type == MD_IN_DIRECTORY || edge_type == MD_PARENT_DIRECTORY
+}
+
+fn string_property(value: Option<&Value>) -> Option<&str> {
+    match value {
+        Some(Value::String(value)) => Some(value),
+        _ => None,
     }
-    Ok(())
 }
 
 fn print_memory_report(report: &MemoryMaintenanceReport, output: OutputFormat) {
