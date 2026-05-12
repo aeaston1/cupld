@@ -24,6 +24,10 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 - `cupld query --with-md` overlays markdown into a temporary query session and does not persist the imported notes.
 - `cupld sync markdown` persists markdown documents and authored markdown link edges into the `.cupld` database.
 - `cupld sync markdown --db default --include-fs-graph` opts in to persisted filesystem structure with `MarkdownDirectory`, `MD_IN_DIRECTORY`, and `MD_PARENT_DIRECTORY`.
+- Use `cupld memory check`, `find-stale`, `find-orphans`, and `reindex` to inspect markdown-derived DB state. Use `cupld sync markdown` to refresh markdown-derived state after note edits.
+- Memory maintenance statuses are `pass`, `warn`, and `fail`. `warn` still means the command completed; `cupld memory check --strict` exits 2 when the aggregate report is `warn`.
+- Maintenance commands support `--output table|json|ndjson`. JSON emits one report envelope; NDJSON emits `memory_meta`, `memory_check`, and `memory_item` lines.
+- `cupld memory repair` and `cupld memory citation-audit` are intentionally deferred in this round.
 - `MD_LINKS_TO` remains authored-only; filesystem structure uses filesystem edge types and never pairwise `MD_SIBLING_OF` edges.
 - Filesystem edges persist `md.edge_weight` for downstream context and retrieval work. Core ranking does not consume it in this workflow.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes with `--poll-ms`, `--debounce-ms`, `--batch-ms`, `--idle-ms`, and `--max-runs`.
@@ -83,9 +87,14 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
    ```
 11. Use maintenance commands before making assumptions about a DB.
    ```bash
-   cupld check --db default
-   cupld schema --db default
-   cupld compact --db default
+   cupld memory check --db default
+   cupld memory find-stale --db default --output table
+   cupld memory find-orphans --db default --output ndjson
+   cupld memory reindex --db default --output json
+   ```
+12. If maintenance reports stale markdown, refresh persisted state.
+   ```bash
+   cupld sync markdown --db default
    ```
 
 ## Markdown Authoring Convention

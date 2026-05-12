@@ -124,6 +124,24 @@ cupld sync markdown --db default --root notes --watch --idle-ms 500 --max-runs 2
 
 Use `cupld query --with-md` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state. By default sync persists markdown documents and authored `MD_LINKS_TO` edges only. `--include-fs-graph` also persists `MarkdownDirectory` nodes plus `MD_IN_DIRECTORY` and `MD_PARENT_DIRECTORY` edges; it does not create `MD_SIBLING_OF` pairwise sibling edges.
 
+Maintain markdown-derived memory state:
+
+```bash
+cupld memory check --db default
+cupld memory check --db default --strict --output json
+cupld memory find-stale --db default --root notes --output table
+cupld memory find-orphans --db default --output ndjson
+cupld memory reindex --db default --output json
+```
+
+`memory check` validates storage integrity, markdown freshness, metadata, duplicate markdown paths and edges, schema index readiness, stale items, orphans, and ambiguous markdown aliases. `memory find-stale` lists markdown documents whose persisted state no longer matches the filesystem, `memory find-orphans` lists current markdown documents without markdown or native graph connectivity, and `memory reindex` inspects existing schema index definitions and reports their status. These commands are diagnostic: use `cupld sync markdown --db default` or `cupld sync markdown --db default --root notes` to refresh markdown-derived DB state after editing notes.
+
+Markdown root resolution for commands that accept `--root` is: explicit `--root`, `.cupld/config.toml`, the DB root saved by `cupld source set-root`, then `./.cupld/data`. Relative roots are resolved against the workspace package root. `memory find-orphans` and `memory reindex` do not need a markdown root and report `root: null` in machine output.
+
+Maintenance reports use stable statuses: `pass` means no problem was found, `warn` means the command found stale or suspicious state but completed successfully, and `fail` is reserved for hard failures. `memory check --strict` keeps warning details in the report but exits with code 2 when the aggregate status is `warn`; without `--strict`, warnings exit successfully. Table output is the default. `--output json` emits one report envelope with `ok`, `command`, `status`, `db_path`, `root`, `summary`, `checks`, and `items`; `--output ndjson` emits one `memory_meta` line followed by `memory_check` and `memory_item` lines.
+
+`cupld memory repair` and `cupld memory citation-audit` are intentionally deferred in this implementation round.
+
 Install into a provider-specific skills directory or a custom path:
 
 ```bash
