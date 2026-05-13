@@ -89,6 +89,12 @@ fn run_cli_in_dir(args: &[&str], dir: &Path) -> std::process::Output {
     run_cli_with_input_in_dir(args, "", Some(dir))
 }
 
+fn write_memory_eval_fixture(root: &Path, name: &str, spec: &str) {
+    let fixture = root.join(name);
+    fs::create_dir_all(fixture.join("markdown")).unwrap();
+    fs::write(fixture.join("case.json"), spec).unwrap();
+}
+
 fn run_cli_with_input_in_dir(
     args: &[&str],
     input: &str,
@@ -357,6 +363,173 @@ fn cli_query_json_outputs_machine_envelope() {
     assert_eq!(
         rows[1].get("col_1").and_then(json::JsonValue::as_str),
         Some("Alan")
+    );
+}
+
+#[test]
+fn cli_eval_memory_json_is_deterministic_and_reports_summary() {
+    let fixtures = TempDir::new("eval_memory_json");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "people",
+        r#"{
+  "cases": [
+    {
+      "name": "names",
+      "setup": [
+        "CREATE (:Person {name: 'Grace'})",
+        "CREATE (:Person {name: 'Ada'})"
+      ],
+      "assertions": [
+        {
+          "type": "query_rows",
+          "query": "MATCH (n:Person) RETURN n.name ORDER BY n.name",
+          "expected": [
+            {"columns": ["col_1"], "rows": [["Ada"], ["Grace"]]}
+          ]
+        }
+      ]
+    }
+  ]
+}"#,
+    );
+
+    let first = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    let second = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+
+    let stdout = String::from_utf8(first.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    let summary = parsed.get("summary").unwrap();
+    assert_eq!(
+        summary.get("fixtures").and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary.get("cases").and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary.get("passed").and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        summary.get("failed").and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        summary.get("warnings").and_then(json::JsonValue::as_i64),
+        Some(0)
+    );
+}
+
+#[test]
+fn cli_eval_memory_ndjson_orders_suite_case_assertion_events_and_filters_case() {
+    let fixtures = TempDir::new("eval_memory_ndjson");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "alpha",
+        r#"{"cases":[{"name":"count","setup":["CREATE (:Person {name: 'Ada'})"],"assertions":[{"type":"query_rows","query":"MATCH (n:Person) RETURN n.name","expected":[{"columns":["col_1"],"rows":[["Ada"]]}]}]}]}"#,
+    );
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "beta",
+        r#"{"cases":[{"name":"count","setup":["CREATE (:Person {name: 'Grace'})"],"assertions":[{"type":"query_rows","query":"MATCH (n:Person) RETURN n.name","expected":[{"columns":["col_1"],"rows":[["Grace"]]}]}]}]}"#,
+    );
+
+    let output = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--case",
+        "beta",
+        "--output",
+        "ndjson",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        json::parse(lines[0])
+            .unwrap()
+            .get("kind")
+            .and_then(json::JsonValue::as_str),
+        Some("eval_memory_suite")
+    );
+    assert_eq!(
+        json::parse(lines[1])
+            .unwrap()
+            .get("kind")
+            .and_then(json::JsonValue::as_str),
+        Some("eval_memory_case")
+    );
+    let assertion = json::parse(lines[2]).unwrap();
+    assert_eq!(
+        assertion.get("kind").and_then(json::JsonValue::as_str),
+        Some("eval_memory_assertion")
+    );
+    assert_eq!(
+        assertion.get("fixture").and_then(json::JsonValue::as_str),
+        Some("beta")
+    );
+}
+
+#[test]
+fn cli_eval_memory_failed_assertion_includes_expected_actual_and_diff() {
+    let fixtures = TempDir::new("eval_memory_failure");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "broken",
+        r#"{"cases":[{"name":"wrong-count","setup":["CREATE (:Person {name: 'Ada'})"],"assertions":[{"type":"query_rows","query":"MATCH (n:Person) RETURN n.name","expected":[{"columns":["col_1"],"rows":[["Grace"]]}]}]}]}"#,
+    );
+
+    let output = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    let assertion = parsed
+        .get("cases")
+        .and_then(json::JsonValue::as_array)
+        .unwrap()[0]
+        .get("assertions")
+        .and_then(json::JsonValue::as_array)
+        .unwrap()[0]
+        .clone();
+    assert!(assertion.get("expected").is_some());
+    assert!(assertion.get("actual").is_some());
+    assert!(
+        assertion
+            .get("diff")
+            .and_then(json::JsonValue::as_str)
+            .is_some()
     );
 }
 

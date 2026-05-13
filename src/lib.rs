@@ -3,6 +3,7 @@ pub mod context;
 pub mod engine;
 pub mod json;
 pub mod mcp;
+pub mod memory_eval;
 pub mod memory_report;
 pub mod package;
 pub mod query;
