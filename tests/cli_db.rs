@@ -382,7 +382,27 @@ fn cli_context_ndjson_outputs_budgeted_contract() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 5);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| {
+                json::parse(line)
+                    .unwrap()
+                    .get("kind")
+                    .and_then(json::JsonValue::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "context_meta",
+            "context_seed",
+            "context_node",
+            "context_node",
+            "context_edge"
+        ]
+    );
 
     let meta = json::parse(lines[0]).unwrap();
     assert_eq!(
@@ -408,16 +428,109 @@ fn cli_context_ndjson_outputs_budgeted_contract() {
             .and_then(json::JsonValue::as_i64),
         Some(2)
     );
+    assert!(meta.get("snippets").is_none());
 
-    let item = json::parse(lines[1]).unwrap();
+    let seed = json::parse(lines[1]).unwrap();
     assert_eq!(
-        item.get("kind").and_then(json::JsonValue::as_str),
-        Some("context_item")
+        seed.get("seed")
+            .and_then(|seed| seed.get("node_ids"))
+            .and_then(json::JsonValue::as_array)
+            .map(|values| values.len()),
+        Some(1)
     );
-    assert!(
-        item.get("item")
-            .and_then(|entry| entry.get("node_id"))
-            .is_some_and(json::JsonValue::is_number)
+
+    let node = json::parse(lines[2]).unwrap();
+    assert_eq!(
+        node.get("node")
+            .and_then(|entry| entry.get("properties"))
+            .and_then(|properties| properties.get("email"))
+            .and_then(json::JsonValue::as_str),
+        Some("ada@example.com")
+    );
+}
+
+#[test]
+fn cli_context_json_outputs_seeded_golden_contract() {
+    let db = TestDb::new("cli_context_json_seeded");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+    drop(session);
+
+    let output = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "json",
+        "--node",
+        "1",
+        "--depth",
+        "2",
+        "--max-nodes",
+        "2",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(stdout.trim()).unwrap();
+
+    assert!(parsed.get("items").is_none());
+    assert!(parsed.get("snippets").is_none());
+    assert_eq!(
+        parsed.get("mode").and_then(json::JsonValue::as_str),
+        Some("seeded")
+    );
+    assert_eq!(
+        parsed
+            .get("nodes")
+            .and_then(json::JsonValue::as_array)
+            .map(|values| values.len()),
+        Some(2)
+    );
+    assert_eq!(
+        parsed
+            .get("edges")
+            .and_then(json::JsonValue::as_array)
+            .map(|values| values.len()),
+        Some(1)
+    );
+    assert_eq!(
+        parsed
+            .get("retrieval_usage")
+            .and_then(|usage| usage.get("nodes"))
+            .and_then(json::JsonValue::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        parsed
+            .get("retrieval_usage")
+            .and_then(|usage| usage.get("edges"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        parsed
+            .get("retrieval_usage")
+            .and_then(|usage| usage.get("total_payload_bytes"))
+            .and_then(json::JsonValue::as_i64),
+        Some(stdout.trim().len() as i64)
+    );
+    assert_eq!(
+        parsed
+            .get("retrieval_usage")
+            .and_then(|usage| usage.get("truncated"))
+            .and_then(json::JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .get("nodes")
+            .and_then(json::JsonValue::as_array)
+            .and_then(|nodes| nodes.first())
+            .and_then(|node| node.get("properties"))
+            .and_then(|properties| properties.get("email"))
+            .and_then(json::JsonValue::as_str),
+        Some("ada@example.com")
     );
 }
 

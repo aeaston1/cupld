@@ -441,8 +441,8 @@ Markdown notes:
 
 - `cupld query --output json` writes one JSON envelope to stdout with `ok`, `command`, `policy`, and `results`.
 - `cupld query --output ndjson` writes one `query_meta` line, one `query_result` line per result set, and one `query_row` line per returned row.
-- `cupld context --output json` writes one JSON envelope to stdout with `ok`, `command`, `policy`, `retrieval_usage`, `provenance`, and `items`.
-- `cupld context --output ndjson` writes one `context_meta` line plus one `context_item` line per item.
+- `cupld context --output json` writes one seeded JSON envelope to stdout with `ok`, `command`, `mode`, `policy`, `retrieval_usage`, `provenance`, `request`, `seeds`, `nodes`, `edges`, and `warnings`.
+- `cupld context --output ndjson` writes one `context_meta` line followed by deterministic `context_seed`, `context_node`, and `context_edge` lines.
 - `cupld check --output json` includes storage integrity plus markdown alias diagnostics, including ambiguous alias counts and colliding paths.
 - `cupld memory check|find-stale|find-orphans|reindex --output json` writes one JSON envelope to stdout with `ok`, `command`, `status`, resolved `db_path`, resolved `root` where applicable, `summary`, `checks`, and `items`.
 - `cupld memory ... --output ndjson` writes one `memory_meta` line, one `memory_check` line per check, and one `memory_item` line per item.

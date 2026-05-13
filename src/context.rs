@@ -6,7 +6,7 @@ use crate::automation::{
     retrieval_usage_json_value,
 };
 use crate::json::{self, JsonValue};
-use crate::{QueryResult, RuntimeValue, Session};
+use crate::{QueryResult, RuntimeValue, Session, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextDirection {
@@ -35,21 +35,30 @@ pub struct ContextEvidence {
     pub source: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContextNode {
     pub node_id: i64,
     pub labels: Vec<String>,
+    pub properties: BTreeMap<String, Value>,
     pub name: Option<String>,
     pub title: Option<String>,
     pub display: Option<String>,
     pub evidence: Vec<ContextEvidence>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContextEdge {
     pub from_node_id: i64,
     pub to_node_id: i64,
     pub edge_type: String,
+    pub properties: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextSeed {
+    pub kind: String,
+    pub value: String,
+    pub node_ids: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,16 +73,29 @@ pub struct ContextProvenance {
     pub source: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContextEnvelope {
     pub ok: bool,
     pub command: String,
+    pub mode: String,
     pub policy: AutomationPolicy,
     pub retrieval_usage: RetrievalUsage,
     pub provenance: ContextProvenance,
-    pub items: Vec<ContextNode>,
+    pub request: ContextRequestSummary,
+    pub seeds: Vec<ContextSeed>,
+    pub nodes: Vec<ContextNode>,
     pub edges: Vec<ContextEdge>,
     pub warnings: Vec<ContextWarning>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextRequestSummary {
+    pub depth: u8,
+    pub direction: ContextDirection,
+    pub edge_types: Vec<String>,
+    pub labels: Vec<String>,
+    pub max_nodes: usize,
+    pub max_edges: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -114,11 +136,26 @@ pub fn context_as_ndjson(response: &ContextEnvelope) -> Vec<String> {
         ),
     ]))];
 
-    for (item_index, item) in response.items.iter().enumerate() {
+    for seed in &response.seeds {
         lines.push(json::stringify(&JsonValue::object([
-            ("kind", JsonValue::from("context_item")),
-            ("item_index", JsonValue::from(item_index)),
-            ("item", context_node_json_value(item)),
+            ("kind", JsonValue::from("context_seed")),
+            ("seed", context_seed_json_value(seed)),
+        ])));
+    }
+
+    for (node_index, node) in response.nodes.iter().enumerate() {
+        lines.push(json::stringify(&JsonValue::object([
+            ("kind", JsonValue::from("context_node")),
+            ("node_index", JsonValue::from(node_index)),
+            ("node", context_node_json_value(node)),
+        ])));
+    }
+
+    for (edge_index, edge) in response.edges.iter().enumerate() {
+        lines.push(json::stringify(&JsonValue::object([
+            ("kind", JsonValue::from("context_edge")),
+            ("edge_index", JsonValue::from(edge_index)),
+            ("edge", context_edge_json_value(edge)),
         ])));
     }
     lines
@@ -134,7 +171,7 @@ pub fn context_as_query_result(response: &ContextEnvelope) -> QueryResult {
             "display".to_owned(),
         ],
         rows: response
-            .items
+            .nodes
             .iter()
             .map(|item| {
                 vec![
@@ -163,35 +200,20 @@ fn optional_runtime_string(value: &Option<String>) -> RuntimeValue {
 }
 
 fn load_context_graph(session: &mut Session) -> Result<ContextGraph, AutomationError> {
-    let node_result = single_result(
-        session,
-        "MATCH (n) RETURN id(n) AS node_id, labels(n) AS labels, n.name AS name, n.title AS title, n.`src.path` AS src_path ORDER BY id(n)",
-    )?;
-    let edge_result = single_result(
-        session,
-        "MATCH (a)-[e]->(b) RETURN id(a) AS from_node_id, id(b) AS to_node_id, edge_type(e) AS edge_type ORDER BY id(a), id(b), edge_type(e)",
-    )?;
-    let nodes = node_result
-        .rows
-        .iter()
-        .map(|row| parse_context_node(&node_result.columns, row).map(|node| (node.node_id, node)))
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let edges = edge_result
-        .rows
-        .iter()
-        .map(|row| parse_context_edge(&edge_result.columns, row))
-        .collect::<Result<Vec<_>, _>>()?;
+    let snapshot = session.engine().snapshot();
+    let nodes = snapshot
+        .nodes()
+        .map(|node| {
+            let context_node = ContextNode::from_node(node);
+            (context_node.node_id, context_node)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let edges = snapshot
+        .edges()
+        .map(ContextEdge::from_edge)
+        .collect::<Vec<_>>();
 
     Ok(ContextGraph { nodes, edges })
-}
-
-fn single_result(session: &mut Session, query: &str) -> Result<QueryResult, AutomationError> {
-    let mut results = session
-        .execute_script(query, &BTreeMap::new())
-        .map_err(AutomationError::from)?;
-    results.pop().ok_or_else(|| {
-        AutomationError::new("context_contract", "context query returned no result set")
-    })
 }
 
 fn build_context_response(
@@ -204,6 +226,7 @@ fn build_context_response(
         unreachable!("context policy should include retrieval budget");
     };
     let seed_nodes = resolve_seed_nodes(request, &graph);
+    let seeds = context_seed_summaries(request, &graph);
     let mut warnings = Vec::new();
     for node_id in &request.nodes {
         if !graph.nodes.contains_key(&(*node_id as i64)) {
@@ -227,15 +250,15 @@ fn build_context_response(
     }
 
     let (node_ids, mut edges, truncated_by_budget) = traverse_context(request, &graph, &seed_nodes);
-    let mut items = node_ids
+    let mut nodes = node_ids
         .iter()
         .filter_map(|node_id| graph.nodes.get(node_id).cloned())
         .collect::<Vec<_>>();
-    let mut truncated = truncated_by_budget || items.len() > retrieval_budget.nodes;
-    items.truncate(retrieval_budget.nodes);
-    let retained_ids = items
+    let mut truncated = truncated_by_budget || nodes.len() > retrieval_budget.nodes;
+    nodes.truncate(retrieval_budget.nodes);
+    let retained_ids = nodes
         .iter()
-        .map(|item| item.node_id)
+        .map(|node| node.node_id)
         .collect::<BTreeSet<_>>();
     edges.retain(|edge| {
         retained_ids.contains(&edge.from_node_id) && retained_ids.contains(&edge.to_node_id)
@@ -250,9 +273,10 @@ fn build_context_response(
         let mut response = ContextEnvelope {
             ok: true,
             command: "context".to_owned(),
+            mode: "seeded".to_owned(),
             policy,
             retrieval_usage: RetrievalUsage {
-                nodes: items.len(),
+                nodes: nodes.len(),
                 edges: edges.len(),
                 snippet_bytes: 0,
                 total_payload_bytes: 0,
@@ -262,21 +286,23 @@ fn build_context_response(
                 db_path: db_path.display().to_string(),
                 source: "cupld.context".to_owned(),
             },
-            items: items.clone(),
+            request: ContextRequestSummary::from_request(request),
+            seeds: seeds.clone(),
+            nodes: nodes.clone(),
             edges: edges.clone(),
             warnings: warnings.clone(),
         };
         let payload_bytes = context_payload_bytes(&mut response, &mut buffer);
-        if payload_bytes <= retrieval_budget.total_payload_bytes || response.items.is_empty() {
+        if payload_bytes <= retrieval_budget.total_payload_bytes || response.nodes.is_empty() {
             return Ok(response);
         }
-        response.items.pop();
+        response.nodes.pop();
         let retained_ids = response
-            .items
+            .nodes
             .iter()
-            .map(|item| item.node_id)
+            .map(|node| node.node_id)
             .collect::<BTreeSet<_>>();
-        items = response.items;
+        nodes = response.nodes;
         edges.retain(|edge| {
             retained_ids.contains(&edge.from_node_id) && retained_ids.contains(&edge.to_node_id)
         });
@@ -302,6 +328,38 @@ fn resolve_seed_nodes(request: &ContextRequest, graph: &ContextGraph) -> BTreeSe
     seeds
 }
 
+fn context_seed_summaries(request: &ContextRequest, graph: &ContextGraph) -> Vec<ContextSeed> {
+    let mut seeds = Vec::new();
+    for node_id in &request.nodes {
+        let resolved_node_id = i64::try_from(*node_id).ok();
+        seeds.push(ContextSeed {
+            kind: "node".to_owned(),
+            value: node_id.to_string(),
+            node_ids: resolved_node_id
+                .filter(|resolved_node_id| graph.nodes.contains_key(resolved_node_id))
+                .into_iter()
+                .collect(),
+        });
+    }
+    for path in &request.paths {
+        seeds.push(ContextSeed {
+            kind: "path".to_owned(),
+            value: path.clone(),
+            node_ids: graph
+                .nodes
+                .values()
+                .filter(|node| {
+                    node.evidence
+                        .iter()
+                        .any(|evidence| evidence.field == "src.path" && evidence.value == *path)
+                })
+                .map(|node| node.node_id)
+                .collect(),
+        });
+    }
+    seeds
+}
+
 fn traverse_context(
     request: &ContextRequest,
     graph: &ContextGraph,
@@ -310,6 +368,7 @@ fn traverse_context(
     let mut visited = BTreeSet::new();
     let mut ordered_nodes = Vec::new();
     let mut selected_edges = Vec::new();
+    let mut selected_edge_keys = BTreeSet::new();
     let mut queued = VecDeque::new();
     let mut truncated = false;
 
@@ -342,7 +401,13 @@ fn traverse_context(
             if !include_node(next_id, request, graph) {
                 continue;
             }
-            selected_edges.push(edge.clone());
+            if selected_edge_keys.insert((
+                edge.from_node_id,
+                edge.to_node_id,
+                edge.edge_type.clone(),
+            )) {
+                selected_edges.push(edge.clone());
+            }
             if visited.insert(next_id) {
                 if ordered_nodes.len() >= request.max_nodes {
                     truncated = true;
@@ -409,6 +474,14 @@ fn context_node_json_value(item: &ContextNode) -> JsonValue {
             "labels".to_owned(),
             JsonValue::array(item.labels.iter().cloned().map(JsonValue::from)),
         ),
+        (
+            "properties".to_owned(),
+            JsonValue::object(
+                item.properties
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value_json_value(value))),
+            ),
+        ),
     ];
     if let Some(name) = &item.name {
         fields.push(("name".to_owned(), JsonValue::from(name.clone())));
@@ -431,6 +504,45 @@ fn context_edge_json_value(edge: &ContextEdge) -> JsonValue {
         ("from_node_id", JsonValue::from(edge.from_node_id)),
         ("to_node_id", JsonValue::from(edge.to_node_id)),
         ("edge_type", JsonValue::from(edge.edge_type.clone())),
+        (
+            "properties",
+            JsonValue::object(
+                edge.properties
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value_json_value(value))),
+            ),
+        ),
+    ])
+}
+
+fn context_seed_json_value(seed: &ContextSeed) -> JsonValue {
+    JsonValue::object([
+        ("kind", JsonValue::from(seed.kind.clone())),
+        ("value", JsonValue::from(seed.value.clone())),
+        (
+            "node_ids",
+            JsonValue::array(seed.node_ids.iter().copied().map(JsonValue::from)),
+        ),
+    ])
+}
+
+fn context_request_json_value(request: &ContextRequestSummary) -> JsonValue {
+    JsonValue::object([
+        ("depth", JsonValue::from(usize::from(request.depth))),
+        (
+            "direction",
+            JsonValue::from(context_direction_name(request.direction)),
+        ),
+        (
+            "edge_types",
+            JsonValue::array(request.edge_types.iter().cloned().map(JsonValue::from)),
+        ),
+        (
+            "labels",
+            JsonValue::array(request.labels.iter().cloned().map(JsonValue::from)),
+        ),
+        ("max_nodes", JsonValue::from(request.max_nodes)),
+        ("max_edges", JsonValue::from(request.max_edges)),
     ])
 }
 
@@ -452,6 +564,7 @@ fn context_json_value(response: &ContextEnvelope) -> JsonValue {
     JsonValue::object([
         ("ok", JsonValue::Bool(response.ok)),
         ("command", JsonValue::from(response.command.clone())),
+        ("mode", JsonValue::from(response.mode.clone())),
         ("policy", automation_policy_json_value(&response.policy)),
         (
             "retrieval_usage",
@@ -461,9 +574,14 @@ fn context_json_value(response: &ContextEnvelope) -> JsonValue {
             "provenance",
             context_provenance_json_value(&response.provenance),
         ),
+        ("request", context_request_json_value(&response.request)),
         (
-            "items",
-            JsonValue::array(response.items.iter().map(context_node_json_value)),
+            "seeds",
+            JsonValue::array(response.seeds.iter().map(context_seed_json_value)),
+        ),
+        (
+            "nodes",
+            JsonValue::array(response.nodes.iter().map(context_node_json_value)),
         ),
         (
             "edges",
@@ -476,165 +594,116 @@ fn context_json_value(response: &ContextEnvelope) -> JsonValue {
     ])
 }
 
-fn parse_context_node(
-    columns: &[String],
-    row: &[RuntimeValue],
-) -> Result<ContextNode, AutomationError> {
-    let node_id = expect_int(columns, row, "node_id")?;
-    let labels = expect_string_list(columns, row, "labels")?;
-    let name = optional_string(columns, row, "name")?;
-    let title = optional_string(columns, row, "title")?;
-    let src_path = optional_string(columns, row, "src_path")?;
-    let display = name
-        .clone()
-        .or_else(|| title.clone())
-        .or_else(|| src_path.clone());
-    let mut evidence = Vec::new();
-    if let Some(name) = &name {
-        evidence.push(ContextEvidence {
-            field: "name".to_owned(),
-            value: name.clone(),
-            source: "property:name".to_owned(),
-        });
-    }
-    if let Some(title) = &title {
-        evidence.push(ContextEvidence {
-            field: "title".to_owned(),
-            value: title.clone(),
-            source: "property:title".to_owned(),
-        });
-    }
-    if let Some(src_path) = &src_path {
-        evidence.push(ContextEvidence {
-            field: "src.path".to_owned(),
-            value: src_path.clone(),
-            source: "property:src.path".to_owned(),
-        });
-    }
-    if !labels.is_empty() {
-        evidence.push(ContextEvidence {
-            field: "labels".to_owned(),
-            value: labels.join(","),
-            source: "labels(n)".to_owned(),
-        });
-    }
-
-    Ok(ContextNode {
-        node_id,
-        labels,
-        name,
-        title,
-        display,
-        evidence,
-    })
-}
-
-fn parse_context_edge(
-    columns: &[String],
-    row: &[RuntimeValue],
-) -> Result<ContextEdge, AutomationError> {
-    Ok(ContextEdge {
-        from_node_id: expect_int(columns, row, "from_node_id")?,
-        to_node_id: expect_int(columns, row, "to_node_id")?,
-        edge_type: expect_string(columns, row, "edge_type")?,
-    })
-}
-
-fn column_index(columns: &[String], expected: &str) -> Result<usize, AutomationError> {
-    columns
-        .iter()
-        .position(|column| column == expected)
-        .ok_or_else(|| {
-            AutomationError::new(
-                "context_contract",
-                format!("missing expected `{expected}` column in context result"),
-            )
-        })
-}
-
-fn expect_int(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<i64, AutomationError> {
-    let index = column_index(columns, column)?;
-    match row.get(index) {
-        Some(RuntimeValue::Int(value)) => Ok(*value),
-        Some(other) => Err(AutomationError::new(
-            "context_contract",
-            format!("expected `{column}` to be an integer, found {other:?}"),
-        )),
-        None => Err(AutomationError::new(
-            "context_contract",
-            format!("missing value for `{column}` in context result row"),
-        )),
+fn context_direction_name(direction: ContextDirection) -> &'static str {
+    match direction {
+        ContextDirection::In => "in",
+        ContextDirection::Out => "out",
+        ContextDirection::Both => "both",
     }
 }
 
-fn expect_string(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<String, AutomationError> {
-    let index = column_index(columns, column)?;
-    match row.get(index) {
-        Some(RuntimeValue::String(value)) => Ok(value.clone()),
-        Some(other) => Err(AutomationError::new(
-            "context_contract",
-            format!("expected `{column}` to be a string, found {other:?}"),
-        )),
-        None => Err(AutomationError::new(
-            "context_contract",
-            format!("missing value for `{column}` in context result row"),
-        )),
+fn value_json_value(value: &Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(value) => JsonValue::Bool(*value),
+        Value::Int(value) => JsonValue::from(*value),
+        Value::Float(value) => {
+            if value.is_finite() {
+                JsonValue::from(*value)
+            } else {
+                JsonValue::from(value.to_string())
+            }
+        }
+        Value::String(value) => JsonValue::from(value.clone()),
+        Value::Bytes(value) => JsonValue::from(format!("{value:?}")),
+        Value::Datetime(value) => JsonValue::from(format!("{value:?}")),
+        Value::List(values) => JsonValue::array(values.iter().map(value_json_value)),
+        Value::Map(entries) => JsonValue::object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value_json_value(value))),
+        ),
     }
 }
 
-fn expect_string_list(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<Vec<String>, AutomationError> {
-    let index = column_index(columns, column)?;
-    match row.get(index) {
-        Some(RuntimeValue::List(values)) => values
+impl ContextRequestSummary {
+    fn from_request(request: &ContextRequest) -> Self {
+        Self {
+            depth: request.depth,
+            direction: request.direction,
+            edge_types: request.edge_types.clone(),
+            labels: request.labels.clone(),
+            max_nodes: request.max_nodes,
+            max_edges: request.max_edges,
+        }
+    }
+}
+
+impl ContextNode {
+    fn from_node(node: &crate::Node) -> Self {
+        let node_id = node.id().get() as i64;
+        let labels = node.labels().iter().cloned().collect::<Vec<_>>();
+        let properties = node
+            .properties()
             .iter()
-            .map(|value| match value {
-                RuntimeValue::String(value) => Ok(value.clone()),
-                other => Err(AutomationError::new(
-                    "context_contract",
-                    format!("expected `{column}` items to be strings, found {other:?}"),
-                )),
-            })
-            .collect(),
-        Some(other) => Err(AutomationError::new(
-            "context_contract",
-            format!("expected `{column}` to be a list, found {other:?}"),
-        )),
-        None => Err(AutomationError::new(
-            "context_contract",
-            format!("missing value for `{column}` in context result row"),
-        )),
+            .map(|(key, value)| (key.to_owned(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let name = string_property(&properties, "name");
+        let title = string_property(&properties, "title");
+        let src_path = string_property(&properties, "src.path");
+        let display = name
+            .clone()
+            .or_else(|| title.clone())
+            .or_else(|| src_path.clone());
+        let mut evidence = Vec::new();
+        for field in ["name", "title", "src.path"] {
+            if let Some(value) = string_property(&properties, field) {
+                evidence.push(ContextEvidence {
+                    field: field.to_owned(),
+                    value,
+                    source: format!("property:{field}"),
+                });
+            }
+        }
+        if !labels.is_empty() {
+            evidence.push(ContextEvidence {
+                field: "labels".to_owned(),
+                value: labels.join(","),
+                source: "labels(n)".to_owned(),
+            });
+        }
+
+        Self {
+            node_id,
+            labels,
+            properties,
+            name,
+            title,
+            display,
+            evidence,
+        }
     }
 }
 
-fn optional_string(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<Option<String>, AutomationError> {
-    let index = column_index(columns, column)?;
-    match row.get(index) {
-        Some(RuntimeValue::Null) => Ok(None),
-        Some(RuntimeValue::String(value)) => Ok(Some(value.clone())),
-        Some(other) => Err(AutomationError::new(
-            "context_contract",
-            format!("expected `{column}` to be a string or null, found {other:?}"),
-        )),
-        None => Err(AutomationError::new(
-            "context_contract",
-            format!("missing value for `{column}` in context result row"),
-        )),
+impl ContextEdge {
+    fn from_edge(edge: &crate::Edge) -> Self {
+        Self {
+            from_node_id: edge.from().get() as i64,
+            to_node_id: edge.to().get() as i64,
+            edge_type: edge.edge_type().to_owned(),
+            properties: edge
+                .properties()
+                .iter()
+                .map(|(key, value)| (key.to_owned(), value.clone()))
+                .collect(),
+        }
+    }
+}
+
+fn string_property(properties: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+    match properties.get(key) {
+        Some(Value::String(value)) => Some(value.clone()),
+        _ => None,
     }
 }
 
@@ -672,9 +741,9 @@ mod tests {
 
         assert_eq!(
             response
-                .items
+                .nodes
                 .iter()
-                .map(|item| item.node_id)
+                .map(|node| node.node_id)
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
@@ -684,24 +753,7 @@ mod tests {
 
     #[test]
     fn builds_context_envelope_with_budgets_and_evidence() {
-        let result = QueryResult {
-            columns: vec![
-                "node_id".to_owned(),
-                "labels".to_owned(),
-                "name".to_owned(),
-                "title".to_owned(),
-                "src_path".to_owned(),
-            ],
-            rows: vec![vec![
-                RuntimeValue::Int(7),
-                RuntimeValue::List(vec![RuntimeValue::String("Person".to_owned())]),
-                RuntimeValue::String("Ada".to_owned()),
-                RuntimeValue::Null,
-                RuntimeValue::Null,
-            ]],
-        };
-
-        let node = parse_context_node(&result.columns, &result.rows[0]).unwrap();
+        let node = node(7, &["Person"], Some("Ada"));
         let graph = ContextGraph {
             nodes: BTreeMap::from([(node.node_id, node)]),
             edges: Vec::new(),
@@ -722,17 +774,20 @@ mod tests {
             build_context_response(Path::new("/tmp/test.cupld"), &request, graph).unwrap();
 
         assert_eq!(envelope.policy.retrieval_budget.unwrap().nodes, 5);
-        assert_eq!(envelope.items[0].display.as_deref(), Some("Ada"));
+        assert_eq!(envelope.mode, "seeded");
+        assert_eq!(envelope.nodes[0].display.as_deref(), Some("Ada"));
         assert!(
-            envelope.items[0]
+            envelope.nodes[0]
                 .evidence
                 .iter()
                 .any(|evidence| evidence.field == "name")
         );
 
         let parsed = json::parse(&context_as_json(&envelope)).unwrap();
+        assert!(parsed.get("items").is_none());
+        assert!(parsed.get("snippets").is_none());
         assert_eq!(
-            parsed.get("items").unwrap().as_array().unwrap()[0]
+            parsed.get("nodes").unwrap().as_array().unwrap()[0]
                 .get("node_id")
                 .unwrap()
                 .as_i64(),
@@ -741,13 +796,26 @@ mod tests {
     }
 
     fn node(id: i64, labels: &[&str], name: Option<&str>) -> ContextNode {
+        let properties = name
+            .map(|name| BTreeMap::from([("name".to_owned(), Value::from(name))]))
+            .unwrap_or_default();
+        let evidence = name
+            .map(|name| {
+                vec![ContextEvidence {
+                    field: "name".to_owned(),
+                    value: name.to_owned(),
+                    source: "property:name".to_owned(),
+                }]
+            })
+            .unwrap_or_default();
         ContextNode {
             node_id: id,
             labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            properties,
             name: name.map(str::to_owned),
             title: None,
             display: name.map(str::to_owned),
-            evidence: Vec::new(),
+            evidence,
         }
     }
 
@@ -756,6 +824,7 @@ mod tests {
             from_node_id,
             to_node_id,
             edge_type: edge_type.to_owned(),
+            properties: BTreeMap::new(),
         }
     }
 }
