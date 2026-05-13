@@ -18,7 +18,7 @@ use cupld::{
     },
     configured_markdown_root,
     context::{
-        ContextDirection, ContextRequest, context_as_json, context_as_ndjson,
+        ContextDirection, ContextRequest, ContextSeed, context_as_json, context_as_ndjson,
         context_as_query_result,
     },
     json, markdown_alias_diagnostics,
@@ -708,6 +708,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
     let mut output = OutputFormat::Json;
     let mut nodes = Vec::new();
     let mut paths = Vec::new();
+    let mut seeds = Vec::new();
     let mut depth = 1u8;
     let mut direction = ContextDirection::Both;
     let mut edge_types = Vec::new();
@@ -748,6 +749,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
                         .parse::<usize>()
                         .map_err(|_| "expected --node <id> for `context` command".to_owned())?,
                 );
+                seeds.push(ContextSeed::Node(*nodes.last().unwrap()));
                 index += 2;
             }
             "--path" => {
@@ -755,6 +757,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
                     return Err("expected --path <src.path> for `context` command".to_owned());
                 };
                 paths.push(value.to_owned());
+                seeds.push(ContextSeed::Path(value.to_owned()));
                 index += 2;
             }
             "--depth" => {
@@ -833,6 +836,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
             db_path,
             nodes,
             paths,
+            seeds,
             depth,
             direction,
             edge_types,
@@ -3004,7 +3008,7 @@ mod tests {
         result_as_ndjson, should_offer_skill_install_prompt, table_value, version_text,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
-    use cupld::context::{ContextDirection, ContextRequest};
+    use cupld::context::{ContextDirection, ContextRequest, ContextSeed};
     use cupld::{MAX_TRAVERSAL_DEPTH, QueryResult, RuntimeValue, Value, json};
     use std::path::PathBuf;
 
@@ -3178,6 +3182,7 @@ mod tests {
                     db_path: PathBuf::from("db.cupld"),
                     nodes: vec![42],
                     paths: Vec::new(),
+                    seeds: vec![ContextSeed::Node(42)],
                     depth: 1,
                     direction: ContextDirection::Both,
                     edge_types: Vec::new(),
@@ -3226,6 +3231,12 @@ mod tests {
                     db_path: PathBuf::from("db.cupld"),
                     nodes: vec![7, 8],
                     paths: vec!["notes/a.md".to_owned(), "notes/b.md".to_owned()],
+                    seeds: vec![
+                        ContextSeed::Node(7),
+                        ContextSeed::Node(8),
+                        ContextSeed::Path("notes/a.md".to_owned()),
+                        ContextSeed::Path("notes/b.md".to_owned()),
+                    ],
                     depth: 3,
                     direction: ContextDirection::Out,
                     edge_types: vec!["LINKS_TO".to_owned(), "MENTIONS".to_owned()],
@@ -3253,6 +3264,7 @@ mod tests {
                     db_path: default_alias_db_path(),
                     nodes: Vec::new(),
                     paths: vec!["notes/a.md".to_owned()],
+                    seeds: vec![ContextSeed::Path("notes/a.md".to_owned())],
                     depth: 1,
                     direction: ContextDirection::Both,
                     edge_types: Vec::new(),

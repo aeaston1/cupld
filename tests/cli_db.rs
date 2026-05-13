@@ -390,6 +390,165 @@ fn cli_context_ndjson_outputs_budgeted_contract() {
 }
 
 #[test]
+fn cli_context_resolves_node_and_path_seeds_in_request_order() {
+    let db = TestDb::new("cli_context_seed_order");
+    let mut session = db.open();
+    run(&mut session, "CREATE (:Person {name: 'Ada'})");
+    run(
+        &mut session,
+        "CREATE (:MarkdownDocument {`src.path`: 'projects/foo.md', `src.status`: 'current', name: 'Foo'})",
+    );
+    let node_rows = run(&mut session, "MATCH (n:Person {name: 'Ada'}) RETURN id(n)");
+    let ada_id = match &node_rows.rows[0][0] {
+        RuntimeValue::Int(value) => *value,
+        other => panic!("expected Ada node id, found {other:?}"),
+    };
+    drop(session);
+
+    let output = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--path",
+        "projects/foo.md",
+        "--node",
+        &ada_id.to_string(),
+        "--depth",
+        "0",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    let items = parsed
+        .get("items")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item
+                .get("display")
+                .and_then(json::JsonValue::as_str)
+                .unwrap())
+            .collect::<Vec<_>>(),
+        vec!["Foo", "Ada"]
+    );
+}
+
+#[test]
+fn cli_context_fails_missing_node_and_path_seeds() {
+    let db = TestDb::new("cli_context_missing_seeds");
+
+    let missing_node = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--node",
+        "999",
+    ]);
+    assert!(!missing_node.status.success());
+    let stderr = String::from_utf8(missing_node.stderr).unwrap();
+    let parsed = json::parse(&stderr).unwrap();
+    assert_eq!(
+        parsed
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(json::JsonValue::as_str),
+        Some("context_seed_not_found")
+    );
+
+    let missing_path = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--path",
+        "projects/missing.md",
+    ]);
+    assert!(!missing_path.status.success());
+    let stderr = String::from_utf8(missing_path.stderr).unwrap();
+    let parsed = json::parse(&stderr).unwrap();
+    assert_eq!(
+        parsed
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(json::JsonValue::as_str),
+        Some("context_seed_path_not_found")
+    );
+}
+
+#[test]
+fn cli_context_handles_duplicate_ambiguous_and_stale_path_seeds() {
+    let db = TestDb::new("cli_context_path_resolution");
+    let mut session = db.open();
+    for statement in [
+        "CREATE (:MarkdownDocument {`src.path`: 'projects/foo.md', `src.status`: 'missing', name: 'Old Foo'})",
+        "CREATE (:MarkdownDocument {`src.path`: 'projects/foo.md', `src.status`: 'current', name: 'Current Foo'})",
+        "CREATE (:MarkdownDocument {`src.path`: 'projects/ambiguous.md', `src.status`: 'current', name: 'A'})",
+        "CREATE (:MarkdownDocument {`src.path`: 'projects/ambiguous.md', `src.status`: 'current', name: 'B'})",
+        "CREATE (:MarkdownDocument {`src.path`: 'projects/stale.md', `src.status`: 'missing', name: 'Stale'})",
+        "CREATE (:MarkdownDocument {`src.path`: 'projects/no-status.md', name: 'No Status'})",
+    ] {
+        run(&mut session, statement);
+    }
+    drop(session);
+
+    let resolved = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--path",
+        "projects/foo.md",
+        "--path",
+        "projects/foo.md",
+        "--path",
+        "projects/stale.md",
+        "--path",
+        "projects/no-status.md",
+        "--depth",
+        "0",
+    ]);
+    assert!(resolved.status.success());
+    let stdout = String::from_utf8(resolved.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    let items = parsed
+        .get("items")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    assert_eq!(items.len(), 3);
+    let warnings = parsed
+        .get("warnings")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    let warning_codes = warnings
+        .iter()
+        .filter_map(|warning| warning.get("code").and_then(json::JsonValue::as_str))
+        .collect::<Vec<_>>();
+    assert!(warning_codes.contains(&"context_seed_path_multiple_matches"));
+    assert!(warning_codes.contains(&"context_seed_duplicate"));
+    assert!(warning_codes.contains(&"context_seed_source_stale"));
+    assert!(warning_codes.contains(&"context_seed_source_missing"));
+
+    let ambiguous = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--path",
+        "projects/ambiguous.md",
+    ]);
+    assert!(!ambiguous.status.success());
+    let stderr = String::from_utf8(ambiguous.stderr).unwrap();
+    let parsed = json::parse(&stderr).unwrap();
+    assert_eq!(
+        parsed
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(json::JsonValue::as_str),
+        Some("context_seed_path_ambiguous")
+    );
+}
+
+#[test]
 fn cli_schema_prints_generated_schema() {
     let db = TestDb::new("cli_schema");
     let mut session = db.open();
