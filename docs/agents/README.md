@@ -11,6 +11,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `cupld install` to install or refresh the bundled `cupld-md-memory` skill and bootstrap local memory. The default DB path is `./.cupld/default.cupld` and the default markdown root is `./.cupld/data/`.
 - Use `--db default` to target `./.cupld/default.cupld`.
 - Use `cupld query --db <path.cupld|default> ...` for one-shot automation and `cupld context --db <path.cupld|default> --node <id>|--path <src.path> ...` for seeded context rows.
+- Use `cupld query` for global node listings. `cupld context` no longer supports legacy global top-k retrieval; it requires explicit node ID or markdown path seeds.
 - Use `cupld mcp serve --db <path.cupld|default>` for MCP-capable harnesses that can call local memory tools over stdio.
 - Use `cupld query --db ... --with-md` for transient markdown overlay reads.
 - Use `cupld sync markdown --db ...` to persist markdown and `cupld sync markdown --db ... --watch` to keep syncing after the initial run.
@@ -54,6 +55,32 @@ Important constraints:
 - `install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in user config `install-state.toml`.
 - If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
 - `mcp serve` is a single-threaded stdio server. It emits MCP JSON-RPC on stdout only and writes diagnostics to stderr.
+
+## Query, Search, And Context
+
+Use `cupld query` when you need exact graph reads, global listings, schema-driven inspection, or deterministic node discovery:
+
+```bash
+cupld query --db default 'MATCH (n) RETURN id(n), labels(n), n.name, n.`src.path` ORDER BY id(n) LIMIT 25'
+```
+
+Use `cupld context` after you already know the seed node ID or synced markdown path. Table output is compact and human-facing, with rows for seeds, nodes, and edges:
+
+```bash
+cupld context --db default --node 42 --depth 1 --output table
+cupld context --db default --path notes/example.md --depth 2 --max-nodes 25 --output table
+```
+
+For automation, prefer JSON or NDJSON. Those are the canonical contracts for seeded context:
+
+```bash
+cupld context --db default --node 42 --depth 1 --output json
+cupld context --db default --path notes/example.md --depth 2 --output ndjson
+```
+
+The hard cutover from legacy global top-k context is complete. `cupld context --top-k ...` is rejected with `context_legacy_top_k_removed`, and `cupld context` without `--node` or `--path` is rejected with `context_seed_required`.
+
+`search` is not a shipped CLI command yet. Snippets, semantic search, and query-aware scoring are future work, so agents should not rely on `context` as a semantic retriever.
 
 ## MCP Memory
 

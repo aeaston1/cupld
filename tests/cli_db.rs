@@ -450,6 +450,36 @@ fn cli_context_ndjson_outputs_budgeted_contract() {
 }
 
 #[test]
+fn cli_context_table_outputs_seed_node_and_edge_rows() {
+    let db = TestDb::new("cli_context_table_seeded");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+    drop(session);
+
+    let output = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "table",
+        "--node",
+        "1",
+        "--direction",
+        "out",
+        "--depth",
+        "1",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("row       | depth | id | labels/type | display | source | target"));
+    assert!(stdout.contains("seed:node | 0     | 1  | node        | 1"));
+    assert!(stdout.contains("node      | 0     | 1  | Person      | Ada"));
+    assert!(stdout.contains("node      | 1     | 2  | Person      | Grace"));
+    assert!(stdout.contains("edge      | 1     | 1  | KNOWS       | out     | 1      | 2"));
+}
+
+#[test]
 fn cli_context_json_outputs_seeded_golden_contract() {
     let db = TestDb::new("cli_context_json_seeded");
     let mut session = db.open();
