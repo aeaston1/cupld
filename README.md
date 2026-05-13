@@ -168,6 +168,26 @@ The interactive installer asks for a skill location, DB path, and markdown root.
 Repo-local package settings live in `.cupld/config.toml`. `install` and markdown-aware commands use it as the workspace default for DB path and markdown root.
 Use `[markdown] include_fs_graph = true` to enable filesystem graph sync for `cupld sync markdown` by default.
 
+## Development
+
+Run the Rust test suite from a checkout:
+
+```bash
+cargo test --locked
+```
+
+Run the default deterministic memory eval suite against committed fixtures and snapshots:
+
+```bash
+cargo run --locked -- eval memory --ci
+```
+
+The CI memory eval command uses `tests/fixtures/memory` by default, does not update snapshots, does not enter watch mode, and reports concise drift failures with fixture, case, assertion, expected, actual, and diff fields. To refresh snapshots intentionally during local fixture work, run:
+
+```bash
+cargo run --locked -- eval memory --update-snapshots
+```
+
 ## Documentation
 
 - Docs index: [`docs/README.md`](./docs/README.md)

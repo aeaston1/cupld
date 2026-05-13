@@ -359,6 +359,7 @@ struct MemoryEvalConfig {
     case: Option<String>,
     output: OutputFormat,
     update_snapshots: bool,
+    ci: bool,
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
@@ -632,7 +633,7 @@ fn parse_eval_command(args: &[String]) -> Result<CliCommand, String> {
             cli_usage_text()
         )),
         None => Err(format!(
-            "error: expected `eval memory [--fixtures <path>] [--case <name>] [--output <json|ndjson|table>] [--update-snapshots>`\n\n{}",
+            "error: expected `eval memory [--fixtures <path>] [--case <name>] [--output <json|ndjson|table>] [--ci] [--update-snapshots>`\n\n{}",
             cli_usage_text()
         )),
     }
@@ -643,6 +644,7 @@ fn parse_eval_memory_command(args: &[String]) -> Result<CliCommand, String> {
     let mut case = None;
     let mut output = OutputFormat::Table;
     let mut update_snapshots = false;
+    let mut ci = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -684,6 +686,13 @@ fn parse_eval_memory_command(args: &[String]) -> Result<CliCommand, String> {
                 update_snapshots = true;
                 index += 1;
             }
+            "--ci" => {
+                if ci {
+                    return Err("duplicate option `--ci`".to_owned());
+                }
+                ci = true;
+                index += 1;
+            }
             value if value.starts_with('-') => {
                 return Err(format!(
                     "error: unknown option `{value}`\n\n{}",
@@ -699,11 +708,16 @@ fn parse_eval_memory_command(args: &[String]) -> Result<CliCommand, String> {
         }
     }
 
+    if ci && update_snapshots {
+        return Err("`eval memory --ci` must not be combined with `--update-snapshots`".to_owned());
+    }
+
     Ok(CliCommand::EvalMemory(MemoryEvalConfig {
         fixtures: fixtures.unwrap_or_else(|| PathBuf::from("tests/fixtures/memory")),
         case,
         output,
         update_snapshots,
+        ci,
     }))
 }
 
@@ -1534,6 +1548,7 @@ Commands:
   --max-edges             Maximum context edges to traverse.
   --fixtures              Fixture directory for `eval memory`; defaults to tests/fixtures/memory.
   --case                  Restrict `eval memory` to one fixture case.
+  --ci                    Print concise PR-friendly failures for `eval memory`.
   --update-snapshots      Update `eval memory` snapshots.
   --output                Select output mode for query/context/memory/eval memory: table, json, ndjson.
   --params-json           Provide named query parameters as a JSON object.
@@ -1638,14 +1653,18 @@ fn run_eval_memory(config: MemoryEvalConfig) -> Result<(), String> {
         case: config.case,
         update_snapshots: config.update_snapshots,
     })?;
-    match config.output {
-        OutputFormat::Table => {
-            print!("{}", memory_eval::report_as_table(&report));
-        }
-        OutputFormat::Json => println!("{}", memory_eval::report_as_json(&report)),
-        OutputFormat::Ndjson => {
-            for line in memory_eval::report_as_ndjson(&report) {
-                println!("{line}");
+    if config.ci {
+        print!("{}", memory_eval::report_as_ci(&report));
+    } else {
+        match config.output {
+            OutputFormat::Table => {
+                print!("{}", memory_eval::report_as_table(&report));
+            }
+            OutputFormat::Json => println!("{}", memory_eval::report_as_json(&report)),
+            OutputFormat::Ndjson => {
+                for line in memory_eval::report_as_ndjson(&report) {
+                    println!("{line}");
+                }
             }
         }
     }
@@ -3996,6 +4015,7 @@ mod tests {
                 case: None,
                 output: OutputFormat::Json,
                 update_snapshots: false,
+                ci: false,
             }))
         );
 
@@ -4013,6 +4033,7 @@ mod tests {
                 case: Some("aliases".to_owned()),
                 output: OutputFormat::Ndjson,
                 update_snapshots: false,
+                ci: false,
             }))
         );
 
@@ -4027,6 +4048,18 @@ mod tests {
                 case: None,
                 output: OutputFormat::Table,
                 update_snapshots: true,
+                ci: false,
+            }))
+        );
+
+        assert_eq!(
+            parse_cli_command(&["eval".to_owned(), "memory".to_owned(), "--ci".to_owned(),]),
+            Ok(CliCommand::EvalMemory(MemoryEvalConfig {
+                fixtures: PathBuf::from("tests/fixtures/memory"),
+                case: None,
+                output: OutputFormat::Table,
+                update_snapshots: false,
+                ci: true,
             }))
         );
     }
@@ -4048,6 +4081,15 @@ mod tests {
                 "--fixtures".to_owned(),
             ]),
             Err("expected --fixtures <path> for `eval memory` command".to_owned())
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "eval".to_owned(),
+                "memory".to_owned(),
+                "--ci".to_owned(),
+                "--update-snapshots".to_owned(),
+            ]),
+            Err("`eval memory --ci` must not be combined with `--update-snapshots`".to_owned())
         );
         assert!(matches!(
             parse_cli_command(&["eval".to_owned(), "context".to_owned()]),
