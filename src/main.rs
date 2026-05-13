@@ -201,6 +201,7 @@ fn run() -> Result<(), String> {
             query_args: &query_args,
         }),
         CliCommand::Context { output, request } => run_context(output, request),
+        CliCommand::EvalMemory(config) => run_eval_memory(config),
         CliCommand::Schema { db_path } => run_schema(&db_path),
         CliCommand::Compact { db_path } => run_compact(db_path),
         CliCommand::Check { db_path } => run_check(db_path),
@@ -274,6 +275,7 @@ enum CliCommand {
         output: OutputFormat,
         request: ContextRequest,
     },
+    EvalMemory(MemoryEvalConfig),
     Schema {
         db_path: PathBuf,
     },
@@ -350,6 +352,14 @@ struct MemoryOptionSpec {
     allow_strict: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct MemoryEvalConfig {
+    fixtures: PathBuf,
+    case: Option<String>,
+    output: OutputFormat,
+    update_snapshots: bool,
+}
+
 fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
     match args.first().map(String::as_str) {
         Some("help") | Some("-h") | Some("--help") => {
@@ -376,6 +386,7 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
         }
         Some("query") => parse_query_command(&args[1..]),
         Some("context") => parse_context_command(&args[1..]),
+        Some("eval") => parse_eval_command(&args[1..]),
         Some("schema") => {
             ensure_subcommand_has_no_option(&args[1..], "schema", "--visualise")?;
             ensure_subcommand_has_no_option(&args[1..], "schema", "--query")?;
@@ -603,6 +614,96 @@ impl MemoryAction {
             Self::Reindex => "reindex",
         }
     }
+}
+
+fn parse_eval_command(args: &[String]) -> Result<CliCommand, String> {
+    ensure_subcommand_has_no_option(args, "eval", "--visualise")?;
+    ensure_subcommand_has_no_option(args, "eval", "--query")?;
+
+    match args.first().map(String::as_str) {
+        Some("memory") => parse_eval_memory_command(&args[1..]),
+        Some(value) if value.starts_with('-') => Err(format!(
+            "error: expected eval subcommand before option `{value}`\n\n{}",
+            cli_usage_text()
+        )),
+        Some(value) => Err(format!(
+            "error: unknown eval subcommand `{value}`; expected memory\n\n{}",
+            cli_usage_text()
+        )),
+        None => Err(format!(
+            "error: expected `eval memory [--fixtures <path>] [--case <name>] [--output <json|ndjson|table>] [--update-snapshots>`\n\n{}",
+            cli_usage_text()
+        )),
+    }
+}
+
+fn parse_eval_memory_command(args: &[String]) -> Result<CliCommand, String> {
+    let mut fixtures = None;
+    let mut case = None;
+    let mut output = OutputFormat::Table;
+    let mut update_snapshots = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--fixtures" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("expected --fixtures <path> for `eval memory` command".to_owned());
+                };
+                if fixtures.is_some() {
+                    return Err("duplicate option `--fixtures`".to_owned());
+                }
+                fixtures = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--case" => {
+                let Some(name) = args.get(index + 1) else {
+                    return Err("expected --case <name> for `eval memory` command".to_owned());
+                };
+                if case.is_some() {
+                    return Err("duplicate option `--case`".to_owned());
+                }
+                case = Some(name.clone());
+                index += 2;
+            }
+            "--output" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(
+                        "expected --output <table|json|ndjson> for `eval memory` command"
+                            .to_owned(),
+                    );
+                };
+                output = parse_output_format(value)?;
+                index += 2;
+            }
+            "--update-snapshots" => {
+                if update_snapshots {
+                    return Err("duplicate option `--update-snapshots`".to_owned());
+                }
+                update_snapshots = true;
+                index += 1;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!(
+                    "error: unknown option `{value}`\n\n{}",
+                    cli_usage_text()
+                ));
+            }
+            value => {
+                return Err(format!(
+                    "error: unexpected argument `{value}`\n\n{}",
+                    cli_usage_text()
+                ));
+            }
+        }
+    }
+
+    Ok(CliCommand::EvalMemory(MemoryEvalConfig {
+        fixtures: fixtures.unwrap_or_else(|| PathBuf::from("tests/fixtures/memory")),
+        case,
+        output,
+        update_snapshots,
+    }))
 }
 
 fn resolve_default_db_alias() -> Result<PathBuf, String> {
@@ -1412,6 +1513,7 @@ Commands:
   --query                 Seed the scene with one read-only RETURN query.
   query                   Run a query against --db using inline text or stdin.
   context                 Build compact seeded context rows for agent prompts.
+  eval memory             Run deterministic markdown memory eval fixtures.
   --with-md               Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
   --include-fs-graph      Persist markdown directory nodes and filesystem structural edges during `sync markdown`.
@@ -1429,7 +1531,10 @@ Commands:
   --label                 Restrict `context` nodes to a label; repeatable.
   --max-nodes             Maximum context nodes to return.
   --max-edges             Maximum context edges to traverse.
-  --output                Select output mode for query/context/memory: table, json, ndjson.
+  --fixtures              Fixture directory for `eval memory`; defaults to tests/fixtures/memory.
+  --case                  Restrict `eval memory` to one fixture case.
+  --update-snapshots      Update `eval memory` snapshots.
+  --output                Select output mode for query/context/memory/eval memory: table, json, ndjson.
   --params-json           Provide named query parameters as a JSON object.
   --params-file           Read named query parameters from a JSON file.
   --max-rows              Hard cap result rows in non-interactive query mode.
@@ -1522,6 +1627,69 @@ fn run_context(output: OutputFormat, request: ContextRequest) -> Result<(), Stri
                 println!("{line}");
             }
         }
+    }
+    Ok(())
+}
+
+fn run_eval_memory(config: MemoryEvalConfig) -> Result<(), String> {
+    match config.output {
+        OutputFormat::Table => {
+            println!("fixtures | case | update_snapshots | status");
+            println!("---------+------+------------------+--------");
+            println!(
+                "{} | {} | {} | parsed",
+                config.fixtures.display(),
+                config.case.as_deref().unwrap_or("*"),
+                config.update_snapshots
+            );
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            json::stringify(&json::JsonValue::object([
+                ("ok", json::JsonValue::from(true)),
+                ("command", json::JsonValue::from("eval memory")),
+                (
+                    "fixtures",
+                    json::JsonValue::from(config.fixtures.display().to_string()),
+                ),
+                (
+                    "case",
+                    config
+                        .case
+                        .as_deref()
+                        .map(json::JsonValue::from)
+                        .unwrap_or(json::JsonValue::Null),
+                ),
+                (
+                    "update_snapshots",
+                    json::JsonValue::from(config.update_snapshots),
+                ),
+                ("results", json::JsonValue::array([])),
+            ]))
+        ),
+        OutputFormat::Ndjson => println!(
+            "{}",
+            json::stringify(&json::JsonValue::object([
+                ("kind", json::JsonValue::from("eval_memory_meta")),
+                ("ok", json::JsonValue::from(true)),
+                (
+                    "fixtures",
+                    json::JsonValue::from(config.fixtures.display().to_string()),
+                ),
+                (
+                    "case",
+                    config
+                        .case
+                        .as_deref()
+                        .map(json::JsonValue::from)
+                        .unwrap_or(json::JsonValue::Null),
+                ),
+                (
+                    "update_snapshots",
+                    json::JsonValue::from(config.update_snapshots),
+                ),
+            ]))
+        ),
     }
     Ok(())
 }
@@ -1645,7 +1813,11 @@ impl CliCommand {
             | Self::McpServe { db_path: path, .. } => Some(path),
             Self::Context { request, .. } => Some(&request.db_path),
             Self::Memory(command) => command.db_path_for_upgrade_hint(),
-            Self::Help | Self::Version | Self::ReplMemory | Self::Install(_) => None,
+            Self::Help
+            | Self::Version
+            | Self::ReplMemory
+            | Self::EvalMemory(_)
+            | Self::Install(_) => None,
         }
     }
 }
@@ -3383,7 +3555,7 @@ fn value_string(value: &RuntimeValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, InputEvent, LatestReleaseInfo, MemoryCommand, OutputFormat,
+        CliCommand, InputEvent, LatestReleaseInfo, MemoryCommand, MemoryEvalConfig, OutputFormat,
         RELEASE_CHECK_INTERVAL_SECS, ReplInput, cap_results, cli_usage_text, format_error_json,
         is_newer_semver, parse_cli_command, parse_latest_release_response, parse_params_json,
         parse_semver, read_release_check_cache, result_as_json, result_as_ndjson,
@@ -3844,6 +4016,90 @@ mod tests {
                 "context_depth_above_max: --depth must be <= {MAX_TRAVERSAL_DEPTH}"
             ))
         );
+    }
+
+    #[test]
+    fn parses_eval_memory_command_forms() {
+        assert_eq!(
+            parse_cli_command(&[
+                "eval".to_owned(),
+                "memory".to_owned(),
+                "--fixtures".to_owned(),
+                "tests/fixtures/memory".to_owned(),
+                "--output".to_owned(),
+                "json".to_owned(),
+            ]),
+            Ok(CliCommand::EvalMemory(MemoryEvalConfig {
+                fixtures: PathBuf::from("tests/fixtures/memory"),
+                case: None,
+                output: OutputFormat::Json,
+                update_snapshots: false,
+            }))
+        );
+
+        assert_eq!(
+            parse_cli_command(&[
+                "eval".to_owned(),
+                "memory".to_owned(),
+                "--case".to_owned(),
+                "aliases".to_owned(),
+                "--output".to_owned(),
+                "ndjson".to_owned(),
+            ]),
+            Ok(CliCommand::EvalMemory(MemoryEvalConfig {
+                fixtures: PathBuf::from("tests/fixtures/memory"),
+                case: Some("aliases".to_owned()),
+                output: OutputFormat::Ndjson,
+                update_snapshots: false,
+            }))
+        );
+
+        assert_eq!(
+            parse_cli_command(&[
+                "eval".to_owned(),
+                "memory".to_owned(),
+                "--update-snapshots".to_owned(),
+            ]),
+            Ok(CliCommand::EvalMemory(MemoryEvalConfig {
+                fixtures: PathBuf::from("tests/fixtures/memory"),
+                case: None,
+                output: OutputFormat::Table,
+                update_snapshots: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_eval_memory_command_forms() {
+        assert!(matches!(
+            parse_cli_command(&[
+                "eval".to_owned(),
+                "memory".to_owned(),
+                "--unknown".to_owned(),
+            ]),
+            Err(error) if error.contains("unknown option `--unknown`")
+        ));
+        assert_eq!(
+            parse_cli_command(&[
+                "eval".to_owned(),
+                "memory".to_owned(),
+                "--fixtures".to_owned(),
+            ]),
+            Err("expected --fixtures <path> for `eval memory` command".to_owned())
+        );
+        assert!(matches!(
+            parse_cli_command(&["eval".to_owned(), "context".to_owned()]),
+            Err(error) if error.contains("unknown eval subcommand `context`")
+        ));
+        assert!(matches!(
+            parse_cli_command(&[
+                "eval".to_owned(),
+                "memory".to_owned(),
+                "--query".to_owned(),
+                "MATCH (n) RETURN n".to_owned(),
+            ]),
+            Err(error) if error.contains("top-level option")
+        ));
     }
 
     #[test]
