@@ -1,4 +1,32 @@
 {
+  "graph_citation_metadata": {
+    "source": "graph",
+    "entries": [
+      {
+        "path": "audit-source.md",
+        "metadata": {
+          "md.aliases": [],
+          "md.body": "# Audit Source\n\nThis note contains a claim whose source path, raw text, body text, and hash must remain available for auditability.\n",
+          "md.frontmatter": {
+            "title": "Audit Source",
+            "tags": ["audit", "source"]
+          },
+          "md.has_frontmatter": true,
+          "md.headings": ["Audit Source"],
+          "md.links": [],
+          "md.raw": "---\ntitle: Audit Source\ntags: [audit, source]\n---\n# Audit Source\n\nThis note contains a claim whose source path, raw text, body text, and hash must remain available for auditability.\n",
+          "md.tags": ["audit", "source"],
+          "md.title": "Audit Source",
+          "src.connector": "markdown",
+          "src.hash": "6e77e1b264425c38",
+          "src.kind": "document",
+          "src.path": "audit-source.md",
+          "src.status": "current"
+        }
+      }
+    ],
+    "failures": []
+  },
   "stable_metadata": [
     {
       "columns": ["col_1", "col_2", "col_3", "col_4", "col_5", "col_6"],
@@ -21,5 +49,48 @@
         ["audit-source.md", "Audit Source"]
       ]
     }
-  ]
+  ],
+  "query_citation_metadata": {
+    "source": "query",
+    "entries": [
+      {
+        "path": "audit-source.md",
+        "metadata": {
+          "md.title": "Audit Source",
+          "src.hash": "6e77e1b264425c38",
+          "src.path": "audit-source.md",
+          "src.status": "current"
+        }
+      }
+    ],
+    "failures": []
+  },
+  "context_citation_metadata": {
+    "source": "context",
+    "entries": [
+      {
+        "path": "audit-source.md",
+        "metadata": {
+          "md.aliases": [],
+          "md.body": "# Audit Source\n\nThis note contains a claim whose source path, raw text, body text, and hash must remain available for auditability.\n",
+          "md.frontmatter": {
+            "title": "Audit Source",
+            "tags": ["audit", "source"]
+          },
+          "md.has_frontmatter": true,
+          "md.headings": ["Audit Source"],
+          "md.links": [],
+          "md.raw": "---\ntitle: Audit Source\ntags: [audit, source]\n---\n# Audit Source\n\nThis note contains a claim whose source path, raw text, body text, and hash must remain available for auditability.\n",
+          "md.tags": ["audit", "source"],
+          "md.title": "Audit Source",
+          "src.connector": "markdown",
+          "src.hash": "6e77e1b264425c38",
+          "src.kind": "document",
+          "src.path": "audit-source.md",
+          "src.status": "current"
+        }
+      }
+    ],
+    "failures": []
+  }
 }

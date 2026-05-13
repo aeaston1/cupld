@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     CupldEngine, Edge, Node, PropertyMap, RuntimeValue, Session, Value,
+    context::{ContextDirection, ContextRequest, context_as_json},
     json::{self, JsonValue},
     sync_markdown_root,
 };
@@ -94,6 +95,7 @@ struct AssertionSpec {
     query: String,
     expected: JsonValue,
     snapshot_key: String,
+    options: BTreeMap<String, JsonValue>,
 }
 
 pub fn run(config: MemoryEvalConfig) -> Result<MemoryEvalReport, String> {
@@ -303,7 +305,7 @@ fn parse_assertion_spec(
     snapshot: Option<&[(String, JsonValue)]>,
 ) -> Result<AssertionSpec, String> {
     let assertion_type = required_string(value, "type")?;
-    let query = if assertion_type == "graph_snapshot" {
+    let query = if assertion_type == "graph_snapshot" || assertion_type == "citation_metadata" {
         value
             .get("query")
             .and_then(JsonValue::as_str)
@@ -326,12 +328,17 @@ fn parse_assertion_spec(
                 .map(|(_, value)| value.clone())
         })
         .or_else(|| value.get("expected").cloned())
+        .or_else(|| (assertion_type == "citation_metadata").then_some(JsonValue::Null))
         .ok_or_else(|| "assertion must contain expected".to_owned())?;
     Ok(AssertionSpec {
         assertion_type,
         query,
         expected,
         snapshot_key,
+        options: value
+            .as_object()
+            .map(|entries| entries.iter().cloned().collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -344,15 +351,34 @@ fn run_case(
     let db_path = sandbox.path.join("case.cupld");
     let mut engine = CupldEngine::default();
     let markdown_root = fixture.path.join("markdown");
+    let vault_before = fixture.path.join("vault-before");
+    let vault_after = fixture.path.join("vault-after");
     let mut warnings = Vec::new();
 
-    if markdown_root.exists() {
-        sync_markdown_root(&mut engine, &markdown_root).map_err(|error| {
+    if vault_before.exists() && vault_after.exists() {
+        let transition_root = sandbox.path.join("vault");
+        copy_dir_all(&vault_before, &transition_root).map_err(|error| {
             format!(
-                "failed to sync markdown for fixture `{}` case `{}`: {error}",
+                "failed to stage vault-before for fixture `{}` case `{}`: {error}",
                 fixture.name, case.name
             )
         })?;
+        sync_fixture_markdown_root(&mut engine, &transition_root, &fixture.name, &case.name)?;
+        fs::remove_dir_all(&transition_root).map_err(|error| {
+            format!(
+                "failed to clear staged vault for fixture `{}` case `{}`: {error}",
+                fixture.name, case.name
+            )
+        })?;
+        copy_dir_all(&vault_after, &transition_root).map_err(|error| {
+            format!(
+                "failed to stage vault-after for fixture `{}` case `{}`: {error}",
+                fixture.name, case.name
+            )
+        })?;
+        sync_fixture_markdown_root(&mut engine, &transition_root, &fixture.name, &case.name)?;
+    } else if markdown_root.exists() {
+        sync_fixture_markdown_root(&mut engine, &markdown_root, &fixture.name, &case.name)?;
     } else {
         warnings.push("fixture has no markdown directory".to_owned());
     }
@@ -375,7 +401,8 @@ fn run_case(
 
     let mut assertions = Vec::new();
     for assertion in &case.assertions {
-        let mut report = run_assertion(&mut session, &fixture.name, &case.name, assertion)?;
+        let mut report =
+            run_assertion(&mut session, &db_path, &fixture.name, &case.name, assertion)?;
         if update_snapshots {
             report.expected = report.actual.clone();
             report.status = EvalStatus::Pass;
@@ -436,14 +463,48 @@ fn write_case_snapshot(
     Ok(vec![case.snapshot_path.display().to_string()])
 }
 
+fn sync_fixture_markdown_root(
+    engine: &mut CupldEngine,
+    markdown_root: &Path,
+    fixture: &str,
+    case: &str,
+) -> Result<(), String> {
+    sync_markdown_root(engine, markdown_root).map_err(|error| {
+        format!(
+            "failed to sync markdown root `{}` for fixture `{fixture}` case `{case}`: {error}",
+            markdown_root.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
+}
+
 fn run_assertion(
     session: &mut Session,
+    db_path: &Path,
     fixture: &str,
     case: &str,
     assertion: &AssertionSpec,
 ) -> Result<MemoryEvalAssertionReport, String> {
     if assertion.assertion_type == "graph_snapshot" {
         return run_graph_snapshot_assertion(session, fixture, case, assertion);
+    }
+    if assertion.assertion_type == "citation_metadata" {
+        return run_citation_metadata_assertion(session, db_path, fixture, case, assertion);
     }
 
     let results = session
@@ -467,6 +528,93 @@ fn run_assertion(
         actual,
         status,
         diff,
+    })
+}
+
+fn run_citation_metadata_assertion(
+    session: &mut Session,
+    db_path: &Path,
+    fixture: &str,
+    case: &str,
+    assertion: &AssertionSpec,
+) -> Result<MemoryEvalAssertionReport, String> {
+    let source =
+        assertion_option_string(assertion, "source")?.unwrap_or_else(|| "query".to_owned());
+    let required_fields = assertion_option_string_array(assertion, "required_fields")?
+        .unwrap_or_else(|| {
+            vec![
+                "src.path".to_owned(),
+                "src.status".to_owned(),
+                "src.hash".to_owned(),
+            ]
+        });
+    let path_fields = assertion_option_string_array(assertion, "path_fields")?
+        .unwrap_or_else(|| vec!["src.path".to_owned()]);
+    let hash_fields = assertion_option_string_array(assertion, "hash_fields")?
+        .unwrap_or_else(|| vec!["src.hash".to_owned()]);
+
+    let entries = match source.as_str() {
+        "graph" => citation_entries_from_graph(session.engine()),
+        "query" => citation_entries_from_query(session, fixture, case, assertion)?,
+        "context" => citation_entries_from_context(session, db_path, fixture, case, assertion)?,
+        other => {
+            return Err(format!(
+                "invalid citation_metadata source `{other}` for fixture `{fixture}` case `{case}`"
+            ));
+        }
+    };
+    let failures = citation_metadata_failures(
+        fixture,
+        case,
+        &entries,
+        &required_fields,
+        &path_fields,
+        &hash_fields,
+    );
+    let status = if failures.is_empty() {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let actual = JsonValue::object([
+        ("source", JsonValue::from(source)),
+        (
+            "entries",
+            JsonValue::array(entries.iter().map(CitationMetadataEntry::as_json)),
+        ),
+        (
+            "failures",
+            JsonValue::array(failures.iter().map(CitationMetadataFailure::as_json)),
+        ),
+    ]);
+
+    Ok(MemoryEvalAssertionReport {
+        fixture: fixture.to_owned(),
+        case: case.to_owned(),
+        assertion_type: assertion.assertion_type.clone(),
+        expected: JsonValue::object([
+            (
+                "required_fields",
+                JsonValue::array(required_fields.iter().cloned().map(JsonValue::from)),
+            ),
+            (
+                "path_fields",
+                JsonValue::array(path_fields.iter().cloned().map(JsonValue::from)),
+            ),
+            (
+                "hash_fields",
+                JsonValue::array(hash_fields.iter().cloned().map(JsonValue::from)),
+            ),
+        ]),
+        actual,
+        status,
+        diff: (status == EvalStatus::Fail).then(|| {
+            failures
+                .iter()
+                .map(CitationMetadataFailure::as_diff)
+                .collect::<Vec<_>>()
+                .join("; ")
+        }),
     })
 }
 
@@ -496,6 +644,287 @@ fn run_graph_snapshot_assertion(
         status,
         diff: (status == EvalStatus::Fail).then(|| diff.join("; ")),
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CitationMetadataEntry {
+    path: String,
+    metadata: BTreeMap<String, JsonValue>,
+}
+
+impl CitationMetadataEntry {
+    fn as_json(&self) -> JsonValue {
+        JsonValue::object([
+            ("path", JsonValue::from(self.path.clone())),
+            (
+                "metadata",
+                JsonValue::object(
+                    self.metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                ),
+            ),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CitationMetadataFailure {
+    fixture: String,
+    case: String,
+    path: String,
+    missing_field: String,
+    actual: JsonValue,
+}
+
+impl CitationMetadataFailure {
+    fn as_json(&self) -> JsonValue {
+        JsonValue::object([
+            ("fixture", JsonValue::from(self.fixture.clone())),
+            ("case", JsonValue::from(self.case.clone())),
+            ("path", JsonValue::from(self.path.clone())),
+            ("missing_field", JsonValue::from(self.missing_field.clone())),
+            ("actual", self.actual.clone()),
+        ])
+    }
+
+    fn as_diff(&self) -> String {
+        format!(
+            "fixture `{}` case `{}` path `{}` missing `{}` actual {}",
+            self.fixture,
+            self.case,
+            self.path,
+            self.missing_field,
+            json::stringify(&self.actual)
+        )
+    }
+}
+
+fn citation_entries_from_graph(engine: &CupldEngine) -> Vec<CitationMetadataEntry> {
+    engine
+        .nodes()
+        .filter(|node| node.labels().contains("MarkdownDocument"))
+        .filter_map(|node| {
+            let metadata = normalized_properties(node.properties());
+            citation_path(&metadata, &["src.path".to_owned()])
+                .map(|path| CitationMetadataEntry { path, metadata })
+        })
+        .collect()
+}
+
+fn citation_entries_from_query(
+    session: &mut Session,
+    fixture: &str,
+    case: &str,
+    assertion: &AssertionSpec,
+) -> Result<Vec<CitationMetadataEntry>, String> {
+    let field_columns = assertion_field_columns(assertion)?;
+    let path_fields = assertion_option_string_array(assertion, "path_fields")?
+        .unwrap_or_else(|| vec!["src.path".to_owned()]);
+    let results = session
+        .execute_script(&assertion.query, &BTreeMap::<String, Value>::new())
+        .map_err(|error| {
+            format!("failed citation query for fixture `{fixture}` case `{case}`: {error}")
+        })?;
+    let mut entries = Vec::new();
+    for result in results {
+        for row in result.rows {
+            let metadata = field_columns
+                .iter()
+                .filter_map(|(field, column)| {
+                    row.get(column.saturating_sub(1))
+                        .map(|value| (field.clone(), normalized_runtime_value_json(value)))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let path =
+                citation_path(&metadata, &path_fields).unwrap_or_else(|| "<unknown>".to_owned());
+            entries.push(CitationMetadataEntry { path, metadata });
+        }
+    }
+    Ok(entries)
+}
+
+fn citation_entries_from_context(
+    session: &mut Session,
+    db_path: &Path,
+    fixture: &str,
+    case: &str,
+    assertion: &AssertionSpec,
+) -> Result<Vec<CitationMetadataEntry>, String> {
+    session.save().map_err(|error| error.to_string())?;
+    let seed_path = assertion_option_string(assertion, "seed_path")?
+        .ok_or_else(|| {
+            format!("citation_metadata context assertion for fixture `{fixture}` case `{case}` requires `seed_path`")
+        })?;
+    let request = ContextRequest {
+        db_path: db_path.to_path_buf(),
+        nodes: Vec::new(),
+        paths: vec![seed_path.clone()],
+        seeds: Vec::new(),
+        depth: assertion_option_u64(assertion, "depth")?.unwrap_or(1) as u8,
+        direction: ContextDirection::Both,
+        edge_types: Vec::new(),
+        labels: Vec::new(),
+        max_nodes: assertion_option_u64(assertion, "max_nodes")?.unwrap_or(25) as usize,
+        max_edges: assertion_option_u64(assertion, "max_edges")?.unwrap_or(100) as usize,
+    };
+    let response = request.run().map_err(|error| {
+        format!("failed citation context for fixture `{fixture}` case `{case}`: {error}")
+    })?;
+    let _json_contract = context_as_json(&response);
+    Ok(response
+        .nodes
+        .iter()
+        .filter(|node| node.labels.iter().any(|label| label == "MarkdownDocument"))
+        .map(|node| {
+            let metadata = normalized_value_map(&node.properties);
+            let path = citation_path(&metadata, &["src.path".to_owned()])
+                .or_else(|| node.display.clone())
+                .unwrap_or_else(|| format!("node:{}", node.node_id));
+            CitationMetadataEntry { path, metadata }
+        })
+        .collect())
+}
+
+fn citation_metadata_failures(
+    fixture: &str,
+    case: &str,
+    entries: &[CitationMetadataEntry],
+    required_fields: &[String],
+    path_fields: &[String],
+    hash_fields: &[String],
+) -> Vec<CitationMetadataFailure> {
+    let mut failures = Vec::new();
+    for entry in entries {
+        for field in required_fields {
+            if field == "src.hash" {
+                if hash_fields
+                    .iter()
+                    .any(|field| present_hash(&entry.metadata, field))
+                {
+                    continue;
+                }
+            } else if present_metadata_field(&entry.metadata, field) {
+                continue;
+            }
+            failures.push(CitationMetadataFailure {
+                fixture: fixture.to_owned(),
+                case: case.to_owned(),
+                path: entry.path.clone(),
+                missing_field: field.clone(),
+                actual: JsonValue::object(
+                    entry
+                        .metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                ),
+            });
+        }
+        if citation_path(&entry.metadata, path_fields).is_none() {
+            failures.push(CitationMetadataFailure {
+                fixture: fixture.to_owned(),
+                case: case.to_owned(),
+                path: entry.path.clone(),
+                missing_field: "stable_markdown_identity".to_owned(),
+                actual: JsonValue::object(
+                    entry
+                        .metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                ),
+            });
+        }
+    }
+    failures
+}
+
+fn present_metadata_field(metadata: &BTreeMap<String, JsonValue>, field: &str) -> bool {
+    metadata
+        .get(field)
+        .is_some_and(|value| !matches!(value, JsonValue::Null))
+}
+
+fn present_hash(metadata: &BTreeMap<String, JsonValue>, field: &str) -> bool {
+    metadata
+        .get(field)
+        .and_then(JsonValue::as_str)
+        .is_some_and(|value| value.len() >= 8 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+}
+
+fn citation_path(metadata: &BTreeMap<String, JsonValue>, fields: &[String]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        metadata
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn assertion_field_columns(assertion: &AssertionSpec) -> Result<Vec<(String, usize)>, String> {
+    let columns = assertion
+        .options
+        .get("field_columns")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| "citation_metadata query assertion requires `field_columns`".to_owned())?;
+    columns
+        .iter()
+        .map(|(field, value)| {
+            let index = value.as_i64().filter(|index| *index > 0).ok_or_else(|| {
+                "`field_columns` values must be positive column numbers".to_owned()
+            })?;
+            Ok((field.clone(), index as usize))
+        })
+        .collect()
+}
+
+fn assertion_option_string(assertion: &AssertionSpec, key: &str) -> Result<Option<String>, String> {
+    assertion
+        .options
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("expected `{key}` to be a string"))
+        })
+        .transpose()
+}
+
+fn assertion_option_u64(assertion: &AssertionSpec, key: &str) -> Result<Option<u64>, String> {
+    assertion
+        .options
+        .get(key)
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+                .ok_or_else(|| format!("expected `{key}` to be a non-negative integer"))
+        })
+        .transpose()
+}
+
+fn assertion_option_string_array(
+    assertion: &AssertionSpec,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    assertion
+        .options
+        .get(key)
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| format!("expected `{key}` to be an array"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("expected `{key}` entries to be strings"))
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -633,6 +1062,14 @@ fn normalized_markdown_edge(
 }
 
 fn normalized_properties(properties: &PropertyMap) -> BTreeMap<String, JsonValue> {
+    properties
+        .iter()
+        .filter(|(key, _)| !is_volatile_property(key))
+        .map(|(key, value)| (key.to_owned(), value_json(value)))
+        .collect()
+}
+
+fn normalized_value_map(properties: &BTreeMap<String, Value>) -> BTreeMap<String, JsonValue> {
     properties
         .iter()
         .filter(|(key, _)| !is_volatile_property(key))
@@ -1219,6 +1656,55 @@ mod tests {
         assert!(
             diff.iter()
                 .any(|entry| entry.contains("node `changed.md` property `src.status` changed"))
+        );
+    }
+
+    #[test]
+    fn citation_metadata_failure_reports_auditable_context() {
+        let entries = vec![CitationMetadataEntry {
+            path: "notes/source.md".to_owned(),
+            metadata: BTreeMap::from([
+                ("src.path".to_owned(), JsonValue::from("notes/source.md")),
+                ("src.status".to_owned(), JsonValue::from("current")),
+            ]),
+        }];
+
+        let failures = citation_metadata_failures(
+            "citation_metadata",
+            "missing-hash",
+            &entries,
+            &[
+                "src.path".to_owned(),
+                "src.status".to_owned(),
+                "src.hash".to_owned(),
+            ],
+            &["src.path".to_owned()],
+            &["src.hash".to_owned()],
+        );
+
+        assert_eq!(failures.len(), 1);
+        let failure = failures[0].as_json();
+        assert_eq!(
+            failure.get("fixture").and_then(JsonValue::as_str),
+            Some("citation_metadata")
+        );
+        assert_eq!(
+            failure.get("case").and_then(JsonValue::as_str),
+            Some("missing-hash")
+        );
+        assert_eq!(
+            failure.get("path").and_then(JsonValue::as_str),
+            Some("notes/source.md")
+        );
+        assert_eq!(
+            failure.get("missing_field").and_then(JsonValue::as_str),
+            Some("src.hash")
+        );
+        assert!(
+            failure
+                .get("actual")
+                .and_then(JsonValue::as_object)
+                .is_some_and(|actual| actual.iter().any(|(key, _)| key == "src.status"))
         );
     }
 }

@@ -12,7 +12,32 @@
               "rows": [
                 ["added.md", "Added", "current"],
                 ["changed.md", "Changed", "current"],
+                ["removed.md", "Removed", "missing"],
                 ["stable.md", "Stable", "current"]
+              ]
+            }
+          ]
+        },
+        {
+          "type": "query_rows",
+          "query": "MATCH (d:MarkdownDocument {`src.path`: 'removed.md'}) RETURN d.`src.path`, d.`src.status`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2"],
+              "rows": [
+                ["removed.md", "missing"]
+              ]
+            }
+          ]
+        },
+        {
+          "type": "query_rows",
+          "query": "MATCH (:MarkdownDocument {`src.path`: 'removed.md'})-[e:MD_LINKS_TO]->(:MarkdownDocument) RETURN count(e)",
+          "expected": [
+            {
+              "columns": ["col_1"],
+              "rows": [
+                [0]
               ]
             }
           ]
