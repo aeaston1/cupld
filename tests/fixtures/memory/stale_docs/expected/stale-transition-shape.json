@@ -1,0 +1,12 @@
+{
+  "after_refresh_documents": [
+    {
+      "columns": ["col_1", "col_2", "col_3"],
+      "rows": [
+        ["added.md", "Added", "current"],
+        ["changed.md", "Changed", "current"],
+        ["stable.md", "Stable", "current"]
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "cases": [
+    {
+      "name": "body-link-surface",
+      "assertions": [
+        {
+          "type": "query_rows",
+          "query": "MATCH (d:MarkdownDocument {`src.path`: 'source.md'}) RETURN d.`md.links`",
+          "expected": [
+            {
+              "columns": ["col_1"],
+              "rows": [[["target-one", "Missing Note", "target-two.md"]]]
+            }
+          ]
+        },
+        {
+          "type": "query_rows",
+          "query": "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_LINKS_TO]->(d:MarkdownDocument) RETURN d.`src.path`, e.`md.link_target`, e.`md.link_sources` ORDER BY d.`src.path`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2", "col_3"],
+              "rows": [
+                ["target-one.md", "target-one", ["body"]],
+                ["target-two.md", "target-two.md", ["body"]]
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

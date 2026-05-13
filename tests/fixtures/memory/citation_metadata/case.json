@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "name": "auditability-metadata",
+      "assertions": [
+        {
+          "type": "query_rows",
+          "query": "MATCH (d:MarkdownDocument {`src.path`: 'audit-source.md'}) RETURN d.`src.connector`, d.`src.kind`, d.`src.status`, d.`md.title`, d.`md.tags`, d.`md.has_frontmatter`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2", "col_3", "col_4", "col_5", "col_6"],
+              "rows": [["markdown", "document", "current", "Audit Source", ["audit", "source"], true]]
+            }
+          ]
+        },
+        {
+          "type": "query_rows",
+          "query": "MATCH (d:MarkdownDocument {`src.path`: 'audit-source.md'}) WHERE d.`src.root` IS NOT NULL AND d.`src.hash` IS NOT NULL AND d.`md.raw` IS NOT NULL AND d.`md.body` IS NOT NULL RETURN d.`src.path`, d.`md.title`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2"],
+              "rows": [["audit-source.md", "Audit Source"]]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

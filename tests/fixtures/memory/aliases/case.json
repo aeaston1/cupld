@@ -1,0 +1,33 @@
+{
+  "cases": [
+    {
+      "name": "alias-resolution",
+      "assertions": [
+        {
+          "type": "query_rows",
+          "query": "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_LINKS_TO]->(d:MarkdownDocument) RETURN d.`src.path`, e.`md.link_target` ORDER BY d.`src.path`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2"],
+              "rows": [["unique-target.md", "Project Codename"]]
+            }
+          ]
+        },
+        {
+          "type": "query_rows",
+          "query": "MATCH (d:MarkdownDocument) WHERE d.`src.path` IN ['shared-one.md', 'shared-two.md', 'unique-target.md'] RETURN d.`src.path`, d.`md.aliases` ORDER BY d.`src.path`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2"],
+              "rows": [
+                ["shared-one.md", ["Shared Alias"]],
+                ["shared-two.md", ["Shared Alias"]],
+                ["unique-target.md", ["Project Codename"]]
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
