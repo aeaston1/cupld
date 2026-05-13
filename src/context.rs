@@ -45,6 +45,7 @@ pub struct ContextEvidence {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContextNode {
     pub node_id: i64,
+    pub depth: u8,
     pub labels: Vec<String>,
     pub properties: BTreeMap<String, Value>,
     pub name: Option<String>,
@@ -56,10 +57,14 @@ pub struct ContextNode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContextEdge {
-    pub from_node_id: i64,
-    pub to_node_id: i64,
+    pub edge_id: i64,
+    pub source_node_id: i64,
+    pub target_node_id: i64,
+    pub direction_from_seed: String,
+    pub depth: u8,
     pub edge_type: String,
     pub properties: BTreeMap<String, Value>,
+    pub evidence: Vec<ContextEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +114,9 @@ pub struct ContextRequestSummary {
 #[derive(Clone, Debug)]
 struct ContextGraph {
     nodes: BTreeMap<i64, ContextNode>,
-    edges: Vec<ContextEdge>,
+    edges: BTreeMap<i64, ContextEdge>,
+    outgoing: BTreeMap<i64, Vec<i64>>,
+    incoming: BTreeMap<i64, Vec<i64>>,
 }
 
 impl ContextRequest {
@@ -216,12 +223,27 @@ fn load_context_graph(session: &mut Session) -> Result<ContextGraph, AutomationE
             (context_node.node_id, context_node)
         })
         .collect::<BTreeMap<_, _>>();
-    let edges = snapshot
-        .edges()
-        .map(ContextEdge::from_edge)
-        .collect::<Vec<_>>();
+    let mut edges = BTreeMap::new();
+    let mut outgoing: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    let mut incoming: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for edge in snapshot.edges().map(ContextEdge::from_edge) {
+        outgoing
+            .entry(edge.source_node_id)
+            .or_default()
+            .push(edge.edge_id);
+        incoming
+            .entry(edge.target_node_id)
+            .or_default()
+            .push(edge.edge_id);
+        edges.insert(edge.edge_id, edge);
+    }
 
-    Ok(ContextGraph { nodes, edges })
+    Ok(ContextGraph {
+        nodes,
+        edges,
+        outgoing,
+        incoming,
+    })
 }
 
 fn build_context_response(
@@ -236,19 +258,26 @@ fn build_context_response(
     let (seed_nodes, warnings) = resolve_seed_nodes(request, &graph)?;
     let seeds = context_seed_summaries(request, &graph);
 
-    let (node_ids, mut edges, truncated_by_budget) = traverse_context(request, &graph, &seed_nodes);
-    let mut nodes = node_ids
+    let (node_depths, mut edges, truncated_by_budget) =
+        traverse_context(request, &graph, &seed_nodes);
+    let mut nodes = node_depths
         .iter()
-        .filter_map(|node_id| graph.nodes.get(node_id).cloned())
+        .filter_map(|(node_id, depth)| {
+            let mut node = graph.nodes.get(node_id).cloned()?;
+            node.depth = *depth;
+            Some(node)
+        })
         .collect::<Vec<_>>();
-    let mut truncated = truncated_by_budget || nodes.len() > retrieval_budget.nodes;
-    nodes.truncate(retrieval_budget.nodes);
+    let seed_count = seed_nodes.len().min(nodes.len());
+    let retained_node_count = retrieval_budget.nodes.max(seed_count).min(nodes.len());
+    let mut truncated = truncated_by_budget || nodes.len() > retained_node_count;
+    nodes.truncate(retained_node_count);
     let retained_ids = nodes
         .iter()
         .map(|node| node.node_id)
         .collect::<BTreeSet<_>>();
     edges.retain(|edge| {
-        retained_ids.contains(&edge.from_node_id) && retained_ids.contains(&edge.to_node_id)
+        retained_ids.contains(&edge.source_node_id) && retained_ids.contains(&edge.target_node_id)
     });
     if edges.len() > retrieval_budget.edges {
         edges.truncate(retrieval_budget.edges);
@@ -280,7 +309,9 @@ fn build_context_response(
             warnings: warnings.clone(),
         };
         let payload_bytes = context_payload_bytes(&mut response, &mut buffer);
-        if payload_bytes <= retrieval_budget.total_payload_bytes || response.nodes.is_empty() {
+        if payload_bytes <= retrieval_budget.total_payload_bytes
+            || response.nodes.len() <= seed_count
+        {
             return Ok(response);
         }
         response.nodes.pop();
@@ -291,7 +322,8 @@ fn build_context_response(
             .collect::<BTreeSet<_>>();
         nodes = response.nodes;
         edges.retain(|edge| {
-            retained_ids.contains(&edge.from_node_id) && retained_ids.contains(&edge.to_node_id)
+            retained_ids.contains(&edge.source_node_id)
+                && retained_ids.contains(&edge.target_node_id)
         });
         truncated = true;
     }
@@ -451,57 +483,67 @@ fn traverse_context(
     request: &ContextRequest,
     graph: &ContextGraph,
     seeds: &[i64],
-) -> (Vec<i64>, Vec<ContextEdge>, bool) {
-    let mut visited = BTreeSet::new();
+) -> (Vec<(i64, u8)>, Vec<ContextEdge>, bool) {
+    let max_depth = request.depth.min(1);
+    let seed_set = seeds.iter().copied().collect::<BTreeSet<_>>();
+    let mut node_depths = BTreeMap::new();
     let mut ordered_nodes = Vec::new();
     let mut selected_edges = Vec::new();
-    let mut selected_edge_keys = BTreeSet::new();
+    let mut selected_edge_ids = BTreeSet::new();
     let mut queued = VecDeque::new();
     let mut truncated = false;
 
     for seed in seeds {
-        if include_node(*seed, request, graph) {
-            visited.insert(*seed);
-            ordered_nodes.push(*seed);
-            queued.push_back((*seed, 0u8));
+        if graph.nodes.contains_key(seed) && !node_depths.contains_key(seed) {
+            node_depths.insert(*seed, 0u8);
+            ordered_nodes.push((*seed, 0u8));
+            queued.push_back((*seed, 0u8, *seed));
         }
     }
 
-    while let Some((node_id, depth)) = queued.pop_front() {
-        if depth >= request.depth {
+    while let Some((node_id, depth, seed_id)) = queued.pop_front() {
+        if depth >= max_depth {
             continue;
         }
-        for edge in graph
-            .edges
-            .iter()
-            .filter(|edge| edge_matches(node_id, edge, request))
-        {
+        for (edge_id, direction_from_seed) in incident_edge_ids(node_id, request, graph) {
             if selected_edges.len() >= request.max_edges {
                 truncated = true;
                 break;
             }
-            let next_id = if edge.from_node_id == node_id {
-                edge.to_node_id
-            } else {
-                edge.from_node_id
+            let Some(edge) = graph.edges.get(&edge_id) else {
+                continue;
             };
-            if !include_node(next_id, request, graph) {
+            if !edge_type_matches(edge, request) {
                 continue;
             }
-            if selected_edge_keys.insert((
-                edge.from_node_id,
-                edge.to_node_id,
-                edge.edge_type.clone(),
-            )) {
-                selected_edges.push(edge.clone());
+            let next_id = if edge.source_node_id == node_id {
+                edge.target_node_id
+            } else {
+                edge.source_node_id
+            };
+            let next_depth = depth + 1;
+            if !seed_set.contains(&next_id) && !include_node(next_id, request, graph) {
+                continue;
             }
-            if visited.insert(next_id) {
-                if ordered_nodes.len() >= request.max_nodes {
-                    truncated = true;
-                    continue;
+            if selected_edge_ids.insert(edge.edge_id) {
+                selected_edges.push(edge.with_traversal(
+                    direction_from_seed,
+                    next_depth,
+                    seed_id,
+                    next_id,
+                ));
+            }
+            match node_depths.get(&next_id).copied() {
+                Some(existing_depth) if existing_depth <= next_depth => {}
+                _ => {
+                    if !seed_set.contains(&next_id) && ordered_nodes.len() >= request.max_nodes {
+                        truncated = true;
+                        continue;
+                    }
+                    node_depths.insert(next_id, next_depth);
+                    ordered_nodes.push((next_id, next_depth));
+                    queued.push_back((next_id, next_depth, seed_id));
                 }
-                ordered_nodes.push(next_id);
-                queued.push_back((next_id, depth + 1));
             }
         }
     }
@@ -509,20 +551,37 @@ fn traverse_context(
     (ordered_nodes, selected_edges, truncated)
 }
 
-fn edge_matches(node_id: i64, edge: &ContextEdge, request: &ContextRequest) -> bool {
-    if !request.edge_types.is_empty()
-        && !request
+fn incident_edge_ids(
+    node_id: i64,
+    request: &ContextRequest,
+    graph: &ContextGraph,
+) -> Vec<(i64, &'static str)> {
+    let mut edge_ids = Vec::new();
+    if matches!(
+        request.direction,
+        ContextDirection::Out | ContextDirection::Both
+    ) {
+        if let Some(outgoing) = graph.outgoing.get(&node_id) {
+            edge_ids.extend(outgoing.iter().copied().map(|edge_id| (edge_id, "out")));
+        }
+    }
+    if matches!(
+        request.direction,
+        ContextDirection::In | ContextDirection::Both
+    ) {
+        if let Some(incoming) = graph.incoming.get(&node_id) {
+            edge_ids.extend(incoming.iter().copied().map(|edge_id| (edge_id, "in")));
+        }
+    }
+    edge_ids
+}
+
+fn edge_type_matches(edge: &ContextEdge, request: &ContextRequest) -> bool {
+    request.edge_types.is_empty()
+        || request
             .edge_types
             .iter()
             .any(|edge_type| edge_type == &edge.edge_type)
-    {
-        return false;
-    }
-    match request.direction {
-        ContextDirection::In => edge.to_node_id == node_id,
-        ContextDirection::Out => edge.from_node_id == node_id,
-        ContextDirection::Both => edge.from_node_id == node_id || edge.to_node_id == node_id,
-    }
 }
 
 fn include_node(node_id: i64, request: &ContextRequest, graph: &ContextGraph) -> bool {
@@ -557,6 +616,7 @@ fn context_evidence_json_value(evidence: &ContextEvidence) -> JsonValue {
 fn context_node_json_value(item: &ContextNode) -> JsonValue {
     let mut fields = vec![
         ("node_id".to_owned(), JsonValue::from(item.node_id)),
+        ("depth".to_owned(), JsonValue::from(usize::from(item.depth))),
         (
             "labels".to_owned(),
             JsonValue::array(item.labels.iter().cloned().map(JsonValue::from)),
@@ -588,8 +648,17 @@ fn context_node_json_value(item: &ContextNode) -> JsonValue {
 
 fn context_edge_json_value(edge: &ContextEdge) -> JsonValue {
     JsonValue::object([
-        ("from_node_id", JsonValue::from(edge.from_node_id)),
-        ("to_node_id", JsonValue::from(edge.to_node_id)),
+        ("edge_id", JsonValue::from(edge.edge_id)),
+        ("type", JsonValue::from(edge.edge_type.clone())),
+        ("source_node_id", JsonValue::from(edge.source_node_id)),
+        ("target_node_id", JsonValue::from(edge.target_node_id)),
+        (
+            "direction_from_seed",
+            JsonValue::from(edge.direction_from_seed.clone()),
+        ),
+        ("depth", JsonValue::from(usize::from(edge.depth))),
+        ("from_node_id", JsonValue::from(edge.source_node_id)),
+        ("to_node_id", JsonValue::from(edge.target_node_id)),
         ("edge_type", JsonValue::from(edge.edge_type.clone())),
         (
             "properties",
@@ -598,6 +667,10 @@ fn context_edge_json_value(edge: &ContextEdge) -> JsonValue {
                     .iter()
                     .map(|(key, value)| (key.clone(), value_json_value(value))),
             ),
+        ),
+        (
+            "evidence",
+            JsonValue::array(edge.evidence.iter().map(context_evidence_json_value)),
         ),
     ])
 }
@@ -763,6 +836,7 @@ impl ContextNode {
 
         Self {
             node_id,
+            depth: 0,
             labels,
             properties,
             name,
@@ -783,16 +857,51 @@ impl ContextNode {
 
 impl ContextEdge {
     fn from_edge(edge: &crate::Edge) -> Self {
+        let edge_id = edge.id().get() as i64;
+        let source_node_id = edge.from().get() as i64;
+        let target_node_id = edge.to().get() as i64;
+        let edge_type = edge.edge_type().to_owned();
         Self {
-            from_node_id: edge.from().get() as i64,
-            to_node_id: edge.to().get() as i64,
-            edge_type: edge.edge_type().to_owned(),
+            edge_id,
+            source_node_id,
+            target_node_id,
+            direction_from_seed: String::new(),
+            depth: 0,
+            edge_type,
             properties: edge
                 .properties()
                 .iter()
                 .map(|(key, value)| (key.to_owned(), value.clone()))
                 .collect(),
+            evidence: Vec::new(),
         }
+    }
+
+    fn with_traversal(
+        &self,
+        direction_from_seed: &str,
+        depth: u8,
+        seed_id: i64,
+        neighbor_id: i64,
+    ) -> Self {
+        let mut edge = self.clone();
+        edge.direction_from_seed = direction_from_seed.to_owned();
+        edge.depth = depth;
+        edge.evidence = vec![
+            ContextEvidence {
+                field: "edge_id".to_owned(),
+                value: edge.edge_id.to_string(),
+                source: format!("edge:e{}", edge.edge_id),
+            },
+            ContextEvidence {
+                field: "traversal".to_owned(),
+                value: format!(
+                    "seed {seed_id} reached node {neighbor_id} via {direction_from_seed} edge at depth {depth}"
+                ),
+                source: "cupld.context.traversal".to_owned(),
+            },
+        ];
+        edge
     }
 }
 
@@ -815,11 +924,11 @@ mod tests {
                 (2, node(2, &["Person"], Some("Grace"))),
                 (3, node(3, &["Doc"], Some("Notes"))),
             ]),
-            edges: vec![
-                edge(1, 2, "KNOWS"),
-                edge(2, 3, "MENTIONS"),
-                edge(3, 1, "REFERS_TO"),
-            ],
+            ..graph_edges(vec![
+                edge(1, 1, 2, "KNOWS"),
+                edge(2, 2, 3, "MENTIONS"),
+                edge(3, 3, 1, "REFERS_TO"),
+            ])
         };
         let request = ContextRequest {
             db_path: PathBuf::from("test.cupld"),
@@ -845,7 +954,12 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(response.edges.len(), 1);
-        assert!(response.retrieval_usage.truncated);
+        assert_eq!(response.nodes[0].depth, 0);
+        assert_eq!(response.nodes[1].depth, 1);
+        assert_eq!(response.edges[0].edge_id, 1);
+        assert_eq!(response.edges[0].direction_from_seed, "out");
+        assert_eq!(response.edges[0].depth, 1);
+        assert!(!response.edges[0].evidence.is_empty());
     }
 
     #[test]
@@ -853,7 +967,7 @@ mod tests {
         let node = node(7, &["Person"], Some("Ada"));
         let graph = ContextGraph {
             nodes: BTreeMap::from([(node.node_id, node)]),
-            edges: Vec::new(),
+            ..graph_edges(Vec::new())
         };
         let request = ContextRequest {
             db_path: PathBuf::from("/tmp/test.cupld"),
@@ -908,6 +1022,7 @@ mod tests {
             .unwrap_or_default();
         ContextNode {
             node_id: id,
+            depth: 0,
             labels: labels.iter().map(|label| (*label).to_owned()).collect(),
             properties,
             name: name.map(str::to_owned),
@@ -918,12 +1033,44 @@ mod tests {
         }
     }
 
-    fn edge(from_node_id: i64, to_node_id: i64, edge_type: &str) -> ContextEdge {
+    fn edge(
+        edge_id: i64,
+        source_node_id: i64,
+        target_node_id: i64,
+        edge_type: &str,
+    ) -> ContextEdge {
         ContextEdge {
-            from_node_id,
-            to_node_id,
+            edge_id,
+            source_node_id,
+            target_node_id,
+            direction_from_seed: String::new(),
+            depth: 0,
             edge_type: edge_type.to_owned(),
             properties: BTreeMap::new(),
+            evidence: Vec::new(),
         }
+    }
+
+    fn graph_edges(edges: Vec<ContextEdge>) -> ContextGraph {
+        let mut graph = ContextGraph {
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            outgoing: BTreeMap::new(),
+            incoming: BTreeMap::new(),
+        };
+        for edge in edges {
+            graph
+                .outgoing
+                .entry(edge.source_node_id)
+                .or_default()
+                .push(edge.edge_id);
+            graph
+                .incoming
+                .entry(edge.target_node_id)
+                .or_default()
+                .push(edge.edge_id);
+            graph.edges.insert(edge.edge_id, edge);
+        }
+        graph
     }
 }
