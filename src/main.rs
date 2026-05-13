@@ -2872,19 +2872,6 @@ fn print_memory_report(report: &MemoryMaintenanceReport, output: OutputFormat) {
         }
     }
 }
-fn string_column(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<String, AutomationError> {
-    optional_string_column(columns, row, column)?.ok_or_else(|| {
-        AutomationError::new(
-            "memory_query_contract",
-            format!("missing expected `{column}` string in memory query result"),
-        )
-    })
-}
-
 fn optional_string_column(
     columns: &[String],
     row: &[RuntimeValue],
@@ -3047,17 +3034,17 @@ fn resolve_markdown_root_for_automation(
     let package = WorkspacePackage::discover_current()
         .map_err(|error| AutomationError::new(error.code(), error.message()))?;
     if let Some(root) = root_override {
-        return Ok(package.resolve_markdown_root(Some(root)));
+        return Ok(canonicalize_existing_path(package.resolve_markdown_root(Some(root))));
     }
     if let Some(root) = package.configured_markdown_root() {
-        return Ok(root);
+        return Ok(canonicalize_existing_path(root));
     }
     if let Some(session) = session
         && let Some(root) = configured_markdown_root(session.engine())
     {
-        return Ok(root);
+        return Ok(canonicalize_existing_path(root));
     }
-    Ok(package.default_markdown_root())
+    Ok(canonicalize_existing_path(package.default_markdown_root()))
 }
 
 fn resolve_markdown_root(
@@ -3066,17 +3053,21 @@ fn resolve_markdown_root(
 ) -> Result<PathBuf, String> {
     let package = WorkspacePackage::discover_current().map_err(|error| error.to_string())?;
     if let Some(root) = root_override {
-        return Ok(package.resolve_markdown_root(Some(root)));
+        return Ok(canonicalize_existing_path(package.resolve_markdown_root(Some(root))));
     }
     if let Some(root) = package.configured_markdown_root() {
-        return Ok(root);
+        return Ok(canonicalize_existing_path(root));
     }
     if let Some(session) = session
         && let Some(root) = configured_markdown_root(session.engine())
     {
-        return Ok(root);
+        return Ok(canonicalize_existing_path(root));
     }
-    Ok(package.default_markdown_root())
+    Ok(canonicalize_existing_path(package.default_markdown_root()))
+}
+
+fn canonicalize_existing_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 fn run_repl(path: Option<PathBuf>) -> Result<(), String> {

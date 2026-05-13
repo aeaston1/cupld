@@ -145,7 +145,11 @@ fn run_cli_with_env_in_dir(
 }
 
 fn workspace_default_db_path(workspace: &Path) -> PathBuf {
-    workspace.join(".cupld").join("default.cupld")
+    workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
+        .join(".cupld")
+        .join("default.cupld")
 }
 
 fn seed_workspace_default_db(workspace: &Path) -> PathBuf {
