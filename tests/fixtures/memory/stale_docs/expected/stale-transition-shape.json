@@ -5,7 +5,24 @@
       "rows": [
         ["added.md", "Added", "current"],
         ["changed.md", "Changed", "current"],
+        ["removed.md", "Removed", "missing"],
         ["stable.md", "Stable", "current"]
+      ]
+    }
+  ],
+  "explicit_missing_document": [
+    {
+      "columns": ["col_1", "col_2"],
+      "rows": [
+        ["removed.md", "missing"]
+      ]
+    }
+  ],
+  "missing_document_outgoing_links": [
+    {
+      "columns": ["col_1"],
+      "rows": [
+        [0]
       ]
     }
   ]
