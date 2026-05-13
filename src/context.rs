@@ -255,7 +255,7 @@ fn build_context_response(
     let Some(retrieval_budget) = policy.retrieval_budget else {
         unreachable!("context policy should include retrieval budget");
     };
-    let (seed_nodes, warnings) = resolve_seed_nodes(request, &graph)?;
+    let (seed_nodes, mut warnings) = resolve_seed_nodes(request, &graph)?;
     let seeds = context_seed_summaries(request, &graph);
 
     let (node_depths, mut edges, truncated_by_budget) =
@@ -270,7 +270,9 @@ fn build_context_response(
         .collect::<Vec<_>>();
     let seed_count = seed_nodes.len().min(nodes.len());
     let retained_node_count = retrieval_budget.nodes.max(seed_count).min(nodes.len());
-    let mut truncated = truncated_by_budget || nodes.len() > retained_node_count;
+    let mut truncated = truncated_by_budget
+        || nodes.len() > retained_node_count
+        || retrieval_budget.nodes < seed_count;
     nodes.truncate(retained_node_count);
     let retained_ids = nodes
         .iter()
@@ -282,6 +284,16 @@ fn build_context_response(
     if edges.len() > retrieval_budget.edges {
         edges.truncate(retrieval_budget.edges);
         truncated = true;
+    }
+    if truncated
+        && !warnings
+            .iter()
+            .any(|warning| warning.code == "context_budget_truncated")
+    {
+        warnings.push(ContextWarning {
+            code: "context_budget_truncated".to_owned(),
+            message: "context traversal was truncated by retrieval budgets".to_owned(),
+        });
     }
 
     let mut buffer = String::new();
@@ -325,6 +337,15 @@ fn build_context_response(
             retained_ids.contains(&edge.source_node_id)
                 && retained_ids.contains(&edge.target_node_id)
         });
+        if !warnings
+            .iter()
+            .any(|warning| warning.code == "context_budget_truncated")
+        {
+            warnings.push(ContextWarning {
+                code: "context_budget_truncated".to_owned(),
+                message: "context traversal was truncated by retrieval budgets".to_owned(),
+            });
+        }
         truncated = true;
     }
 }
@@ -484,10 +505,10 @@ fn traverse_context(
     graph: &ContextGraph,
     seeds: &[i64],
 ) -> (Vec<(i64, u8)>, Vec<ContextEdge>, bool) {
-    let max_depth = request.depth.min(1);
+    let max_depth = request.depth;
     let seed_set = seeds.iter().copied().collect::<BTreeSet<_>>();
     let mut node_depths = BTreeMap::new();
-    let mut ordered_nodes = Vec::new();
+    let mut non_seed_node_count = 0usize;
     let mut selected_edges = Vec::new();
     let mut selected_edge_ids = BTreeSet::new();
     let mut queued = VecDeque::new();
@@ -496,7 +517,6 @@ fn traverse_context(
     for seed in seeds {
         if graph.nodes.contains_key(seed) && !node_depths.contains_key(seed) {
             node_depths.insert(*seed, 0u8);
-            ordered_nodes.push((*seed, 0u8));
             queued.push_back((*seed, 0u8, *seed));
         }
     }
@@ -536,18 +556,26 @@ fn traverse_context(
             match node_depths.get(&next_id).copied() {
                 Some(existing_depth) if existing_depth <= next_depth => {}
                 _ => {
-                    if !seed_set.contains(&next_id) && ordered_nodes.len() >= request.max_nodes {
+                    if !seed_set.contains(&next_id) && non_seed_node_count >= request.max_nodes {
                         truncated = true;
                         continue;
                     }
                     node_depths.insert(next_id, next_depth);
-                    ordered_nodes.push((next_id, next_depth));
+                    if !seed_set.contains(&next_id) {
+                        non_seed_node_count += 1;
+                    }
                     queued.push_back((next_id, next_depth, seed_id));
                 }
             }
         }
     }
 
+    let mut ordered_nodes = node_depths
+        .into_iter()
+        .map(|(node_id, depth)| (node_id, depth))
+        .collect::<Vec<_>>();
+    ordered_nodes.sort_by_key(|(node_id, depth)| (*depth, *node_id));
+    selected_edges.sort_by_key(|edge| (edge.depth, edge.edge_id));
     (ordered_nodes, selected_edges, truncated)
 }
 
@@ -960,6 +988,103 @@ mod tests {
         assert_eq!(response.edges[0].direction_from_seed, "out");
         assert_eq!(response.edges[0].depth, 1);
         assert!(!response.edges[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn traverses_bfs_depth_filters_cycles_and_budgets_deterministically() {
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([
+                (1, node(1, &["Seed"], Some("Seed"))),
+                (2, node(2, &["MarkdownDocument"], Some("Two"))),
+                (3, node(3, &["Other"], Some("Three"))),
+                (4, node(4, &["MarkdownDocument"], Some("Four"))),
+                (5, node(5, &["MarkdownDocument"], Some("Five"))),
+            ]),
+            ..graph_edges(vec![
+                edge(10, 1, 2, "MD_LINKS_TO"),
+                edge(11, 2, 4, "MD_LINKS_TO"),
+                edge(12, 2, 1, "MD_LINKS_TO"),
+                edge(13, 1, 3, "MENTIONS"),
+                edge(14, 2, 5, "MD_LINKS_TO"),
+            ])
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1],
+            paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1)],
+            depth: 2,
+            direction: ContextDirection::Out,
+            edge_types: vec!["MD_LINKS_TO".to_owned()],
+            labels: vec!["MarkdownDocument".to_owned()],
+            max_nodes: 4,
+            max_edges: 10,
+        };
+
+        let response = build_context_response(Path::new("test.cupld"), &request, graph).unwrap();
+
+        assert_eq!(
+            response
+                .nodes
+                .iter()
+                .map(|node| (node.node_id, node.depth))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2, 1), (4, 2), (5, 2)]
+        );
+        assert_eq!(
+            response
+                .edges
+                .iter()
+                .map(|edge| (edge.edge_id, edge.depth))
+                .collect::<Vec<_>>(),
+            vec![(10, 1), (11, 2), (12, 2), (14, 2)]
+        );
+        assert!(response.warnings.is_empty());
+    }
+
+    #[test]
+    fn depth_zero_and_small_budgets_preserve_seeds_with_warning() {
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([
+                (1, node(1, &["Seed"], Some("One"))),
+                (2, node(2, &["Seed"], Some("Two"))),
+                (3, node(3, &["MarkdownDocument"], Some("Three"))),
+            ]),
+            ..graph_edges(vec![
+                edge(1, 1, 3, "MD_LINKS_TO"),
+                edge(2, 2, 3, "MD_LINKS_TO"),
+            ])
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1, 2],
+            paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1), ContextSeedRequest::Node(2)],
+            depth: 0,
+            direction: ContextDirection::Out,
+            edge_types: Vec::new(),
+            labels: vec!["MarkdownDocument".to_owned()],
+            max_nodes: 1,
+            max_edges: 10,
+        };
+
+        let response = build_context_response(Path::new("test.cupld"), &request, graph).unwrap();
+
+        assert_eq!(
+            response
+                .nodes
+                .iter()
+                .map(|node| (node.node_id, node.depth))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2, 0)]
+        );
+        assert!(response.edges.is_empty());
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "context_budget_truncated")
+        );
     }
 
     #[test]

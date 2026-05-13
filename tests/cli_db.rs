@@ -520,7 +520,16 @@ fn cli_context_json_outputs_seeded_golden_contract() {
             .get("retrieval_usage")
             .and_then(|usage| usage.get("truncated"))
             .and_then(json::JsonValue::as_bool),
-        Some(false)
+        Some(true)
+    );
+    assert_eq!(
+        parsed
+            .get("warnings")
+            .and_then(json::JsonValue::as_array)
+            .and_then(|warnings| warnings.first())
+            .and_then(|warning| warning.get("code"))
+            .and_then(json::JsonValue::as_str),
+        Some("context_budget_truncated")
     );
     assert_eq!(
         parsed
@@ -690,7 +699,7 @@ fn cli_context_ndjson_outputs_one_hop_edge_evidence() {
 }
 
 #[test]
-fn cli_context_resolves_node_and_path_seeds_in_request_order() {
+fn cli_context_sorts_seed_nodes_by_depth_then_id() {
     let db = TestDb::new("cli_context_seed_order");
     let mut session = db.open();
     run(&mut session, "CREATE (:Person {name: 'Ada'})");
@@ -732,7 +741,7 @@ fn cli_context_resolves_node_and_path_seeds_in_request_order() {
                 .and_then(json::JsonValue::as_str)
                 .unwrap())
             .collect::<Vec<_>>(),
-        vec!["Foo", "Ada"]
+        vec!["Ada", "Foo"]
     );
 }
 
