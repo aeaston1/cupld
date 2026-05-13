@@ -75,6 +75,16 @@ Build compact context rows for agent prompts:
 
 ```bash
 cupld context --db default --path notes/example.md --depth 2 --max-nodes 25
+cupld context --db default --node 42 --depth 1 --output table
+cupld context --db default --path notes/example.md --depth 2 --output json
+```
+
+`context` is seeded: pass one or more `--node <id>` or `--path <src.path>` seeds to get a bounded neighborhood table with seed, node, and edge rows. JSON and NDJSON remain the stable machine contracts for automation.
+
+Use `cupld query` for global node listings and ad hoc graph reads:
+
+```bash
+cupld query --db default 'MATCH (n) RETURN id(n), labels(n), n.name, n.`src.path` ORDER BY id(n) LIMIT 25'
 ```
 
 Inspect, validate, and compact a database:

@@ -177,41 +177,59 @@ pub fn context_as_ndjson(response: &ContextEnvelope) -> Vec<String> {
 }
 
 pub fn context_as_query_result(response: &ContextEnvelope) -> QueryResult {
+    let mut rows = Vec::new();
+    for seed in &response.seeds {
+        rows.push(vec![
+            RuntimeValue::String(format!("seed:{}", seed.kind)),
+            RuntimeValue::Int(0),
+            RuntimeValue::String(
+                seed.node_ids
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            RuntimeValue::String(seed.kind.clone()),
+            RuntimeValue::String(seed.value.clone()),
+            RuntimeValue::String(String::new()),
+            RuntimeValue::String(String::new()),
+        ]);
+    }
+    for node in &response.nodes {
+        rows.push(vec![
+            RuntimeValue::String("node".to_owned()),
+            RuntimeValue::Int(i64::from(node.depth)),
+            RuntimeValue::Int(node.node_id),
+            RuntimeValue::String(node.labels.join(",")),
+            RuntimeValue::String(node.display.clone().unwrap_or_default()),
+            RuntimeValue::String(String::new()),
+            RuntimeValue::String(String::new()),
+        ]);
+    }
+    for edge in &response.edges {
+        rows.push(vec![
+            RuntimeValue::String("edge".to_owned()),
+            RuntimeValue::Int(i64::from(edge.depth)),
+            RuntimeValue::Int(edge.edge_id),
+            RuntimeValue::String(edge.edge_type.clone()),
+            RuntimeValue::String(edge.direction_from_seed.clone()),
+            RuntimeValue::Int(edge.source_node_id),
+            RuntimeValue::Int(edge.target_node_id),
+        ]);
+    }
+
     QueryResult {
         columns: vec![
-            "node_id".to_owned(),
-            "labels".to_owned(),
-            "name".to_owned(),
-            "title".to_owned(),
+            "row".to_owned(),
+            "depth".to_owned(),
+            "id".to_owned(),
+            "labels/type".to_owned(),
             "display".to_owned(),
+            "source".to_owned(),
+            "target".to_owned(),
         ],
-        rows: response
-            .nodes
-            .iter()
-            .map(|item| {
-                vec![
-                    RuntimeValue::Int(item.node_id),
-                    RuntimeValue::List(
-                        item.labels
-                            .iter()
-                            .cloned()
-                            .map(RuntimeValue::String)
-                            .collect(),
-                    ),
-                    optional_runtime_string(&item.name),
-                    optional_runtime_string(&item.title),
-                    optional_runtime_string(&item.display),
-                ]
-            })
-            .collect(),
+        rows,
     }
-}
-
-fn optional_runtime_string(value: &Option<String>) -> RuntimeValue {
-    value
-        .as_ref()
-        .map(|value| RuntimeValue::String(value.clone()))
-        .unwrap_or(RuntimeValue::Null)
 }
 
 fn load_context_graph(session: &mut Session) -> Result<ContextGraph, AutomationError> {
