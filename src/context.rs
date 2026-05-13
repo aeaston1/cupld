@@ -20,12 +20,19 @@ pub struct ContextRequest {
     pub db_path: PathBuf,
     pub nodes: Vec<usize>,
     pub paths: Vec<String>,
+    pub seeds: Vec<ContextSeedRequest>,
     pub depth: u8,
     pub direction: ContextDirection,
     pub edge_types: Vec<String>,
     pub labels: Vec<String>,
     pub max_nodes: usize,
     pub max_edges: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextSeedRequest {
+    Node(usize),
+    Path(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +51,7 @@ pub struct ContextNode {
     pub title: Option<String>,
     pub display: Option<String>,
     pub evidence: Vec<ContextEvidence>,
+    pub src_status: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,7 +63,7 @@ pub struct ContextEdge {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextSeed {
+pub struct ContextSeedSummary {
     pub kind: String,
     pub value: String,
     pub node_ids: Vec<i64>,
@@ -82,7 +90,7 @@ pub struct ContextEnvelope {
     pub retrieval_usage: RetrievalUsage,
     pub provenance: ContextProvenance,
     pub request: ContextRequestSummary,
-    pub seeds: Vec<ContextSeed>,
+    pub seeds: Vec<ContextSeedSummary>,
     pub nodes: Vec<ContextNode>,
     pub edges: Vec<ContextEdge>,
     pub warnings: Vec<ContextWarning>,
@@ -225,29 +233,8 @@ fn build_context_response(
     let Some(retrieval_budget) = policy.retrieval_budget else {
         unreachable!("context policy should include retrieval budget");
     };
-    let seed_nodes = resolve_seed_nodes(request, &graph);
+    let (seed_nodes, warnings) = resolve_seed_nodes(request, &graph)?;
     let seeds = context_seed_summaries(request, &graph);
-    let mut warnings = Vec::new();
-    for node_id in &request.nodes {
-        if !graph.nodes.contains_key(&(*node_id as i64)) {
-            warnings.push(ContextWarning {
-                code: "context_seed_not_found".to_owned(),
-                message: format!("node seed `{node_id}` was not found"),
-            });
-        }
-    }
-    for path in &request.paths {
-        if !graph.nodes.values().any(|node| {
-            node.evidence
-                .iter()
-                .any(|evidence| evidence.field == "src.path" && evidence.value == *path)
-        }) {
-            warnings.push(ContextWarning {
-                code: "context_seed_not_found".to_owned(),
-                message: format!("path seed `{path}` was not found"),
-            });
-        }
-    }
 
     let (node_ids, mut edges, truncated_by_budget) = traverse_context(request, &graph, &seed_nodes);
     let mut nodes = node_ids
@@ -310,29 +297,129 @@ fn build_context_response(
     }
 }
 
-fn resolve_seed_nodes(request: &ContextRequest, graph: &ContextGraph) -> BTreeSet<i64> {
-    let mut seeds = request
-        .nodes
-        .iter()
-        .filter_map(|node_id| i64::try_from(*node_id).ok())
-        .filter(|node_id| graph.nodes.contains_key(node_id))
-        .collect::<BTreeSet<_>>();
-    for path in &request.paths {
-        seeds.extend(graph.nodes.values().filter_map(|node| {
-            node.evidence
-                .iter()
-                .any(|evidence| evidence.field == "src.path" && evidence.value == *path)
-                .then_some(node.node_id)
-        }));
+fn resolve_seed_nodes(
+    request: &ContextRequest,
+    graph: &ContextGraph,
+) -> Result<(Vec<i64>, Vec<ContextWarning>), AutomationError> {
+    let requested_seeds = if request.seeds.is_empty() {
+        request
+            .nodes
+            .iter()
+            .copied()
+            .map(ContextSeedRequest::Node)
+            .chain(request.paths.iter().cloned().map(ContextSeedRequest::Path))
+            .collect::<Vec<_>>()
+    } else {
+        request.seeds.clone()
+    };
+    let mut seed_nodes = Vec::new();
+    let mut seen_nodes = BTreeSet::new();
+    let mut warnings = Vec::new();
+
+    for seed in requested_seeds {
+        let node_id = match seed {
+            ContextSeedRequest::Node(node_id) => {
+                let node_id = i64::try_from(node_id).map_err(|_| {
+                    AutomationError::new(
+                        "context_seed_not_found",
+                        format!("node seed `{node_id}` was not found"),
+                    )
+                })?;
+                if !graph.nodes.contains_key(&node_id) {
+                    return Err(AutomationError::new(
+                        "context_seed_not_found",
+                        format!("node seed `{node_id}` was not found"),
+                    ));
+                }
+                node_id
+            }
+            ContextSeedRequest::Path(path) => resolve_path_seed(&path, graph, &mut warnings)?,
+        };
+
+        if !seen_nodes.insert(node_id) {
+            warnings.push(ContextWarning {
+                code: "context_seed_duplicate".to_owned(),
+                message: format!("duplicate seed resolved to node `{node_id}`"),
+            });
+            continue;
+        }
+        warn_for_seed_source(node_id, graph, &mut warnings);
+        seed_nodes.push(node_id);
     }
-    seeds
+
+    Ok((seed_nodes, warnings))
 }
 
-fn context_seed_summaries(request: &ContextRequest, graph: &ContextGraph) -> Vec<ContextSeed> {
+fn resolve_path_seed(
+    path: &str,
+    graph: &ContextGraph,
+    warnings: &mut Vec<ContextWarning>,
+) -> Result<i64, AutomationError> {
+    let matches = graph
+        .nodes
+        .values()
+        .filter(|node| node.src_path() == Some(path))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(AutomationError::new(
+            "context_seed_path_not_found",
+            format!("path seed `{path}` was not found"),
+        )),
+        [node] => Ok(node.node_id),
+        many => {
+            let current = many
+                .iter()
+                .copied()
+                .filter(|node| node.src_status.as_deref() == Some("current"))
+                .collect::<Vec<_>>();
+            match current.as_slice() {
+                [node] => {
+                    warnings.push(ContextWarning {
+                        code: "context_seed_path_multiple_matches".to_owned(),
+                        message: format!(
+                            "path seed `{path}` matched multiple nodes; using current node `{}`",
+                            node.node_id
+                        ),
+                    });
+                    Ok(node.node_id)
+                }
+                _ => Err(AutomationError::new(
+                    "context_seed_path_ambiguous",
+                    format!("path seed `{path}` matched multiple nodes"),
+                )),
+            }
+        }
+    }
+}
+
+fn warn_for_seed_source(node_id: i64, graph: &ContextGraph, warnings: &mut Vec<ContextWarning>) {
+    let Some(node) = graph.nodes.get(&node_id) else {
+        return;
+    };
+    if node.src_path().is_none() && !node.labels.iter().any(|label| label == "MarkdownDocument") {
+        return;
+    }
+    match node.src_status.as_deref() {
+        Some("current") => {}
+        Some(status) => warnings.push(ContextWarning {
+            code: "context_seed_source_stale".to_owned(),
+            message: format!("seed node `{node_id}` has src.status `{status}`"),
+        }),
+        None => warnings.push(ContextWarning {
+            code: "context_seed_source_missing".to_owned(),
+            message: format!("seed node `{node_id}` has no src.status"),
+        }),
+    }
+}
+
+fn context_seed_summaries(
+    request: &ContextRequest,
+    graph: &ContextGraph,
+) -> Vec<ContextSeedSummary> {
     let mut seeds = Vec::new();
     for node_id in &request.nodes {
         let resolved_node_id = i64::try_from(*node_id).ok();
-        seeds.push(ContextSeed {
+        seeds.push(ContextSeedSummary {
             kind: "node".to_owned(),
             value: node_id.to_string(),
             node_ids: resolved_node_id
@@ -342,7 +429,7 @@ fn context_seed_summaries(request: &ContextRequest, graph: &ContextGraph) -> Vec
         });
     }
     for path in &request.paths {
-        seeds.push(ContextSeed {
+        seeds.push(ContextSeedSummary {
             kind: "path".to_owned(),
             value: path.clone(),
             node_ids: graph
@@ -363,7 +450,7 @@ fn context_seed_summaries(request: &ContextRequest, graph: &ContextGraph) -> Vec
 fn traverse_context(
     request: &ContextRequest,
     graph: &ContextGraph,
-    seeds: &BTreeSet<i64>,
+    seeds: &[i64],
 ) -> (Vec<i64>, Vec<ContextEdge>, bool) {
     let mut visited = BTreeSet::new();
     let mut ordered_nodes = Vec::new();
@@ -515,7 +602,7 @@ fn context_edge_json_value(edge: &ContextEdge) -> JsonValue {
     ])
 }
 
-fn context_seed_json_value(seed: &ContextSeed) -> JsonValue {
+fn context_seed_json_value(seed: &ContextSeedSummary) -> JsonValue {
     JsonValue::object([
         ("kind", JsonValue::from(seed.kind.clone())),
         ("value", JsonValue::from(seed.value.clone())),
@@ -655,8 +742,9 @@ impl ContextNode {
             .clone()
             .or_else(|| title.clone())
             .or_else(|| src_path.clone());
+        let src_status = string_property(&properties, "src.status");
         let mut evidence = Vec::new();
-        for field in ["name", "title", "src.path"] {
+        for field in ["name", "title", "src.path", "src.status"] {
             if let Some(value) = string_property(&properties, field) {
                 evidence.push(ContextEvidence {
                     field: field.to_owned(),
@@ -681,7 +769,15 @@ impl ContextNode {
             title,
             display,
             evidence,
+            src_status,
         }
+    }
+
+    fn src_path(&self) -> Option<&str> {
+        self.evidence
+            .iter()
+            .find(|evidence| evidence.field == "src.path")
+            .map(|evidence| evidence.value.as_str())
     }
 }
 
@@ -729,6 +825,7 @@ mod tests {
             db_path: PathBuf::from("test.cupld"),
             nodes: vec![1],
             paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1)],
             depth: 2,
             direction: ContextDirection::Out,
             edge_types: Vec::new(),
@@ -762,6 +859,7 @@ mod tests {
             db_path: PathBuf::from("/tmp/test.cupld"),
             nodes: vec![7],
             paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(7)],
             depth: 1,
             direction: ContextDirection::Both,
             edge_types: Vec::new(),
@@ -816,6 +914,7 @@ mod tests {
             title: None,
             display: name.map(str::to_owned),
             evidence,
+            src_status: None,
         }
     }
 
