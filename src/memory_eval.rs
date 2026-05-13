@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process,
@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    CupldEngine, RuntimeValue, Session, Value,
+    CupldEngine, Edge, Node, PropertyMap, RuntimeValue, Session, Value,
     json::{self, JsonValue},
     sync_markdown_root,
 };
@@ -249,9 +249,19 @@ fn parse_case_spec(value: &JsonValue) -> Result<CaseSpec, String> {
 }
 
 fn parse_assertion_spec(value: &JsonValue) -> Result<AssertionSpec, String> {
+    let assertion_type = required_string(value, "type")?;
+    let query = if assertion_type == "graph_snapshot" {
+        value
+            .get("query")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_owned()
+    } else {
+        required_string(value, "query")?
+    };
     Ok(AssertionSpec {
-        assertion_type: required_string(value, "type")?,
-        query: required_string(value, "query")?,
+        assertion_type,
+        query,
         expected: value
             .get("expected")
             .cloned()
@@ -329,6 +339,10 @@ fn run_assertion(
     case: &str,
     assertion: &AssertionSpec,
 ) -> Result<MemoryEvalAssertionReport, String> {
+    if assertion.assertion_type == "graph_snapshot" {
+        return run_graph_snapshot_assertion(session, fixture, case, assertion);
+    }
+
     let results = session
         .execute_script(&assertion.query, &BTreeMap::<String, Value>::new())
         .map_err(|error| {
@@ -351,6 +365,208 @@ fn run_assertion(
         status,
         diff,
     })
+}
+
+fn run_graph_snapshot_assertion(
+    session: &mut Session,
+    fixture: &str,
+    case: &str,
+    assertion: &AssertionSpec,
+) -> Result<MemoryEvalAssertionReport, String> {
+    let snapshot = normalized_markdown_graph_snapshot(session.engine());
+    let actual = snapshot.as_json();
+    let diff = compare_graph_snapshots(&snapshot, &assertion.expected).map_err(|error| {
+        format!("invalid graph snapshot assertion for fixture `{fixture}` case `{case}`: {error}")
+    })?;
+    let status = if diff.is_empty() {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+
+    Ok(MemoryEvalAssertionReport {
+        fixture: fixture.to_owned(),
+        case: case.to_owned(),
+        assertion_type: assertion.assertion_type.clone(),
+        expected: assertion.expected.clone(),
+        actual,
+        status,
+        diff: (status == EvalStatus::Fail).then(|| diff.join("; ")),
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NormalizedGraphSnapshot {
+    nodes: BTreeMap<String, NormalizedGraphNode>,
+    edges: BTreeMap<String, NormalizedGraphEdge>,
+}
+
+impl NormalizedGraphSnapshot {
+    fn as_json(&self) -> JsonValue {
+        JsonValue::object([
+            (
+                "nodes",
+                JsonValue::array(self.nodes.values().map(NormalizedGraphNode::as_json)),
+            ),
+            (
+                "edges",
+                JsonValue::array(self.edges.values().map(NormalizedGraphEdge::as_json)),
+            ),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NormalizedGraphNode {
+    key: String,
+    labels: Vec<String>,
+    properties: BTreeMap<String, JsonValue>,
+}
+
+impl NormalizedGraphNode {
+    fn as_json(&self) -> JsonValue {
+        JsonValue::object([
+            ("key", JsonValue::from(self.key.clone())),
+            (
+                "labels",
+                JsonValue::array(self.labels.iter().cloned().map(JsonValue::from)),
+            ),
+            (
+                "properties",
+                JsonValue::object(
+                    self.properties
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                ),
+            ),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NormalizedGraphEdge {
+    key: String,
+    from: String,
+    edge_type: String,
+    to: String,
+    properties: BTreeMap<String, JsonValue>,
+}
+
+impl NormalizedGraphEdge {
+    fn as_json(&self) -> JsonValue {
+        JsonValue::object([
+            ("key", JsonValue::from(self.key.clone())),
+            ("from", JsonValue::from(self.from.clone())),
+            ("type", JsonValue::from(self.edge_type.clone())),
+            ("to", JsonValue::from(self.to.clone())),
+            (
+                "properties",
+                JsonValue::object(
+                    self.properties
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                ),
+            ),
+        ])
+    }
+}
+
+fn normalized_markdown_graph_snapshot(engine: &CupldEngine) -> NormalizedGraphSnapshot {
+    let node_keys = engine
+        .nodes()
+        .filter_map(|node| markdown_node_key(node).map(|key| (node.id(), key)))
+        .collect::<BTreeMap<_, _>>();
+    let nodes = engine
+        .nodes()
+        .filter_map(normalized_markdown_node)
+        .map(|node| (node.key.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let edges = engine
+        .edges()
+        .filter_map(|edge| normalized_markdown_edge(edge, &node_keys))
+        .map(|edge| (edge.key.clone(), edge))
+        .collect::<BTreeMap<_, _>>();
+
+    NormalizedGraphSnapshot { nodes, edges }
+}
+
+fn normalized_markdown_node(node: &Node) -> Option<NormalizedGraphNode> {
+    let key = markdown_node_key(node)?;
+    Some(NormalizedGraphNode {
+        key,
+        labels: node.labels().iter().cloned().collect(),
+        properties: normalized_properties(node.properties()),
+    })
+}
+
+fn markdown_node_key(node: &Node) -> Option<String> {
+    let path = string_property(node.property("src.path"))?;
+    if node.labels().contains("MarkdownDocument") {
+        Some(path.to_owned())
+    } else if node.labels().contains("MarkdownDirectory") {
+        Some(format!("dir:{path}"))
+    } else {
+        None
+    }
+}
+
+fn normalized_markdown_edge(
+    edge: &Edge,
+    node_keys: &BTreeMap<crate::NodeId, String>,
+) -> Option<NormalizedGraphEdge> {
+    if !edge.edge_type().starts_with("MD_") {
+        return None;
+    }
+    let from = node_keys.get(&edge.from())?.clone();
+    let to = node_keys.get(&edge.to())?.clone();
+    let key = format!("{from}|{}|{to}", edge.edge_type());
+    Some(NormalizedGraphEdge {
+        key,
+        from,
+        edge_type: edge.edge_type().to_owned(),
+        to,
+        properties: normalized_properties(edge.properties()),
+    })
+}
+
+fn normalized_properties(properties: &PropertyMap) -> BTreeMap<String, JsonValue> {
+    properties
+        .iter()
+        .filter(|(key, _)| !is_volatile_property(key))
+        .map(|(key, value)| (key.to_owned(), value_json(value)))
+        .collect()
+}
+
+fn is_volatile_property(key: &str) -> bool {
+    key == "id" || key.ends_with(".id") || key.ends_with("_id")
+}
+
+fn value_json(value: &Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(value) => JsonValue::from(*value),
+        Value::Int(value) => JsonValue::from(*value),
+        Value::Float(value) => JsonValue::from(*value),
+        Value::String(value) => JsonValue::from(value.clone()),
+        Value::Bytes(value) => {
+            JsonValue::array(value.iter().map(|byte| JsonValue::from(u64::from(*byte))))
+        }
+        Value::Datetime(value) => JsonValue::from(format!("{value:?}")),
+        Value::List(values) => JsonValue::array(values.iter().map(value_json)),
+        Value::Map(fields) => JsonValue::object(
+            fields
+                .iter()
+                .filter(|(key, _)| !is_volatile_property(key))
+                .map(|(key, value)| (key.clone(), value_json(value))),
+        ),
+    }
+}
+
+fn string_property(value: Option<&Value>) -> Option<&str> {
+    match value {
+        Some(Value::String(value)) => Some(value),
+        _ => None,
+    }
 }
 
 fn query_result_json(result: &crate::QueryResult) -> JsonValue {
@@ -377,6 +593,202 @@ fn normalized_runtime_value_json(value: &RuntimeValue) -> JsonValue {
         RuntimeValue::Edge(edge_id) => JsonValue::from(format!("edge:{}", edge_id.get())),
         _ => json::runtime_value_to_json(value),
     }
+}
+
+fn compare_graph_snapshots(
+    actual: &NormalizedGraphSnapshot,
+    expected: &JsonValue,
+) -> Result<Vec<String>, String> {
+    let expected_nodes = expected_graph_nodes(expected)?;
+    let expected_edges = expected_graph_edges(expected)?;
+    let mut diff = Vec::new();
+
+    diff.extend(key_set_diff(
+        "node",
+        actual.nodes.keys().cloned().collect(),
+        expected_nodes.keys().cloned().collect(),
+    ));
+    diff.extend(key_set_diff(
+        "edge",
+        actual.edges.keys().cloned().collect(),
+        expected_edges.keys().cloned().collect(),
+    ));
+
+    for (key, expected_node) in expected_nodes {
+        let Some(actual_node) = actual.nodes.get(&key) else {
+            continue;
+        };
+        diff.extend(compare_expected_properties(
+            &format!("node `{key}`"),
+            &actual_node.properties,
+            expected_node.properties.as_ref(),
+            &expected_node.required_properties,
+        ));
+    }
+
+    for (key, expected_edge) in expected_edges {
+        let Some(actual_edge) = actual.edges.get(&key) else {
+            continue;
+        };
+        diff.extend(compare_expected_properties(
+            &format!("edge `{key}`"),
+            &actual_edge.properties,
+            expected_edge.properties.as_ref(),
+            &expected_edge.required_properties,
+        ));
+    }
+
+    Ok(diff)
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedGraphEntry {
+    key: String,
+    properties: Option<BTreeMap<String, JsonValue>>,
+    required_properties: Vec<String>,
+}
+
+fn expected_graph_nodes(
+    expected: &JsonValue,
+) -> Result<BTreeMap<String, ExpectedGraphEntry>, String> {
+    let nodes = expected
+        .get("nodes")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "graph_snapshot expected value must contain a nodes array".to_owned())?;
+    nodes
+        .iter()
+        .map(expected_graph_node)
+        .map(|entry| entry.map(|entry| (entry.key.clone(), entry)))
+        .collect()
+}
+
+fn expected_graph_edges(
+    expected: &JsonValue,
+) -> Result<BTreeMap<String, ExpectedGraphEntry>, String> {
+    let edges = expected
+        .get("edges")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| "graph_snapshot expected value must contain an edges array".to_owned())?;
+    edges
+        .iter()
+        .map(expected_graph_edge)
+        .map(|entry| entry.map(|entry| (entry.key.clone(), entry)))
+        .collect()
+}
+
+fn expected_graph_node(value: &JsonValue) -> Result<ExpectedGraphEntry, String> {
+    expected_graph_entry(value, "node", |value| {
+        value
+            .get("key")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "graph_snapshot node entries must contain string `key`".to_owned())
+    })
+}
+
+fn expected_graph_edge(value: &JsonValue) -> Result<ExpectedGraphEntry, String> {
+    expected_graph_entry(value, "edge", |value| {
+        if let Some(key) = value.get("key").and_then(JsonValue::as_str) {
+            return Ok(key.to_owned());
+        }
+        let from = value
+            .get("from")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "graph_snapshot edge entries must contain string `from`".to_owned())?;
+        let edge_type = value
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "graph_snapshot edge entries must contain string `type`".to_owned())?;
+        let to = value
+            .get("to")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "graph_snapshot edge entries must contain string `to`".to_owned())?;
+        Ok(format!("{from}|{edge_type}|{to}"))
+    })
+}
+
+fn expected_graph_entry(
+    value: &JsonValue,
+    kind: &str,
+    key: impl FnOnce(&JsonValue) -> Result<String, String>,
+) -> Result<ExpectedGraphEntry, String> {
+    let properties = value
+        .get("properties")
+        .map(json_object_map)
+        .transpose()
+        .map_err(|error| format!("graph_snapshot {kind} {error}"))?;
+    Ok(ExpectedGraphEntry {
+        key: key(value)?,
+        properties,
+        required_properties: optional_json_string_array(value, "required_properties")?,
+    })
+}
+
+fn json_object_map(value: &JsonValue) -> Result<BTreeMap<String, JsonValue>, String> {
+    value
+        .as_object()
+        .ok_or_else(|| "`properties` must be an object".to_owned())
+        .map(|entries| entries.iter().cloned().collect())
+}
+
+fn optional_json_string_array(value: &JsonValue, key: &str) -> Result<Vec<String>, String> {
+    let Some(values) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    values
+        .as_array()
+        .ok_or_else(|| format!("expected `{key}` to be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("expected `{key}` entries to be strings"))
+        })
+        .collect()
+}
+
+fn key_set_diff(kind: &str, actual: BTreeSet<String>, expected: BTreeSet<String>) -> Vec<String> {
+    let mut diff = Vec::new();
+    for key in expected.difference(&actual) {
+        diff.push(format!(
+            "{kind} added in expected/missing in actual: `{key}`"
+        ));
+    }
+    for key in actual.difference(&expected) {
+        diff.push(format!(
+            "{kind} removed from expected/present in actual: `{key}`"
+        ));
+    }
+    diff
+}
+
+fn compare_expected_properties(
+    context: &str,
+    actual: &BTreeMap<String, JsonValue>,
+    expected: Option<&BTreeMap<String, JsonValue>>,
+    required: &[String],
+) -> Vec<String> {
+    let mut diff = Vec::new();
+    for key in required {
+        if !actual.contains_key(key) {
+            diff.push(format!("{context} missing required property `{key}`"));
+        }
+    }
+    if let Some(expected) = expected {
+        for (key, expected_value) in expected {
+            match actual.get(key) {
+                Some(actual_value) if actual_value == expected_value => {}
+                Some(actual_value) => diff.push(format!(
+                    "{context} property `{key}` changed: expected {}, actual {}",
+                    json::stringify(expected_value),
+                    json::stringify(actual_value)
+                )),
+                None => diff.push(format!("{context} missing property `{key}`")),
+            }
+        }
+    }
+    diff
 }
 
 fn report_json_fields(report: &MemoryEvalReport, ndjson: bool) -> Vec<(String, JsonValue)> {
@@ -573,6 +985,70 @@ mod tests {
         assert_eq!(
             parsed.get("diff").and_then(JsonValue::as_str),
             Some("expected 1, actual 2")
+        );
+    }
+
+    #[test]
+    fn graph_snapshot_diff_reports_shape_and_property_changes() {
+        let actual = NormalizedGraphSnapshot {
+            nodes: BTreeMap::from([
+                (
+                    "changed.md".to_owned(),
+                    NormalizedGraphNode {
+                        key: "changed.md".to_owned(),
+                        labels: vec!["MarkdownDocument".to_owned()],
+                        properties: BTreeMap::from([(
+                            "src.status".to_owned(),
+                            JsonValue::from("missing"),
+                        )]),
+                    },
+                ),
+                (
+                    "extra.md".to_owned(),
+                    NormalizedGraphNode {
+                        key: "extra.md".to_owned(),
+                        labels: vec!["MarkdownDocument".to_owned()],
+                        properties: BTreeMap::new(),
+                    },
+                ),
+            ]),
+            edges: BTreeMap::new(),
+        };
+        let expected = JsonValue::object([
+            (
+                "nodes",
+                JsonValue::array([
+                    JsonValue::object([
+                        ("key", JsonValue::from("changed.md")),
+                        (
+                            "required_properties",
+                            JsonValue::array([JsonValue::from("src.hash")]),
+                        ),
+                        (
+                            "properties",
+                            JsonValue::object([("src.status", JsonValue::from("current"))]),
+                        ),
+                    ]),
+                    JsonValue::object([("key", JsonValue::from("missing.md"))]),
+                ]),
+            ),
+            ("edges", JsonValue::array([])),
+        ]);
+
+        let diff = compare_graph_snapshots(&actual, &expected).unwrap();
+
+        assert!(
+            diff.contains(&"node added in expected/missing in actual: `missing.md`".to_owned())
+        );
+        assert!(
+            diff.contains(&"node removed from expected/present in actual: `extra.md`".to_owned())
+        );
+        assert!(
+            diff.contains(&"node `changed.md` missing required property `src.hash`".to_owned())
+        );
+        assert!(
+            diff.iter()
+                .any(|entry| entry.contains("node `changed.md` property `src.status` changed"))
         );
     }
 }

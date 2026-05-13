@@ -1,0 +1,50 @@
+{
+  "cases": [
+    {
+      "name": "stable-markdown-graph",
+      "assertions": [
+        {
+          "type": "graph_snapshot",
+          "expected": {
+            "nodes": [
+              {
+                "key": "source.md",
+                "required_properties": ["src.hash"],
+                "properties": {
+                  "src.connector": "markdown",
+                  "src.kind": "document",
+                  "src.path": "source.md",
+                  "src.status": "current",
+                  "md.title": "Source"
+                }
+              },
+              {
+                "key": "target.md",
+                "required_properties": ["src.hash"],
+                "properties": {
+                  "src.connector": "markdown",
+                  "src.kind": "document",
+                  "src.path": "target.md",
+                  "src.status": "current",
+                  "md.title": "Target"
+                }
+              }
+            ],
+            "edges": [
+              {
+                "from": "source.md",
+                "type": "MD_LINKS_TO",
+                "to": "target.md",
+                "properties": {
+                  "src.connector": "markdown",
+                  "src.status": "current",
+                  "md.link_target": "target"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
