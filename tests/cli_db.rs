@@ -144,6 +144,37 @@ fn seed_workspace_default_db(workspace: &Path) -> PathBuf {
     db_path
 }
 
+fn copied_person_fixture(prefix: &str) -> TempPath {
+    let db = TempPath::new(prefix);
+    fs::copy("tests/fixtures/person_v0_1_0.cupld", db.path()).unwrap();
+    db
+}
+
+fn normalize_seeded_context_fixture_output(output: &str, db_path: &Path) -> String {
+    let db_path = db_path.display().to_string();
+    let normalized_path = output.trim().replace(
+        &format!(r#""db_path":"{db_path}""#),
+        r#""db_path":"__DB_PATH__""#,
+    );
+    normalize_retrieval_usage_payload_bytes(&normalized_path)
+}
+
+fn normalize_retrieval_usage_payload_bytes(output: &str) -> String {
+    let marker =
+        r#""retrieval_usage":{"nodes":2,"edges":1,"snippet_bytes":0,"total_payload_bytes":"#;
+    let Some(start) = output.find(marker).map(|index| index + marker.len()) else {
+        return output.to_owned();
+    };
+    let Some(end) = output[start..].find(',').map(|offset| start + offset) else {
+        return output.to_owned();
+    };
+    let mut normalized = String::with_capacity(output.len());
+    normalized.push_str(&output[..start]);
+    normalized.push('0');
+    normalized.push_str(&output[end..]);
+    normalized
+}
+
 #[cfg(unix)]
 fn write_fake_curl(dir: &Path, body: &str, exit_code: i32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -481,11 +512,7 @@ fn cli_context_table_outputs_seed_node_and_edge_rows() {
 
 #[test]
 fn cli_context_json_outputs_seeded_golden_contract() {
-    let db = TestDb::new("cli_context_json_seeded");
-    let mut session = db.open();
-    seed_person_graph(&mut session);
-    drop(session);
-
+    let db = copied_person_fixture("cli_context_json_seeded_fixture");
     let output = run_cli(&[
         "context",
         "--db",
@@ -502,10 +529,16 @@ fn cli_context_json_outputs_seeded_golden_contract() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        normalize_seeded_context_fixture_output(&stdout, db.path()),
+        include_str!("fixtures/context_seeded_golden.json").trim()
+    );
     let parsed = json::parse(stdout.trim()).unwrap();
 
     assert!(parsed.get("items").is_none());
     assert!(parsed.get("snippets").is_none());
+    assert!(parsed.get("query").is_none());
+    assert!(parsed.get("score").is_none());
     assert_eq!(
         parsed.get("mode").and_then(json::JsonValue::as_str),
         Some("seeded")
@@ -570,6 +603,57 @@ fn cli_context_json_outputs_seeded_golden_contract() {
             .and_then(|properties| properties.get("email"))
             .and_then(json::JsonValue::as_str),
         Some("ada@example.com")
+    );
+}
+
+#[test]
+fn cli_context_ndjson_matches_seeded_golden_kind_ordering() {
+    let db = copied_person_fixture("cli_context_ndjson_seeded_fixture");
+    let output = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+        "--node",
+        "1",
+        "--depth",
+        "1",
+        "--max-nodes",
+        "2",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        normalize_seeded_context_fixture_output(&stdout, db.path()),
+        include_str!("fixtures/context_seeded_golden.ndjson").trim()
+    );
+    assert!(!stdout.contains("\"items\""));
+    assert!(!stdout.contains("\"snippets\""));
+    assert!(!stdout.contains("\"query\""));
+    assert!(!stdout.contains("\"score\""));
+
+    let kinds = stdout
+        .lines()
+        .map(|line| {
+            json::parse(line)
+                .unwrap()
+                .get("kind")
+                .and_then(json::JsonValue::as_str)
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            "context_meta",
+            "context_seed",
+            "context_node",
+            "context_node",
+            "context_edge"
+        ]
     );
 }
 

@@ -1263,6 +1263,236 @@ mod tests {
         assert_eq!(error.code(), "context_payload_too_large");
     }
 
+    #[test]
+    fn validates_node_seeds_and_deduplicates_resolved_seeds() {
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([
+                (1, node(1, &["Seed"], Some("One"))),
+                (
+                    2,
+                    node_with_src(2, &["MarkdownDocument"], "Doc", "notes/doc.md", "current"),
+                ),
+            ]),
+            ..graph_edges(Vec::new())
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1, 1],
+            paths: vec!["notes/doc.md".to_owned(), "notes/doc.md".to_owned()],
+            seeds: Vec::new(),
+            depth: 0,
+            direction: ContextDirection::Both,
+            edge_types: Vec::new(),
+            labels: Vec::new(),
+            max_nodes: 10,
+            max_edges: 10,
+        };
+
+        let (seed_nodes, warnings) = resolve_seed_nodes(&request, &graph).unwrap();
+
+        assert_eq!(seed_nodes, vec![1, 2]);
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.code == "context_seed_duplicate")
+                .count(),
+            2
+        );
+
+        let mut missing = request.clone();
+        missing.nodes = vec![99];
+        missing.paths.clear();
+        let error = resolve_seed_nodes(&missing, &graph).unwrap_err();
+        assert_eq!(error.code(), "context_seed_not_found");
+    }
+
+    #[test]
+    fn serializes_display_fallback_and_all_property_shapes() {
+        let mut node = node_with_src(
+            7,
+            &["MarkdownDocument"],
+            "Source Doc",
+            "notes/source.md",
+            "current",
+        );
+        node.name = None;
+        node.display = node.title.clone();
+        node.properties
+            .insert("active".to_owned(), Value::Bool(true));
+        node.properties.insert("count".to_owned(), Value::Int(3));
+        node.properties
+            .insert("ratio".to_owned(), Value::Float(1.5));
+        node.properties.insert(
+            "tags".to_owned(),
+            Value::List(vec![Value::from("m9"), Value::from("context")]),
+        );
+        node.properties.insert(
+            "meta".to_owned(),
+            Value::Map(vec![("source".to_owned(), Value::from("fixture"))]),
+        );
+
+        let parsed = context_node_json_value(&node);
+        let properties = parsed.get("properties").unwrap();
+
+        assert_eq!(
+            parsed.get("display").and_then(JsonValue::as_str),
+            Some("Source Doc")
+        );
+        assert_eq!(
+            properties.get("src.path").and_then(JsonValue::as_str),
+            Some("notes/source.md")
+        );
+        assert_eq!(
+            properties.get("active").and_then(JsonValue::as_bool),
+            Some(true)
+        );
+        assert_eq!(properties.get("count").and_then(JsonValue::as_i64), Some(3));
+        assert_eq!(
+            properties
+                .get("tags")
+                .and_then(JsonValue::as_array)
+                .map(|values| values.len()),
+            Some(2)
+        );
+        assert_eq!(
+            properties
+                .get("meta")
+                .and_then(|meta| meta.get("source"))
+                .and_then(JsonValue::as_str),
+            Some("fixture")
+        );
+    }
+
+    #[test]
+    fn direction_edge_type_and_label_filters_exclude_non_matching_reachable_nodes() {
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([
+                (1, node(1, &["Seed"], Some("Seed"))),
+                (2, node(2, &["MarkdownDocument"], Some("Out Doc"))),
+                (3, node(3, &["Person"], Some("Out Person"))),
+                (4, node(4, &["MarkdownDocument"], Some("Incoming Doc"))),
+            ]),
+            ..graph_edges(vec![
+                edge(1, 1, 2, "MD_LINKS_TO"),
+                edge(2, 1, 3, "MENTIONS"),
+                edge(3, 4, 1, "MD_LINKS_TO"),
+            ])
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1],
+            paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1)],
+            depth: 1,
+            direction: ContextDirection::Out,
+            edge_types: vec!["MD_LINKS_TO".to_owned()],
+            labels: vec!["MarkdownDocument".to_owned()],
+            max_nodes: 10,
+            max_edges: 10,
+        };
+
+        let response = build_context_response(Path::new("test.cupld"), &request, graph).unwrap();
+
+        assert_eq!(
+            response
+                .nodes
+                .iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            response
+                .edges
+                .iter()
+                .map(|edge| edge.edge_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn duplicate_reachable_nodes_keep_shallowest_depth_and_single_node_row() {
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([
+                (1, node(1, &["Seed"], Some("Seed"))),
+                (2, node(2, &["Doc"], Some("Near"))),
+                (3, node(3, &["Doc"], Some("Shared"))),
+            ]),
+            ..graph_edges(vec![
+                edge(1, 1, 3, "LINKS"),
+                edge(2, 1, 2, "LINKS"),
+                edge(3, 2, 3, "LINKS"),
+            ])
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1],
+            paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1)],
+            depth: 2,
+            direction: ContextDirection::Out,
+            edge_types: Vec::new(),
+            labels: Vec::new(),
+            max_nodes: 10,
+            max_edges: 10,
+        };
+
+        let response = build_context_response(Path::new("test.cupld"), &request, graph).unwrap();
+
+        assert_eq!(
+            response
+                .nodes
+                .iter()
+                .map(|node| (node.node_id, node.depth))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2, 1), (3, 1)]
+        );
+        assert_eq!(
+            response
+                .edges
+                .iter()
+                .map(|edge| edge.edge_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn edge_budget_truncates_edges_and_reports_warning() {
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([
+                (1, node(1, &["Seed"], Some("Seed"))),
+                (2, node(2, &["Doc"], Some("Two"))),
+                (3, node(3, &["Doc"], Some("Three"))),
+            ]),
+            ..graph_edges(vec![edge(1, 1, 2, "LINKS"), edge(2, 1, 3, "LINKS")])
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1],
+            paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1)],
+            depth: 1,
+            direction: ContextDirection::Out,
+            edge_types: Vec::new(),
+            labels: Vec::new(),
+            max_nodes: 10,
+            max_edges: 1,
+        };
+
+        let response = build_context_response(Path::new("test.cupld"), &request, graph).unwrap();
+
+        assert_eq!(response.edges.len(), 1);
+        assert!(response.retrieval_usage.truncated);
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "context_budget_truncated")
+        );
+    }
+
     fn node(id: i64, labels: &[&str], name: Option<&str>) -> ContextNode {
         let properties = name
             .map(|name| BTreeMap::from([("name".to_owned(), Value::from(name))]))
@@ -1287,6 +1517,48 @@ mod tests {
             evidence,
             src_status: None,
         }
+    }
+
+    fn node_with_src(
+        id: i64,
+        labels: &[&str],
+        title: &str,
+        path: &str,
+        status: &str,
+    ) -> ContextNode {
+        let mut node = node(id, labels, None);
+        node.title = Some(title.to_owned());
+        node.display = Some(title.to_owned());
+        node.src_status = Some(status.to_owned());
+        node.properties
+            .insert("title".to_owned(), Value::from(title));
+        node.properties
+            .insert("src.path".to_owned(), Value::from(path));
+        node.properties
+            .insert("src.status".to_owned(), Value::from(status));
+        node.evidence = vec![
+            ContextEvidence {
+                field: "title".to_owned(),
+                value: title.to_owned(),
+                source: "property:title".to_owned(),
+            },
+            ContextEvidence {
+                field: "src.path".to_owned(),
+                value: path.to_owned(),
+                source: "property:src.path".to_owned(),
+            },
+            ContextEvidence {
+                field: "src.status".to_owned(),
+                value: status.to_owned(),
+                source: "property:src.status".to_owned(),
+            },
+            ContextEvidence {
+                field: "labels".to_owned(),
+                value: labels.join(","),
+                source: "labels(n)".to_owned(),
+            },
+        ];
+        node
     }
 
     fn node_with_property(id: i64, labels: &[&str], key: &str, value_len: usize) -> ContextNode {
