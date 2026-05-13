@@ -48,6 +48,26 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize formula platform selection
+        shell: bash
+        run: |
+          ruby - "${{ steps.formula.outputs.path }}" <<'RUBY'
+          path = ARGV.fetch(0)
+          text = File.read(path)
+
+          text = text.sub(
+            /  if OS\.mac\?\n    if Hardware::CPU\.arm\?\n(      url "[^"]*aarch64-apple-darwin[^"]*"\n      sha256 "[^"]*"\n)    end\n    if Hardware::CPU\.intel\?\n(      url "[^"]*x86_64-apple-darwin[^"]*"\n      sha256 "[^"]*"\n)    end\n  end\n  if OS\.linux\? && Hardware::CPU\.intel\?\n/,
+            "  if OS.mac? && Hardware::CPU.intel?\n\\2  elsif OS.mac?\n\\1  elsif OS.linux? && Hardware::CPU.intel?\n",
+          )
+
+          text = text.gsub(
+            /^    bin\.install "cupld" if .*$/,
+            '    bin.install "cupld"',
+          ).sub(/(    bin\.install "cupld"\n)+/, "    bin.install \"cupld\"\n")
+
+          File.write(path, text)
+          RUBY
+
       - name: Validate generated formula
         shell: bash
         run: |
