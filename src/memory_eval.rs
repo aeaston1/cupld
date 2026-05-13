@@ -274,15 +274,34 @@ fn run_case(fixture: &Fixture, case: &CaseSpec) -> Result<MemoryEvalCaseReport, 
     let db_path = sandbox.path.join("case.cupld");
     let mut engine = CupldEngine::default();
     let markdown_root = fixture.path.join("markdown");
+    let vault_before = fixture.path.join("vault-before");
+    let vault_after = fixture.path.join("vault-after");
     let mut warnings = Vec::new();
 
-    if markdown_root.exists() {
-        sync_markdown_root(&mut engine, &markdown_root).map_err(|error| {
+    if vault_before.exists() && vault_after.exists() {
+        let transition_root = sandbox.path.join("vault");
+        copy_dir_all(&vault_before, &transition_root).map_err(|error| {
             format!(
-                "failed to sync markdown for fixture `{}` case `{}`: {error}",
+                "failed to stage vault-before for fixture `{}` case `{}`: {error}",
                 fixture.name, case.name
             )
         })?;
+        sync_fixture_markdown_root(&mut engine, &transition_root, &fixture.name, &case.name)?;
+        fs::remove_dir_all(&transition_root).map_err(|error| {
+            format!(
+                "failed to clear staged vault for fixture `{}` case `{}`: {error}",
+                fixture.name, case.name
+            )
+        })?;
+        copy_dir_all(&vault_after, &transition_root).map_err(|error| {
+            format!(
+                "failed to stage vault-after for fixture `{}` case `{}`: {error}",
+                fixture.name, case.name
+            )
+        })?;
+        sync_fixture_markdown_root(&mut engine, &transition_root, &fixture.name, &case.name)?;
+    } else if markdown_root.exists() {
+        sync_fixture_markdown_root(&mut engine, &markdown_root, &fixture.name, &case.name)?;
     } else {
         warnings.push("fixture has no markdown directory".to_owned());
     }
@@ -331,6 +350,36 @@ fn run_case(fixture: &Fixture, case: &CaseSpec) -> Result<MemoryEvalCaseReport, 
         assertions,
         warnings,
     })
+}
+
+fn sync_fixture_markdown_root(
+    engine: &mut CupldEngine,
+    markdown_root: &Path,
+    fixture: &str,
+    case: &str,
+) -> Result<(), String> {
+    sync_markdown_root(engine, markdown_root).map_err(|error| {
+        format!(
+            "failed to sync markdown root `{}` for fixture `{fixture}` case `{case}`: {error}",
+            markdown_root.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn run_assertion(

@@ -95,6 +95,13 @@ fn write_memory_eval_fixture(root: &Path, name: &str, spec: &str) {
     fs::write(fixture.join("case.json"), spec).unwrap();
 }
 
+fn write_stale_memory_eval_fixture(root: &Path, name: &str, spec: &str) {
+    let fixture = root.join(name);
+    fs::create_dir_all(fixture.join("vault-before")).unwrap();
+    fs::create_dir_all(fixture.join("vault-after")).unwrap();
+    fs::write(fixture.join("case.json"), spec).unwrap();
+}
+
 fn run_cli_with_input_in_dir(
     args: &[&str],
     input: &str,
@@ -530,6 +537,74 @@ fn cli_eval_memory_failed_assertion_includes_expected_actual_and_diff() {
             .get("diff")
             .and_then(json::JsonValue::as_str)
             .is_some()
+    );
+}
+
+#[test]
+fn cli_eval_memory_syncs_stale_docs_through_before_and_after_vaults() {
+    let fixtures = TempDir::new("eval_memory_stale_docs");
+    write_stale_memory_eval_fixture(
+        fixtures.path(),
+        "stale",
+        r#"{
+  "cases": [
+    {
+      "name": "stale-transition",
+      "assertions": [
+        {
+          "type": "query_rows",
+          "query": "MATCH (d:MarkdownDocument) RETURN d.`src.path`, d.`src.status` ORDER BY d.`src.path`",
+          "expected": [
+            {"columns": ["col_1", "col_2"], "rows": [["current.md", "current"], ["removed.md", "missing"]]}
+          ]
+        },
+        {
+          "type": "query_rows",
+          "query": "MATCH (:MarkdownDocument {`src.path`: 'removed.md'})-[e:MD_LINKS_TO]->(:MarkdownDocument) RETURN count(e)",
+          "expected": [
+            {"columns": ["col_1"], "rows": [[0]]}
+          ]
+        }
+      ]
+    }
+  ]
+}"#,
+    );
+    let fixture = fixtures.path().join("stale");
+    fs::write(
+        fixture.join("vault-before").join("removed.md"),
+        "# Removed\n\n[[current]]\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.join("vault-before").join("current.md"),
+        "# Current\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.join("vault-after").join("current.md"),
+        "# Current\n",
+    )
+    .unwrap();
+
+    let output = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(&stdout).unwrap();
+    assert_eq!(
+        parsed
+            .get("summary")
+            .and_then(|summary| summary.get("passed"))
+            .and_then(json::JsonValue::as_i64),
+        Some(1)
     );
 }
 
