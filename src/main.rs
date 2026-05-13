@@ -9,8 +9,9 @@ use std::thread;
 use std::time::Duration;
 
 use cupld::{
-    MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, MemoryMaintenanceCheck,
-    MemoryMaintenanceReport, MemoryMaintenanceStatus, QueryResult, RuntimeValue, Session, Value,
+    MAX_TRAVERSAL_DEPTH, MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions,
+    MemoryMaintenanceCheck, MemoryMaintenanceReport, MemoryMaintenanceStatus, QueryResult,
+    RuntimeValue, Session, Value,
     automation::{
         AutomationError, AutomationPolicy, build_context_response, context_as_json,
         context_as_ndjson, format_error_json as machine_error_json,
@@ -191,11 +192,7 @@ fn run() -> Result<(), String> {
             max_rows,
             query_args: &query_args,
         }),
-        CliCommand::Context {
-            db_path,
-            output,
-            top_k,
-        } => run_context(db_path, output, top_k),
+        CliCommand::Context { config } => run_context(config),
         CliCommand::Schema { db_path } => run_schema(&db_path),
         CliCommand::Compact { db_path } => run_compact(db_path),
         CliCommand::Check { db_path } => run_check(db_path),
@@ -252,9 +249,7 @@ enum CliCommand {
         query_args: Vec<String>,
     },
     Context {
-        db_path: PathBuf,
-        output: OutputFormat,
-        top_k: usize,
+        config: ContextRunConfig,
     },
     Schema {
         db_path: PathBuf,
@@ -287,6 +282,27 @@ enum CliCommand {
         read_only: bool,
     },
     Install(InstallCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextDirection {
+    In,
+    Out,
+    Both,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ContextRunConfig {
+    db_path: PathBuf,
+    output: OutputFormat,
+    nodes: Vec<usize>,
+    paths: Vec<String>,
+    depth: u8,
+    direction: ContextDirection,
+    edge_types: Vec<String>,
+    labels: Vec<String>,
+    max_nodes: usize,
+    max_edges: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -706,7 +722,14 @@ fn parse_query_command(args: &[String]) -> Result<CliCommand, String> {
 fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
     let mut db_path = None;
     let mut output = OutputFormat::Json;
-    let mut top_k = 20usize;
+    let mut nodes = Vec::new();
+    let mut paths = Vec::new();
+    let mut depth = 1u8;
+    let mut direction = ContextDirection::Both;
+    let mut edge_types = Vec::new();
+    let mut labels = Vec::new();
+    let mut max_nodes = 20usize;
+    let mut max_edges = 100usize;
     let mut index = 0;
 
     while index < args.len() {
@@ -730,12 +753,79 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
                 index += 2;
             }
             "--top-k" => {
+                return Err("context_legacy_top_k_removed".to_owned());
+            }
+            "--node" => {
                 let Some(value) = args.get(index + 1) else {
-                    return Err("expected --top-k <n> for `context` command".to_owned());
+                    return Err("expected --node <id> for `context` command".to_owned());
                 };
-                top_k = value
+                nodes.push(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "expected --node <id> for `context` command".to_owned())?,
+                );
+                index += 2;
+            }
+            "--path" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --path <src.path> for `context` command".to_owned());
+                };
+                paths.push(value.to_owned());
+                index += 2;
+            }
+            "--depth" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --depth <n> for `context` command".to_owned());
+                };
+                depth = value
+                    .parse::<u8>()
+                    .map_err(|_| "expected --depth <n> for `context` command".to_owned())?;
+                if depth > MAX_TRAVERSAL_DEPTH {
+                    return Err(format!(
+                        "context_depth_above_max: --depth must be <= {MAX_TRAVERSAL_DEPTH}"
+                    ));
+                }
+                index += 2;
+            }
+            "--direction" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(
+                        "expected --direction <in|out|both> for `context` command".to_owned()
+                    );
+                };
+                direction = parse_context_direction(value)?;
+                index += 2;
+            }
+            "--edge-type" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --edge-type <type> for `context` command".to_owned());
+                };
+                edge_types.push(value.to_owned());
+                index += 2;
+            }
+            "--label" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --label <label> for `context` command".to_owned());
+                };
+                labels.push(value.to_owned());
+                index += 2;
+            }
+            "--max-nodes" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --max-nodes <n> for `context` command".to_owned());
+                };
+                max_nodes = value
                     .parse::<usize>()
-                    .map_err(|_| "expected --top-k <n> for `context` command".to_owned())?;
+                    .map_err(|_| "expected --max-nodes <n> for `context` command".to_owned())?;
+                index += 2;
+            }
+            "--max-edges" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("expected --max-edges <n> for `context` command".to_owned());
+                };
+                max_edges = value
+                    .parse::<usize>()
+                    .map_err(|_| "expected --max-edges <n> for `context` command".to_owned())?;
                 index += 2;
             }
             value => {
@@ -750,11 +840,32 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
     let Some(db_path) = db_path else {
         return Err("expected --db <path.cupld|default> for `context` command".to_owned());
     };
+    if nodes.is_empty() && paths.is_empty() {
+        return Err("context_seed_required".to_owned());
+    }
     Ok(CliCommand::Context {
-        db_path,
-        output,
-        top_k,
+        config: ContextRunConfig {
+            db_path,
+            output,
+            nodes,
+            paths,
+            depth,
+            direction,
+            edge_types,
+            labels,
+            max_nodes,
+            max_edges,
+        },
     })
+}
+
+fn parse_context_direction(input: &str) -> Result<ContextDirection, String> {
+    match input {
+        "in" => Ok(ContextDirection::In),
+        "out" => Ok(ContextDirection::Out),
+        "both" => Ok(ContextDirection::Both),
+        _ => Err("expected --direction <in|out|both>".to_owned()),
+    }
 }
 
 fn parse_output_format(input: &str) -> Result<OutputFormat, String> {
@@ -1284,7 +1395,7 @@ Commands:
   --visualise             Open the interactive scene viewer for --db.
   --query                 Seed the scene with one read-only RETURN query.
   query                   Run a query against --db using inline text or stdin.
-  context                 Build compact context rows (top-k nodes) for agent prompts.
+  context                 Build compact seeded context rows for agent prompts.
   --with-md               Overlay markdown documents into `query` before execution.
   --root                  Override the markdown root for `query` or `sync markdown`.
   --include-fs-graph      Persist markdown directory nodes and filesystem structural edges during `sync markdown`.
@@ -1294,6 +1405,14 @@ Commands:
   --batch-ms              Max coalescing window before a forced watched sync.
   --idle-ms               Exit watched sync after this long with no pending changes.
   --max-runs              Stop watched sync after this many sync runs, including the initial run.
+  --node                  Seed `context` from a graph node id; repeatable.
+  --path                  Seed `context` from a markdown src.path; repeatable.
+  --depth                 Traversal depth for `context` seeds.
+  --direction             Traversal direction for `context`: in, out, both.
+  --edge-type             Restrict `context` traversal to an edge type; repeatable.
+  --label                 Restrict `context` nodes to a label; repeatable.
+  --max-nodes             Maximum context nodes to return.
+  --max-edges             Maximum context edges to traverse.
   --output                Select output mode for query/context/memory: table, json, ndjson.
   --params-json           Provide named query parameters as a JSON object.
   --params-file           Read named query parameters from a JSON file.
@@ -1374,7 +1493,10 @@ fn run_query(config: QueryRunConfig<'_>) -> Result<(), String> {
     Ok(())
 }
 
-fn run_context(db_path: PathBuf, output: OutputFormat, top_k: usize) -> Result<(), String> {
+fn run_context(config: ContextRunConfig) -> Result<(), String> {
+    let output = config.output;
+    let top_k = config.max_nodes;
+    let db_path = config.db_path;
     let query = format!(
         "MATCH (n) RETURN id(n) AS node_id, labels(n) AS labels, n.name AS name, n.title AS title ORDER BY id(n) LIMIT {top_k}"
     );
@@ -2919,12 +3041,13 @@ fn value_string(value: &RuntimeValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, InputEvent, MemoryCommand, OutputFormat, ReplInput, cap_results,
-        cli_usage_text, format_error_json, parse_cli_command, parse_params_json, result_as_json,
-        result_as_ndjson, should_offer_skill_install_prompt, table_value, version_text,
+        CliCommand, ContextDirection, ContextRunConfig, InputEvent, MemoryCommand, OutputFormat,
+        ReplInput, cap_results, cli_usage_text, format_error_json, parse_cli_command,
+        parse_params_json, result_as_json, result_as_ndjson, should_offer_skill_install_prompt,
+        table_value, version_text,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
-    use cupld::{QueryResult, RuntimeValue, Value, json};
+    use cupld::{MAX_TRAVERSAL_DEPTH, QueryResult, RuntimeValue, Value, json};
     use std::path::PathBuf;
 
     fn default_alias_db_path() -> PathBuf {
@@ -3082,17 +3205,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_context_command_defaults_and_overrides() {
+    fn parses_context_command_defaults_and_repeated_flags() {
         assert_eq!(
             parse_cli_command(&[
                 "context".to_owned(),
                 "--db".to_owned(),
                 "db.cupld".to_owned(),
+                "--node".to_owned(),
+                "42".to_owned(),
             ]),
             Ok(CliCommand::Context {
-                db_path: PathBuf::from("db.cupld"),
-                output: OutputFormat::Json,
-                top_k: 20,
+                config: ContextRunConfig {
+                    db_path: PathBuf::from("db.cupld"),
+                    output: OutputFormat::Json,
+                    nodes: vec![42],
+                    paths: Vec::new(),
+                    depth: 1,
+                    direction: ContextDirection::Both,
+                    edge_types: Vec::new(),
+                    labels: Vec::new(),
+                    max_nodes: 20,
+                    max_edges: 100,
+                },
             })
         );
 
@@ -3103,13 +3237,44 @@ mod tests {
                 "db.cupld".to_owned(),
                 "--output".to_owned(),
                 "ndjson".to_owned(),
-                "--top-k".to_owned(),
+                "--node".to_owned(),
                 "7".to_owned(),
+                "--node".to_owned(),
+                "8".to_owned(),
+                "--path".to_owned(),
+                "notes/a.md".to_owned(),
+                "--path".to_owned(),
+                "notes/b.md".to_owned(),
+                "--depth".to_owned(),
+                "3".to_owned(),
+                "--direction".to_owned(),
+                "out".to_owned(),
+                "--edge-type".to_owned(),
+                "LINKS_TO".to_owned(),
+                "--edge-type".to_owned(),
+                "MENTIONS".to_owned(),
+                "--label".to_owned(),
+                "MarkdownDocument".to_owned(),
+                "--label".to_owned(),
+                "Concept".to_owned(),
+                "--max-nodes".to_owned(),
+                "50".to_owned(),
+                "--max-edges".to_owned(),
+                "150".to_owned(),
             ]),
             Ok(CliCommand::Context {
-                db_path: PathBuf::from("db.cupld"),
-                output: OutputFormat::Ndjson,
-                top_k: 7,
+                config: ContextRunConfig {
+                    db_path: PathBuf::from("db.cupld"),
+                    output: OutputFormat::Ndjson,
+                    nodes: vec![7, 8],
+                    paths: vec!["notes/a.md".to_owned(), "notes/b.md".to_owned()],
+                    depth: 3,
+                    direction: ContextDirection::Out,
+                    edge_types: vec!["LINKS_TO".to_owned(), "MENTIONS".to_owned()],
+                    labels: vec!["MarkdownDocument".to_owned(), "Concept".to_owned()],
+                    max_nodes: 50,
+                    max_edges: 150,
+                },
             })
         );
     }
@@ -3121,12 +3286,85 @@ mod tests {
                 "context".to_owned(),
                 "--db".to_owned(),
                 "default".to_owned(),
+                "--path".to_owned(),
+                "notes/a.md".to_owned(),
             ]),
             Ok(CliCommand::Context {
-                db_path: default_alias_db_path(),
-                output: OutputFormat::Json,
-                top_k: 20,
+                config: ContextRunConfig {
+                    db_path: default_alias_db_path(),
+                    output: OutputFormat::Json,
+                    nodes: Vec::new(),
+                    paths: vec!["notes/a.md".to_owned()],
+                    depth: 1,
+                    direction: ContextDirection::Both,
+                    edge_types: Vec::new(),
+                    labels: Vec::new(),
+                    max_nodes: 20,
+                    max_edges: 100,
+                },
             })
+        );
+    }
+
+    #[test]
+    fn rejects_context_legacy_top_k_and_missing_seed() {
+        assert_eq!(
+            parse_cli_command(&[
+                "context".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+                "--top-k".to_owned(),
+                "20".to_owned(),
+            ]),
+            Err("context_legacy_top_k_removed".to_owned())
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "context".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+            ]),
+            Err("context_seed_required".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_context_invalid_values_and_depth_above_max() {
+        assert_eq!(
+            parse_cli_command(&[
+                "context".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+                "--node".to_owned(),
+                "abc".to_owned(),
+            ]),
+            Err("expected --node <id> for `context` command".to_owned())
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "context".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+                "--node".to_owned(),
+                "1".to_owned(),
+                "--direction".to_owned(),
+                "sideways".to_owned(),
+            ]),
+            Err("expected --direction <in|out|both>".to_owned())
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "context".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+                "--node".to_owned(),
+                "1".to_owned(),
+                "--depth".to_owned(),
+                (MAX_TRAVERSAL_DEPTH + 1).to_string(),
+            ]),
+            Err(format!(
+                "context_depth_above_max: --depth must be <= {MAX_TRAVERSAL_DEPTH}"
+            ))
         );
     }
 

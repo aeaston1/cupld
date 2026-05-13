@@ -10,7 +10,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `cupld <path.cupld>` or `cupld --db <path.cupld|default>` to open or create a file-backed REPL.
 - Use `cupld install` to install or refresh the bundled `cupld-md-memory` skill and bootstrap local memory. The default DB path is `./.cupld/default.cupld` and the default markdown root is `./.cupld/data/`.
 - Use `--db default` to target `./.cupld/default.cupld`.
-- Use `cupld query --db <path.cupld|default> ...` for one-shot automation and `cupld context --db <path.cupld|default> ...` for top-k context rows.
+- Use `cupld query --db <path.cupld|default> ...` for one-shot automation and `cupld context --db <path.cupld|default> --node <id>|--path <src.path> ...` for seeded context rows.
 - Use `cupld mcp serve --db <path.cupld|default>` for MCP-capable harnesses that can call local memory tools over stdio.
 - Use `cupld query --db ... --with-md` for transient markdown overlay reads.
 - Use `cupld sync markdown --db ...` to persist markdown and `cupld sync markdown --db ... --watch` to keep syncing after the initial run.
@@ -31,7 +31,7 @@ cupld --visualise --db <path.cupld|default>
 cupld --db <path.cupld|default> --visualise
 cupld --visualise --db <path.cupld|default> --query 'MATCH (n) RETURN n LIMIT 10'
 cupld query --db <path.cupld|default> [--with-md] [--root <path>] [--output <table|json|ndjson>] [--params-json <json> | --params-file <path>] [--max-rows <n>] [query]
-cupld context --db <path.cupld|default> [--top-k <n>] [--output <table|json|ndjson>]
+cupld context --db <path.cupld|default> (--node <id> | --path <src.path>) [--node <id> ...] [--path <src.path> ...] [--depth <n>] [--direction <in|out|both>] [--edge-type <type> ...] [--label <label> ...] [--max-nodes <n>] [--max-edges <n>] [--output <table|json|ndjson>]
 cupld schema --db <path.cupld|default>
 cupld compact --db <path.cupld|default>
 cupld check --db <path.cupld|default>
@@ -121,7 +121,7 @@ For safe automation, prefer this order:
 1. `cupld check --db default`
 2. `cupld schema --db default`
 3. `cupld query --db default --output json 'MATCH (n) RETURN n ORDER BY id(n) LIMIT 10'`
-4. `cupld context --db default --top-k 25 --output json` when prompt assembly needs a bounded context window
+4. `cupld context --db default --path notes/example.md --max-nodes 25 --output json` when prompt assembly needs a seeded context window
 5. `cupld query --db default --with-md ...` when you want markdown overlaid without persisting it
 6. `cupld sync markdown --db default` or `cupld sync markdown --db default --watch ...` when later plain queries should see persisted markdown state
 

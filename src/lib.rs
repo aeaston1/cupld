@@ -17,10 +17,10 @@ pub use engine::{
 };
 pub use memory_report::{MemoryMaintenanceCheck, MemoryMaintenanceReport, MemoryMaintenanceStatus};
 pub use query::{
-    BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, HopRange, NodePattern, OrderItem,
-    ParamValue, Pattern, PatternSegment, PropertyTarget, Query, QueryError, RemoveTarget,
-    ReturnItem, SchemaTargetExpr, SetAssignment, SetOperator, SetTarget, ShowKind, Statement,
-    UnaryOp, WithClause, parse_script,
+    BinaryOp, ConstraintSpec, Direction, EdgePattern, Expr, HopRange, MAX_TRAVERSAL_DEPTH,
+    NodePattern, OrderItem, ParamValue, Pattern, PatternSegment, PropertyTarget, Query, QueryError,
+    RemoveTarget, ReturnItem, SchemaTargetExpr, SetAssignment, SetOperator, SetTarget, ShowKind,
+    Statement, UnaryOp, WithClause, parse_script,
 };
 pub use runtime::{ExecutionError, QueryResult, RuntimeValue, Session, TransactionInfo};
 pub use source::{
