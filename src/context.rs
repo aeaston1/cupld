@@ -297,56 +297,102 @@ fn build_context_response(
     }
 
     let mut buffer = String::new();
-    loop {
-        let mut response = ContextEnvelope {
-            ok: true,
-            command: "context".to_owned(),
-            mode: "seeded".to_owned(),
-            policy,
-            retrieval_usage: RetrievalUsage {
-                nodes: nodes.len(),
-                edges: edges.len(),
-                snippet_bytes: 0,
-                total_payload_bytes: 0,
-                truncated,
-            },
-            provenance: ContextProvenance {
-                db_path: db_path.display().to_string(),
-                source: "cupld.context".to_owned(),
-            },
-            request: ContextRequestSummary::from_request(request),
-            seeds: seeds.clone(),
-            nodes: nodes.clone(),
-            edges: edges.clone(),
-            warnings: warnings.clone(),
-        };
-        let payload_bytes = context_payload_bytes(&mut response, &mut buffer);
-        if payload_bytes <= retrieval_budget.total_payload_bytes
-            || response.nodes.len() <= seed_count
+    let mut response = context_envelope(
+        db_path, request, policy, &seeds, &nodes, &edges, &warnings, truncated,
+    );
+    if context_payload_bytes(&mut response, &mut buffer) <= retrieval_budget.total_payload_bytes {
+        return Ok(response);
+    }
+
+    ensure_truncation_warning(&mut warnings);
+    truncated = true;
+
+    while !edges.is_empty() {
+        let mut response = context_envelope(
+            db_path, request, policy, &seeds, &nodes, &edges, &warnings, truncated,
+        );
+        if context_payload_bytes(&mut response, &mut buffer) <= retrieval_budget.total_payload_bytes
         {
             return Ok(response);
         }
-        response.nodes.pop();
-        let retained_ids = response
-            .nodes
+        edges.pop();
+    }
+
+    while nodes.len() > seed_count {
+        let mut response = context_envelope(
+            db_path, request, policy, &seeds, &nodes, &edges, &warnings, truncated,
+        );
+        if context_payload_bytes(&mut response, &mut buffer) <= retrieval_budget.total_payload_bytes
+        {
+            return Ok(response);
+        }
+        nodes.pop();
+        let retained_ids = nodes
             .iter()
             .map(|node| node.node_id)
             .collect::<BTreeSet<_>>();
-        nodes = response.nodes;
         edges.retain(|edge| {
             retained_ids.contains(&edge.source_node_id)
                 && retained_ids.contains(&edge.target_node_id)
         });
-        if !warnings
-            .iter()
-            .any(|warning| warning.code == "context_budget_truncated")
-        {
-            warnings.push(ContextWarning {
-                code: "context_budget_truncated".to_owned(),
-                message: "context traversal was truncated by retrieval budgets".to_owned(),
-            });
-        }
-        truncated = true;
+    }
+
+    let mut response = context_envelope(
+        db_path, request, policy, &seeds, &nodes, &edges, &warnings, truncated,
+    );
+    if context_payload_bytes(&mut response, &mut buffer) <= retrieval_budget.total_payload_bytes {
+        return Ok(response);
+    }
+
+    Err(AutomationError::new(
+        "context_payload_too_large",
+        "context payload cannot fit within the retrieval budget while preserving all seed nodes",
+    ))
+}
+
+fn context_envelope(
+    db_path: &Path,
+    request: &ContextRequest,
+    policy: AutomationPolicy,
+    seeds: &[ContextSeedSummary],
+    nodes: &[ContextNode],
+    edges: &[ContextEdge],
+    warnings: &[ContextWarning],
+    truncated: bool,
+) -> ContextEnvelope {
+    ContextEnvelope {
+        ok: true,
+        command: "context".to_owned(),
+        mode: "seeded".to_owned(),
+        policy,
+        retrieval_usage: RetrievalUsage {
+            nodes: nodes.len(),
+            edges: edges.len(),
+            snippet_bytes: 0,
+            total_payload_bytes: 0,
+            truncated,
+        },
+        provenance: ContextProvenance {
+            db_path: db_path.display().to_string(),
+            source: "cupld.context".to_owned(),
+        },
+        request: ContextRequestSummary::from_request(request),
+        seeds: seeds.to_vec(),
+        nodes: nodes.to_vec(),
+        edges: edges.to_vec(),
+        warnings: warnings.to_vec(),
+    }
+}
+
+fn ensure_truncation_warning(warnings: &mut Vec<ContextWarning>) {
+    if !warnings
+        .iter()
+        .any(|warning| warning.code == "context_budget_truncated")
+    {
+        warnings.push(ContextWarning {
+            code: "context_budget_truncated".to_owned(),
+            message: "context traversal was truncated by retrieval budgets".to_owned(),
+        });
     }
 }
 
@@ -1132,6 +1178,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn payload_budget_removes_edges_before_non_seed_nodes() {
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([
+                (1, node(1, &["Seed"], Some("Seed"))),
+                (2, node(2, &["Doc"], Some("Near"))),
+            ]),
+            ..graph_edges(vec![edge_with_property(1, 1, 2, "MENTIONS", 80_000)])
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1],
+            paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1)],
+            depth: 1,
+            direction: ContextDirection::Out,
+            edge_types: Vec::new(),
+            labels: Vec::new(),
+            max_nodes: 10,
+            max_edges: 10,
+        };
+
+        let response = build_context_response(Path::new("test.cupld"), &request, graph).unwrap();
+
+        assert_eq!(
+            response
+                .nodes
+                .iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(response.edges.is_empty());
+        assert!(response.retrieval_usage.truncated);
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "context_budget_truncated")
+        );
+    }
+
+    #[test]
+    fn payload_budget_fails_when_seed_properties_cannot_fit() {
+        let seed = node_with_property(1, &["Seed"], "blob", 80_000);
+        let graph = ContextGraph {
+            nodes: BTreeMap::from([(seed.node_id, seed)]),
+            ..graph_edges(Vec::new())
+        };
+        let request = ContextRequest {
+            db_path: PathBuf::from("test.cupld"),
+            nodes: vec![1],
+            paths: Vec::new(),
+            seeds: vec![ContextSeedRequest::Node(1)],
+            depth: 0,
+            direction: ContextDirection::Both,
+            edge_types: Vec::new(),
+            labels: Vec::new(),
+            max_nodes: 10,
+            max_edges: 10,
+        };
+
+        let error = build_context_response(Path::new("test.cupld"), &request, graph).unwrap_err();
+
+        assert_eq!(error.code(), "context_payload_too_large");
+    }
+
     fn node(id: i64, labels: &[&str], name: Option<&str>) -> ContextNode {
         let properties = name
             .map(|name| BTreeMap::from([("name".to_owned(), Value::from(name))]))
@@ -1158,6 +1271,21 @@ mod tests {
         }
     }
 
+    fn node_with_property(id: i64, labels: &[&str], key: &str, value_len: usize) -> ContextNode {
+        let value = "x".repeat(value_len);
+        ContextNode {
+            node_id: id,
+            depth: 0,
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            properties: BTreeMap::from([(key.to_owned(), Value::from(value))]),
+            name: None,
+            title: None,
+            display: None,
+            evidence: Vec::new(),
+            src_status: None,
+        }
+    }
+
     fn edge(
         edge_id: i64,
         source_node_id: i64,
@@ -1174,6 +1302,19 @@ mod tests {
             properties: BTreeMap::new(),
             evidence: Vec::new(),
         }
+    }
+
+    fn edge_with_property(
+        edge_id: i64,
+        source_node_id: i64,
+        target_node_id: i64,
+        edge_type: &str,
+        value_len: usize,
+    ) -> ContextEdge {
+        let mut edge = edge(edge_id, source_node_id, target_node_id, edge_type);
+        edge.properties
+            .insert("blob".to_owned(), Value::from("x".repeat(value_len)));
+        edge
     }
 
     fn graph_edges(edges: Vec<ContextEdge>) -> ContextGraph {

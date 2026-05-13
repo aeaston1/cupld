@@ -162,7 +162,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    let command = parse_cli_command(&args)?;
+    let command = parse_cli_command(&args).map_err(|error| format_parse_error(&args, error))?;
     maybe_suggest_release_upgrade(&command);
     if should_offer_skill_install_prompt(&command)
         && let Err(error) = skill_install::maybe_prompt_for_repl()
@@ -235,6 +235,19 @@ fn run() -> Result<(), String> {
         } => run_mcp_serve(db_path, root_override, read_only),
         CliCommand::Install(command) => skill_install::install(command),
     }
+}
+
+fn format_parse_error(args: &[String], error: String) -> String {
+    if matches!(args.first().map(String::as_str), Some("context")) {
+        let code = error
+            .split_once(':')
+            .map(|(code, _)| code)
+            .unwrap_or(error.as_str());
+        if code.starts_with("context_") {
+            return format_error_json(code, &error);
+        }
+    }
+    error
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -781,7 +794,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
                 };
                 depth = value
                     .parse::<u8>()
-                    .map_err(|_| "expected --depth <n> for `context` command".to_owned())?;
+                    .map_err(|_| "context_invalid_depth: expected --depth <n>".to_owned())?;
                 if depth > MAX_TRAVERSAL_DEPTH {
                     return Err(format!(
                         "context_depth_above_max: --depth must be <= {MAX_TRAVERSAL_DEPTH}"
@@ -867,7 +880,7 @@ fn parse_context_direction(input: &str) -> Result<ContextDirection, String> {
         "in" => Ok(ContextDirection::In),
         "out" => Ok(ContextDirection::Out),
         "both" => Ok(ContextDirection::Both),
-        _ => Err("expected --direction <in|out|both>".to_owned()),
+        _ => Err("context_invalid_direction: expected --direction <in|out|both>".to_owned()),
     }
 }
 
@@ -3803,7 +3816,19 @@ mod tests {
                 "--direction".to_owned(),
                 "sideways".to_owned(),
             ]),
-            Err("expected --direction <in|out|both>".to_owned())
+            Err("context_invalid_direction: expected --direction <in|out|both>".to_owned())
+        );
+        assert_eq!(
+            parse_cli_command(&[
+                "context".to_owned(),
+                "--db".to_owned(),
+                "default".to_owned(),
+                "--node".to_owned(),
+                "1".to_owned(),
+                "--depth".to_owned(),
+                "wide".to_owned(),
+            ]),
+            Err("context_invalid_depth: expected --depth <n>".to_owned())
         );
         assert_eq!(
             parse_cli_command(&[
