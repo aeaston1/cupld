@@ -1,0 +1,31 @@
+{
+  "document_frontmatter": [
+    {
+      "columns": ["col_1", "col_2", "col_3"],
+      "rows": [
+        [
+          true,
+          ["Index", "Sibling", "next-step", "appendix.md"],
+          {
+            "title": "Source With Relationships",
+            "parent": "[[Index]]",
+            "related": ["[[Sibling]]"],
+            "next": "next-step",
+            "links": ["appendix.md"]
+          }
+        ]
+      ]
+    }
+  ],
+  "edge_provenance": [
+    {
+      "columns": ["col_1", "col_2", "col_3"],
+      "rows": [
+        ["appendix.md", ["frontmatter"], ["link"]],
+        ["index.md", ["frontmatter"], ["up"]],
+        ["next-step.md", ["frontmatter"], ["next"]],
+        ["sibling.md", ["frontmatter", "body"], ["related"]]
+      ]
+    }
+  ]
+}

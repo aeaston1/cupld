@@ -1,0 +1,46 @@
+{
+  "cases": [
+    {
+      "name": "frontmatter-provenance",
+      "assertions": [
+        {
+          "type": "query_rows",
+          "query": "MATCH (d:MarkdownDocument {`src.path`: 'source.md'}) RETURN d.`md.has_frontmatter`, d.`md.links`, d.`md.frontmatter`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2", "col_3"],
+              "rows": [
+                [
+                  true,
+                  ["Index", "Sibling", "next-step", "appendix.md"],
+                  {
+                    "title": "Source With Relationships",
+                    "parent": "[[Index]]",
+                    "related": ["[[Sibling]]"],
+                    "next": "next-step",
+                    "links": ["appendix.md"]
+                  }
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "type": "query_rows",
+          "query": "MATCH (:MarkdownDocument {`src.path`: 'source.md'})-[e:MD_LINKS_TO]->(d:MarkdownDocument) RETURN d.`src.path`, e.`md.link_sources`, e.`md.link_rels` ORDER BY d.`src.path`",
+          "expected": [
+            {
+              "columns": ["col_1", "col_2", "col_3"],
+              "rows": [
+                ["appendix.md", ["frontmatter"], ["link"]],
+                ["index.md", ["frontmatter"], ["up"]],
+                ["next-step.md", ["frontmatter"], ["next"]],
+                ["sibling.md", ["frontmatter", "body"], ["related"]]
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
