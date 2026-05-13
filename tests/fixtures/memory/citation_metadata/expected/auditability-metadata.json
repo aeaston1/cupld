@@ -2,13 +2,24 @@
   "stable_metadata": [
     {
       "columns": ["col_1", "col_2", "col_3", "col_4", "col_5", "col_6"],
-      "rows": [["markdown", "document", "current", "Audit Source", ["audit", "source"], true]]
+      "rows": [
+        [
+          "markdown",
+          "document",
+          "current",
+          "Audit Source",
+          ["audit", "source"],
+          true
+        ]
+      ]
     }
   ],
   "required_source_fields_present": [
     {
       "columns": ["col_1", "col_2"],
-      "rows": [["audit-source.md", "Audit Source"]]
+      "rows": [
+        ["audit-source.md", "Audit Source"]
+      ]
     }
   ]
 }

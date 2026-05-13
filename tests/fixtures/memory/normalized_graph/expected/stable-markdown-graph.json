@@ -1,0 +1,65 @@
+{
+  "assertion_1": {
+    "nodes": [
+      {
+        "key": "source.md",
+        "labels": ["MarkdownDocument"],
+        "properties": {
+          "md.aliases": [],
+          "md.body": "\nLinks to [[target]].\n",
+          "md.frontmatter": {
+            "title": "Source",
+            "tags": ["memory"]
+          },
+          "md.has_frontmatter": true,
+          "md.headings": [],
+          "md.links": ["target"],
+          "md.raw": "---\ntitle: Source\ntags: [memory]\n---\n\nLinks to [[target]].\n",
+          "md.tags": ["memory"],
+          "md.title": "Source",
+          "src.connector": "markdown",
+          "src.hash": "97f230da34fa1a33",
+          "src.kind": "document",
+          "src.path": "source.md",
+          "src.status": "current"
+        }
+      },
+      {
+        "key": "target.md",
+        "labels": ["MarkdownDocument"],
+        "properties": {
+          "md.aliases": [],
+          "md.body": "# Target\n\nLinked target.\n",
+          "md.has_frontmatter": false,
+          "md.headings": ["Target"],
+          "md.links": [],
+          "md.raw": "# Target\n\nLinked target.\n",
+          "md.tags": [],
+          "md.title": "Target",
+          "src.connector": "markdown",
+          "src.hash": "8b96e433905af4ab",
+          "src.kind": "document",
+          "src.path": "target.md",
+          "src.status": "current"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "key": "source.md|MD_LINKS_TO|target.md",
+        "from": "source.md",
+        "type": "MD_LINKS_TO",
+        "to": "target.md",
+        "properties": {
+          "md.link_rels": [],
+          "md.link_sources": ["body"],
+          "md.link_target": "target",
+          "md.link_targets": ["target"],
+          "src.connector": "markdown",
+          "src.kind": "link",
+          "src.status": "current"
+        }
+      }
+    ]
+  }
+}

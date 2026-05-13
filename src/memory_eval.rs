@@ -27,6 +27,7 @@ pub struct MemoryEvalReport {
     pub selected_case: Option<String>,
     pub summary: MemoryEvalSummary,
     pub cases: Vec<MemoryEvalCaseReport>,
+    pub snapshot_updates: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -85,17 +86,20 @@ struct CaseSpec {
     name: String,
     setup: Vec<String>,
     assertions: Vec<AssertionSpec>,
+    snapshot_path: PathBuf,
 }
 
 struct AssertionSpec {
     assertion_type: String,
     query: String,
     expected: JsonValue,
+    snapshot_key: String,
 }
 
 pub fn run(config: MemoryEvalConfig) -> Result<MemoryEvalReport, String> {
     let fixtures = discover_fixtures(&config.fixtures, config.case.as_deref())?;
     let mut cases = Vec::new();
+    let mut snapshot_updates = Vec::new();
     let mut summary = MemoryEvalSummary {
         fixtures: fixtures.len(),
         ..MemoryEvalSummary::default()
@@ -103,10 +107,14 @@ pub fn run(config: MemoryEvalConfig) -> Result<MemoryEvalReport, String> {
 
     for fixture in fixtures {
         for case in &fixture.cases {
-            let case_report = run_case(&fixture, case)?;
+            let case_report = run_case(&fixture, case, config.update_snapshots)?;
+            if config.update_snapshots {
+                let updates = write_case_snapshot(case, &case_report)?;
+                snapshot_updates.extend(updates);
+            }
             summary.cases += 1;
             summary.warnings += case_report.warnings.len();
-            if case_report.status == EvalStatus::Fail {
+            if !config.update_snapshots && case_report.status == EvalStatus::Fail {
                 summary.failed += 1;
             } else {
                 summary.passed += 1;
@@ -122,6 +130,7 @@ pub fn run(config: MemoryEvalConfig) -> Result<MemoryEvalReport, String> {
         selected_case: config.case,
         summary,
         cases,
+        snapshot_updates,
     })
 }
 
@@ -173,6 +182,12 @@ pub fn report_as_table(report: &MemoryEvalReport) -> String {
         report.summary.failed,
         report.summary.warnings
     ));
+    if !report.snapshot_updates.is_empty() {
+        output.push_str("snapshot_updates:\n");
+        for path in &report.snapshot_updates {
+            output.push_str(&format!("{path}\n"));
+        }
+    }
     output
 }
 
@@ -197,10 +212,11 @@ fn discover_fixtures(root: &Path, selected: Option<&str>) -> Result<Vec<Fixture>
         if !spec_path.exists() {
             continue;
         }
+        let fixture_path = path.clone();
         fixtures.push(Fixture {
             name,
             path,
-            cases: parse_fixture_spec(&spec_path)?,
+            cases: parse_fixture_spec(&spec_path, &fixture_path)?,
         });
     }
 
@@ -217,7 +233,7 @@ fn discover_fixtures(root: &Path, selected: Option<&str>) -> Result<Vec<Fixture>
     Ok(fixtures)
 }
 
-fn parse_fixture_spec(path: &Path) -> Result<Vec<CaseSpec>, String> {
+fn parse_fixture_spec(path: &Path, fixture_path: &Path) -> Result<Vec<CaseSpec>, String> {
     let input = fs::read_to_string(path)
         .map_err(|error| format!("failed to read fixture `{}`: {error}", path.display()))?;
     let parsed = json::parse(&input)
@@ -227,28 +243,65 @@ fn parse_fixture_spec(path: &Path) -> Result<Vec<CaseSpec>, String> {
         .and_then(JsonValue::as_array)
         .ok_or_else(|| format!("fixture `{}` must contain a cases array", path.display()))?;
 
-    cases.iter().map(parse_case_spec).collect()
+    cases
+        .iter()
+        .map(|case| parse_case_spec(case, fixture_path))
+        .collect()
 }
 
-fn parse_case_spec(value: &JsonValue) -> Result<CaseSpec, String> {
+fn parse_case_spec(value: &JsonValue, fixture_path: &Path) -> Result<CaseSpec, String> {
     let name = required_string(value, "name")?;
+    let snapshot_path = fixture_path.join("expected").join(format!("{name}.json"));
+    let snapshot = load_expected_snapshot(&snapshot_path)?;
     let setup = optional_string_array(value, "setup")?;
-    let assertions = value
+    let raw_assertions = value
         .get("assertions")
         .and_then(JsonValue::as_array)
-        .ok_or_else(|| format!("case `{name}` must contain an assertions array"))?
+        .ok_or_else(|| format!("case `{name}` must contain an assertions array"))?;
+    let assertions = raw_assertions
         .iter()
-        .map(parse_assertion_spec)
+        .enumerate()
+        .map(|(index, assertion)| parse_assertion_spec(assertion, index, snapshot.as_deref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CaseSpec {
         name,
         setup,
         assertions,
+        snapshot_path,
     })
 }
 
-fn parse_assertion_spec(value: &JsonValue) -> Result<AssertionSpec, String> {
+fn load_expected_snapshot(path: &Path) -> Result<Option<Vec<(String, JsonValue)>>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let input = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "failed to read expected snapshot `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let parsed = json::parse(&input).map_err(|error| {
+        format!(
+            "failed to parse expected snapshot `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let JsonValue::Object(entries) = parsed else {
+        return Err(format!(
+            "expected snapshot `{}` must contain a JSON object",
+            path.display()
+        ));
+    };
+    Ok(Some(entries))
+}
+
+fn parse_assertion_spec(
+    value: &JsonValue,
+    index: usize,
+    snapshot: Option<&[(String, JsonValue)]>,
+) -> Result<AssertionSpec, String> {
     let assertion_type = required_string(value, "type")?;
     let query = if assertion_type == "graph_snapshot" {
         value
@@ -259,17 +312,34 @@ fn parse_assertion_spec(value: &JsonValue) -> Result<AssertionSpec, String> {
     } else {
         required_string(value, "query")?
     };
+    let snapshot_key = value
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+        .or_else(|| snapshot.and_then(|entries| entries.get(index).map(|(key, _)| key.clone())))
+        .unwrap_or_else(|| format!("assertion_{}", index + 1));
+    let expected = snapshot
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|(key, _)| key == &snapshot_key)
+                .map(|(_, value)| value.clone())
+        })
+        .or_else(|| value.get("expected").cloned())
+        .ok_or_else(|| "assertion must contain expected".to_owned())?;
     Ok(AssertionSpec {
         assertion_type,
         query,
-        expected: value
-            .get("expected")
-            .cloned()
-            .ok_or_else(|| "assertion must contain expected".to_owned())?,
+        expected,
+        snapshot_key,
     })
 }
 
-fn run_case(fixture: &Fixture, case: &CaseSpec) -> Result<MemoryEvalCaseReport, String> {
+fn run_case(
+    fixture: &Fixture,
+    case: &CaseSpec,
+    update_snapshots: bool,
+) -> Result<MemoryEvalCaseReport, String> {
     let sandbox = EvalSandbox::new(&fixture.name, &case.name)?;
     let db_path = sandbox.path.join("case.cupld");
     let mut engine = CupldEngine::default();
@@ -305,12 +375,13 @@ fn run_case(fixture: &Fixture, case: &CaseSpec) -> Result<MemoryEvalCaseReport, 
 
     let mut assertions = Vec::new();
     for assertion in &case.assertions {
-        assertions.push(run_assertion(
-            &mut session,
-            &fixture.name,
-            &case.name,
-            assertion,
-        )?);
+        let mut report = run_assertion(&mut session, &fixture.name, &case.name, assertion)?;
+        if update_snapshots {
+            report.expected = report.actual.clone();
+            report.status = EvalStatus::Pass;
+            report.diff = None;
+        }
+        assertions.push(report);
     }
 
     let status = if assertions
@@ -331,6 +402,38 @@ fn run_case(fixture: &Fixture, case: &CaseSpec) -> Result<MemoryEvalCaseReport, 
         assertions,
         warnings,
     })
+}
+
+fn write_case_snapshot(
+    case: &CaseSpec,
+    report: &MemoryEvalCaseReport,
+) -> Result<Vec<String>, String> {
+    let entries = case
+        .assertions
+        .iter()
+        .zip(report.assertions.iter())
+        .map(|(spec, assertion)| (spec.snapshot_key.clone(), assertion.actual.clone()));
+    let snapshot = JsonValue::object(entries);
+    let output = format!("{}\n", pretty_json(&snapshot));
+    let existing = fs::read_to_string(&case.snapshot_path).ok();
+    if existing.as_deref() == Some(output.as_str()) {
+        return Ok(Vec::new());
+    }
+    if let Some(parent) = case.snapshot_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create expected snapshot directory `{}`: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&case.snapshot_path, output).map_err(|error| {
+        format!(
+            "failed to write expected snapshot `{}`: {error}",
+            case.snapshot_path.display()
+        )
+    })?;
+    Ok(vec![case.snapshot_path.display().to_string()])
 }
 
 fn run_assertion(
@@ -538,7 +641,12 @@ fn normalized_properties(properties: &PropertyMap) -> BTreeMap<String, JsonValue
 }
 
 fn is_volatile_property(key: &str) -> bool {
-    key == "id" || key.ends_with(".id") || key.ends_with("_id")
+    key == "id"
+        || key == "src.root"
+        || key.contains("duration")
+        || key.contains("elapsed")
+        || key.ends_with(".id")
+        || key.ends_with("_id")
 }
 
 fn value_json(value: &Value) -> JsonValue {
@@ -589,8 +697,8 @@ fn query_result_json(result: &crate::QueryResult) -> JsonValue {
 
 fn normalized_runtime_value_json(value: &RuntimeValue) -> JsonValue {
     match value {
-        RuntimeValue::Node(node_id) => JsonValue::from(format!("node:{}", node_id.get())),
-        RuntimeValue::Edge(edge_id) => JsonValue::from(format!("edge:{}", edge_id.get())),
+        RuntimeValue::Node(_) => JsonValue::from("<node>"),
+        RuntimeValue::Edge(_) => JsonValue::from("<edge>"),
         _ => json::runtime_value_to_json(value),
     }
 }
@@ -812,6 +920,10 @@ fn report_json_fields(report: &MemoryEvalReport, ndjson: bool) -> Vec<(String, J
                 .unwrap_or(JsonValue::Null),
         ),
         ("summary".to_owned(), summary_json(&report.summary)),
+        (
+            "snapshot_updates".to_owned(),
+            JsonValue::array(report.snapshot_updates.iter().cloned().map(JsonValue::from)),
+        ),
     ];
     if !ndjson {
         fields.push((
@@ -895,6 +1007,64 @@ fn truncate(value: &str, max: usize) -> String {
     } else {
         format!("{}...", &value[..max])
     }
+}
+
+fn pretty_json(value: &JsonValue) -> String {
+    let mut output = String::new();
+    pretty_json_value(value, 0, &mut output);
+    output
+}
+
+fn pretty_json_value(value: &JsonValue, indent: usize, output: &mut String) {
+    match value {
+        JsonValue::Array(values) if values.is_empty() => output.push_str("[]"),
+        JsonValue::Array(values) if values.iter().all(is_json_scalar) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                json::write_to(output, value);
+            }
+            output.push(']');
+        }
+        JsonValue::Array(values) => {
+            output.push('[');
+            output.push('\n');
+            for (index, value) in values.iter().enumerate() {
+                output.push_str(&" ".repeat(indent + 2));
+                pretty_json_value(value, indent + 2, output);
+                if index + 1 != values.len() {
+                    output.push(',');
+                }
+                output.push('\n');
+            }
+            output.push_str(&" ".repeat(indent));
+            output.push(']');
+        }
+        JsonValue::Object(entries) if entries.is_empty() => output.push_str("{}"),
+        JsonValue::Object(entries) => {
+            output.push('{');
+            output.push('\n');
+            for (index, (key, value)) in entries.iter().enumerate() {
+                output.push_str(&" ".repeat(indent + 2));
+                json::write_quoted_string(output, key);
+                output.push_str(": ");
+                pretty_json_value(value, indent + 2, output);
+                if index + 1 != entries.len() {
+                    output.push(',');
+                }
+                output.push('\n');
+            }
+            output.push_str(&" ".repeat(indent));
+            output.push('}');
+        }
+        _ => json::write_to(output, value),
+    }
+}
+
+fn is_json_scalar(value: &JsonValue) -> bool {
+    !matches!(value, JsonValue::Array(_) | JsonValue::Object(_))
 }
 
 fn required_string(value: &JsonValue, key: &str) -> Result<String, String> {

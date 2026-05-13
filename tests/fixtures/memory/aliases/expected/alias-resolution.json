@@ -2,16 +2,27 @@
   "resolved_edges": [
     {
       "columns": ["col_1", "col_2"],
-      "rows": [["unique-target.md", "Project Codename"]]
+      "rows": [
+        ["unique-target.md", "Project Codename"]
+      ]
     }
   ],
   "alias_inventory": [
     {
       "columns": ["col_1", "col_2"],
       "rows": [
-        ["shared-one.md", ["Shared Alias"]],
-        ["shared-two.md", ["Shared Alias"]],
-        ["unique-target.md", ["Project Codename"]]
+        [
+          "shared-one.md",
+          ["Shared Alias"]
+        ],
+        [
+          "shared-two.md",
+          ["Shared Alias"]
+        ],
+        [
+          "unique-target.md",
+          ["Project Codename"]
+        ]
       ]
     }
   ]
