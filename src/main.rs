@@ -3,10 +3,10 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, ExitCode};
+use std::process::{self, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cupld::{
     MAX_TRAVERSAL_DEPTH, MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions,
@@ -45,6 +45,9 @@ const REQUIRED_MARKDOWN_SOURCE_METADATA: [&str; 6] = [
     "src.hash",
     "src.status",
 ];
+const RELEASE_CHECK_CACHE_FILE: &str = "release-check-cache.json";
+const RELEASE_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/aeaston1/cupld/releases/latest";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -160,6 +163,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let command = parse_cli_command(&args)?;
+    maybe_suggest_release_upgrade(&command);
     if should_offer_skill_install_prompt(&command)
         && let Err(error) = skill_install::maybe_prompt_for_repl()
     {
@@ -200,6 +204,7 @@ fn run() -> Result<(), String> {
         CliCommand::Schema { db_path } => run_schema(&db_path),
         CliCommand::Compact { db_path } => run_compact(db_path),
         CliCommand::Check { db_path } => run_check(db_path),
+        CliCommand::Upgrade { db_path } => run_upgrade(db_path),
         CliCommand::Memory(command) => run_memory(command),
         CliCommand::SyncMarkdown {
             db_path,
@@ -263,6 +268,9 @@ enum CliCommand {
         db_path: PathBuf,
     },
     Check {
+        db_path: PathBuf,
+    },
+    Upgrade {
         db_path: PathBuf,
     },
     Memory(MemoryCommand),
@@ -374,6 +382,13 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand, String> {
             ensure_subcommand_has_no_option(&args[1..], "check", "--query")?;
             Ok(CliCommand::Check {
                 db_path: parse_db_path(&args[1..], "check", false)?,
+            })
+        }
+        Some("upgrade") => {
+            ensure_subcommand_has_no_option(&args[1..], "upgrade", "--visualise")?;
+            ensure_subcommand_has_no_option(&args[1..], "upgrade", "--query")?;
+            Ok(CliCommand::Upgrade {
+                db_path: parse_optional_db_path(&args[1..], "upgrade")?,
             })
         }
         Some("memory") => parse_memory_command(&args[1..]),
@@ -1408,6 +1423,7 @@ Commands:
   schema                  Print SHOW SCHEMA for --db.
   compact                 Rewrite --db and reset its WAL.
   check                   Validate --db and print recovery metadata.
+  upgrade                 Back up --db, validate it, and run memory check; defaults to --db default.
   memory check            Validate memory DB health and markdown maintenance status.
   memory find-stale       List indexed markdown documents that differ from the filesystem.
   memory find-orphans     List tombstoned markdown documents and directories retained in memory.
@@ -1567,9 +1583,258 @@ fn install_prompt_disabled() -> bool {
     )
 }
 
+fn release_upgrade_check_disabled() -> bool {
+    matches!(
+        env::var("CUPLD_NO_UPGRADE_CHECK").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 fn should_offer_skill_install_prompt(command: &CliCommand) -> bool {
     !install_prompt_disabled()
         && matches!(command, CliCommand::ReplMemory | CliCommand::ReplWithDb(_))
+}
+
+fn maybe_suggest_release_upgrade(command: &CliCommand) {
+    if release_upgrade_check_disabled() {
+        return;
+    }
+    let Some(db_path) = command.db_path_for_upgrade_hint() else {
+        return;
+    };
+    let Some(latest) = latest_release_for_startup_hint() else {
+        return;
+    };
+    if !is_newer_semver(&latest.version, env!("CARGO_PKG_VERSION")) {
+        return;
+    }
+    eprintln!(
+        "A newer cupld release is available: {} (current {}). Update cupld, then run `cupld upgrade --db {}` before normal DB use. See {}",
+        latest.version,
+        env!("CARGO_PKG_VERSION"),
+        db_path.display(),
+        latest.url
+    );
+}
+
+impl CliCommand {
+    fn db_path_for_upgrade_hint(&self) -> Option<&Path> {
+        match self {
+            Self::ReplWithDb(path)
+            | Self::Visualise { db_path: path, .. }
+            | Self::Query { db_path: path, .. }
+            | Self::Schema { db_path: path }
+            | Self::Compact { db_path: path }
+            | Self::Check { db_path: path }
+            | Self::Upgrade { db_path: path }
+            | Self::SyncMarkdown { db_path: path, .. }
+            | Self::SourceSetRoot { db_path: path, .. }
+            | Self::McpServe { db_path: path, .. } => Some(path),
+            Self::Context { request, .. } => Some(&request.db_path),
+            Self::Memory(command) => command.db_path_for_upgrade_hint(),
+            Self::Help | Self::Version | Self::ReplMemory | Self::Install(_) => None,
+        }
+    }
+}
+
+impl MemoryCommand {
+    fn db_path_for_upgrade_hint(&self) -> Option<&Path> {
+        match self {
+            Self::Check { db_path, .. }
+            | Self::FindStale { db_path, .. }
+            | Self::FindOrphans { db_path, .. }
+            | Self::Reindex { db_path, .. } => Some(db_path),
+            Self::Deferred { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LatestReleaseInfo {
+    version: String,
+    url: String,
+}
+
+fn latest_release_for_startup_hint() -> Option<LatestReleaseInfo> {
+    let cache_path = release_check_cache_path()?;
+    let now = unix_timestamp_secs()?;
+    if let Some(cached) = read_release_check_cache(&cache_path, now) {
+        return cached.latest;
+    }
+
+    let fetched = fetch_latest_release();
+    let _ = write_release_check_cache(&cache_path, now, fetched.as_ref());
+    fetched
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleaseCheckCache {
+    checked_at_unix: u64,
+    latest: Option<LatestReleaseInfo>,
+}
+
+fn read_release_check_cache(path: &Path, now: u64) -> Option<ReleaseCheckCache> {
+    let contents = fs::read_to_string(path).ok()?;
+    let parsed = json::parse(&contents).ok()?;
+    let checked_at_unix = json_u64(parsed.get("checked_at_unix")?)?;
+    if now.saturating_sub(checked_at_unix) >= RELEASE_CHECK_INTERVAL_SECS {
+        return None;
+    }
+    let latest_version = parsed
+        .get("latest_version")
+        .and_then(json::JsonValue::as_str)
+        .map(str::to_owned);
+    let latest_url = parsed
+        .get("latest_url")
+        .and_then(json::JsonValue::as_str)
+        .map(str::to_owned);
+    let latest = match (latest_version, latest_url) {
+        (Some(version), Some(url)) => Some(LatestReleaseInfo { version, url }),
+        _ => None,
+    };
+    Some(ReleaseCheckCache {
+        checked_at_unix,
+        latest,
+    })
+}
+
+fn json_u64(value: &json::JsonValue) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+}
+
+fn write_release_check_cache(
+    path: &Path,
+    checked_at_unix: u64,
+    latest: Option<&LatestReleaseInfo>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let (latest_version, latest_url) = match latest {
+        Some(latest) => (
+            json::JsonValue::from(latest.version.clone()),
+            json::JsonValue::from(latest.url.clone()),
+        ),
+        None => (json::JsonValue::Null, json::JsonValue::Null),
+    };
+    let rendered = json::stringify(&json::JsonValue::object([
+        ("checked_at_unix", json::JsonValue::from(checked_at_unix)),
+        ("latest_version", latest_version),
+        ("latest_url", latest_url),
+    ]));
+    fs::write(path, rendered).map_err(|error| error.to_string())
+}
+
+fn fetch_latest_release() -> Option<LatestReleaseInfo> {
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            "2",
+            "--header",
+            concat!("User-Agent: cupld/", env!("CARGO_PKG_VERSION")),
+            LATEST_RELEASE_URL,
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(output.stdout).ok()?;
+    parse_latest_release_response(&body)
+}
+
+fn parse_latest_release_response(input: &str) -> Option<LatestReleaseInfo> {
+    let parsed = json::parse(input).ok()?;
+    let version = parsed.get("tag_name")?.as_str()?.to_owned();
+    let url = parsed
+        .get("html_url")
+        .and_then(json::JsonValue::as_str)
+        .unwrap_or("https://github.com/aeaston1/cupld/releases/latest")
+        .to_owned();
+    Some(LatestReleaseInfo { version, url })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Semver {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+fn parse_semver(input: &str) -> Option<Semver> {
+    let version = input
+        .trim()
+        .strip_prefix('v')
+        .unwrap_or_else(|| input.trim());
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Semver {
+        major,
+        minor,
+        patch,
+    })
+}
+
+fn is_newer_semver(candidate: &str, current: &str) -> bool {
+    match (parse_semver(candidate), parse_semver(current)) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+fn unix_timestamp_secs() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn release_check_cache_path() -> Option<PathBuf> {
+    if cfg!(windows)
+        && let Some(path) = env_path("APPDATA")
+    {
+        return Some(path.join(".cupld").join(RELEASE_CHECK_CACHE_FILE));
+    }
+    if let Some(path) = env_path("XDG_CONFIG_HOME") {
+        return Some(path.join(".cupld").join(RELEASE_CHECK_CACHE_FILE));
+    }
+    home_dir().map(|home| {
+        home.join(".config")
+            .join(".cupld")
+            .join(RELEASE_CHECK_CACHE_FILE)
+    })
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env_path("HOME")
+        .or_else(|| env_path("USERPROFILE"))
+        .or_else(|| match (env_path("HOMEDRIVE"), env_path("HOMEPATH")) {
+            (Some(drive), Some(path)) => Some(PathBuf::from(format!(
+                "{}{}",
+                drive.display(),
+                path.display()
+            ))),
+            _ => None,
+        })
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn run_visualise(db_path: PathBuf, query: Option<String>) -> Result<(), String> {
@@ -1593,18 +1858,90 @@ fn run_compact(db_path: PathBuf) -> Result<(), String> {
 }
 
 fn run_check(db_path: PathBuf) -> Result<(), String> {
-    let report = Session::check(&db_path).map_err(|error| error.to_string())?;
-    let session = Session::open(&db_path).map_err(|error| error.to_string())?;
-    let alias_diagnostics = markdown_alias_diagnostics(session.engine());
+    let check = check_database(&db_path)?;
     println!(
         "ok db={} last_tx_id={} wal_records={} recovered_tail={} ambiguous_markdown_aliases={}",
         db_path.display(),
-        report.last_tx_id,
-        report.wal_records,
-        report.recovered_tail,
-        alias_diagnostics.ambiguous_alias_count()
+        check.last_tx_id,
+        check.wal_records,
+        check.recovered_tail,
+        check.ambiguous_markdown_aliases
     );
     Ok(())
+}
+
+struct DatabaseCheckSummary {
+    last_tx_id: u64,
+    wal_records: usize,
+    recovered_tail: bool,
+    ambiguous_markdown_aliases: usize,
+}
+
+fn check_database(db_path: &Path) -> Result<DatabaseCheckSummary, String> {
+    let report = Session::check(db_path).map_err(|error| error.to_string())?;
+    let session = Session::open(db_path).map_err(|error| error.to_string())?;
+    let alias_diagnostics = markdown_alias_diagnostics(session.engine());
+    Ok(DatabaseCheckSummary {
+        last_tx_id: report.last_tx_id,
+        wal_records: report.wal_records,
+        recovered_tail: report.recovered_tail,
+        ambiguous_markdown_aliases: alias_diagnostics.ambiguous_alias_count(),
+    })
+}
+
+fn run_upgrade(db_path: PathBuf) -> Result<(), String> {
+    let backup_path = backup_database(&db_path)?;
+    let check = check_database(&db_path)?;
+    let memory_report = build_memory_check_report(&db_path, None, OutputFormat::Table, false)?;
+
+    println!("backup={}", backup_path.display());
+    println!(
+        "check=pass db={} last_tx_id={} wal_records={} recovered_tail={} ambiguous_markdown_aliases={}",
+        db_path.display(),
+        check.last_tx_id,
+        check.wal_records,
+        check.recovered_tail,
+        check.ambiguous_markdown_aliases
+    );
+    println!(
+        "memory_check={} db={} root={}",
+        memory_report.status.as_str(),
+        memory_report.db_path.display(),
+        memory_report
+            .root
+            .as_ref()
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "null".to_owned())
+    );
+    Ok(())
+}
+
+fn backup_database(db_path: &Path) -> Result<PathBuf, String> {
+    if !db_path.exists() {
+        return Err(format!("database does not exist: {}", db_path.display()));
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "database path has no valid file name: {}",
+                db_path.display()
+            )
+        })?;
+    let backup_path = db_path.with_file_name(format!("{file_name}.backup.{timestamp}"));
+    fs::copy(db_path, &backup_path).map_err(|error| {
+        format!(
+            "failed to back up {} to {}: {error}",
+            db_path.display(),
+            backup_path.display()
+        )
+    })?;
+    Ok(backup_path)
 }
 
 fn resolved_report_db_path(db_path: &Path, output: OutputFormat) -> Result<PathBuf, String> {
@@ -1675,11 +2012,26 @@ fn run_memory_check(
     output: OutputFormat,
     strict: bool,
 ) -> Result<(), String> {
-    let report_db_path = resolved_report_db_path(&db_path, output)?;
-    let integrity = Session::check(&db_path)
+    let report = build_memory_check_report(&db_path, root_override.as_deref(), output, strict)?;
+    let status = report.status;
+    print_memory_report(&report, output);
+    if strict && status == MemoryMaintenanceStatus::Warn {
+        process::exit(2);
+    }
+    Ok(())
+}
+
+fn build_memory_check_report(
+    db_path: &Path,
+    root_override: Option<&Path>,
+    output: OutputFormat,
+    strict: bool,
+) -> Result<MemoryMaintenanceReport, String> {
+    let report_db_path = resolved_report_db_path(db_path, output)?;
+    let integrity = Session::check(db_path)
         .map_err(AutomationError::from)
         .map_err(|error| format_command_error(output, &error))?;
-    let mut session = Session::open(&db_path)
+    let mut session = Session::open(db_path)
         .map_err(AutomationError::from)
         .map_err(|error| format_command_error(output, &error))?;
     let root =
@@ -1802,11 +2154,7 @@ fn run_memory_check(
             rows: Vec::new(),
         },
     };
-    print_memory_report(&report, output);
-    if strict && status == MemoryMaintenanceStatus::Warn {
-        process::exit(2);
-    }
-    Ok(())
+    Ok(report)
 }
 
 fn run_memory_find_stale(
@@ -2802,6 +3150,24 @@ fn parse_db_path(
     parse_db_flag_value(&args[1])
 }
 
+fn parse_optional_db_path(args: &[String], command: &str) -> Result<PathBuf, String> {
+    if args.is_empty() {
+        return parse_db_flag_value("default");
+    }
+    if args.len() == 2 && args[0] == "--db" {
+        return parse_db_flag_value(&args[1]);
+    }
+    if args.first().map(String::as_str) == Some("--db") {
+        return Err(format!(
+            "expected --db <path.cupld|default> for `{command}` command"
+        ));
+    }
+    Err(format!(
+        "`{command}` accepts only optional --db <path.cupld|default>\n\n{}",
+        cli_usage_text()
+    ))
+}
+
 fn parse_query(db_path: PathBuf, query_args: &[String]) -> Result<(PathBuf, String), String> {
     if query_args.is_empty() {
         let mut input = String::new();
@@ -2880,6 +3246,7 @@ fn is_registered_command(input: &str) -> bool {
             | "schema"
             | "compact"
             | "check"
+            | "upgrade"
             | "memory"
             | "sync"
             | "source"
@@ -3003,20 +3370,113 @@ fn value_string(value: &RuntimeValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, InputEvent, MemoryCommand, OutputFormat, ReplInput, cap_results,
-        cli_usage_text, format_error_json, parse_cli_command, parse_params_json, result_as_json,
-        result_as_ndjson, should_offer_skill_install_prompt, table_value, version_text,
+        CliCommand, InputEvent, LatestReleaseInfo, MemoryCommand, OutputFormat,
+        RELEASE_CHECK_INTERVAL_SECS, ReplInput, cap_results, cli_usage_text, format_error_json,
+        is_newer_semver, parse_cli_command, parse_latest_release_response, parse_params_json,
+        parse_semver, read_release_check_cache, result_as_json, result_as_ndjson,
+        should_offer_skill_install_prompt, table_value, version_text, write_release_check_cache,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
     use cupld::context::{ContextDirection, ContextRequest, ContextSeed};
     use cupld::{MAX_TRAVERSAL_DEPTH, QueryResult, RuntimeValue, Value, json};
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn default_alias_db_path() -> PathBuf {
         std::env::current_dir()
             .unwrap()
             .join(".cupld")
             .join("default.cupld")
+    }
+
+    fn temp_cache_path(prefix: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cupld_{prefix}_{}_{}.json",
+            std::process::id(),
+            timestamp
+        ))
+    }
+
+    #[test]
+    fn compares_release_semver_versions() {
+        assert_eq!(
+            parse_semver("v1.2.3"),
+            Some(super::Semver {
+                major: 1,
+                minor: 2,
+                patch: 3,
+            })
+        );
+        assert!(is_newer_semver("v0.3.1", "0.3.0"));
+        assert!(is_newer_semver("v0.4.0", "0.3.9"));
+        assert!(is_newer_semver("1.0.0", "0.99.99"));
+        assert!(!is_newer_semver("0.3.0", "0.3.0"));
+        assert!(!is_newer_semver("0.2.9", "0.3.0"));
+        assert!(!is_newer_semver("not-a-version", "0.3.0"));
+    }
+
+    #[test]
+    fn parses_latest_release_response() {
+        let release = parse_latest_release_response(
+            r#"{"tag_name":"v0.4.0","html_url":"https://github.com/aeaston1/cupld/releases/tag/v0.4.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(release.version, "v0.4.0");
+        assert_eq!(
+            release.url,
+            "https://github.com/aeaston1/cupld/releases/tag/v0.4.0"
+        );
+    }
+
+    #[test]
+    fn release_check_cache_reads_fresh_entries() {
+        let path = temp_cache_path("release_cache_fresh");
+        let latest = LatestReleaseInfo {
+            version: "v9.0.0".to_owned(),
+            url: "https://example.com/v9".to_owned(),
+        };
+        write_release_check_cache(&path, 1_000, Some(&latest)).unwrap();
+
+        let cache =
+            read_release_check_cache(&path, 1_000 + RELEASE_CHECK_INTERVAL_SECS - 1).unwrap();
+
+        assert_eq!(cache.checked_at_unix, 1_000);
+        assert_eq!(cache.latest, Some(latest));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn release_check_cache_ignores_stale_and_malformed_entries() {
+        let stale = temp_cache_path("release_cache_stale");
+        let latest = LatestReleaseInfo {
+            version: "v9.0.0".to_owned(),
+            url: "https://example.com/v9".to_owned(),
+        };
+        write_release_check_cache(&stale, 1_000, Some(&latest)).unwrap();
+        assert!(read_release_check_cache(&stale, 1_000 + RELEASE_CHECK_INTERVAL_SECS).is_none());
+        let _ = fs::remove_file(stale);
+
+        let malformed = temp_cache_path("release_cache_malformed");
+        fs::write(&malformed, "not json").unwrap();
+        assert!(read_release_check_cache(&malformed, 1_000).is_none());
+        let _ = fs::remove_file(malformed);
+    }
+
+    #[test]
+    fn release_check_cache_can_record_failed_fetch() {
+        let path = temp_cache_path("release_cache_failed_fetch");
+        write_release_check_cache(&path, 2_000, None).unwrap();
+
+        let cache = read_release_check_cache(&path, 2_100).unwrap();
+
+        assert_eq!(cache.checked_at_unix, 2_000);
+        assert_eq!(cache.latest, None);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -3130,6 +3590,29 @@ mod tests {
                 params_file: None,
                 max_rows: 1_000,
                 query_args: vec!["MATCH".into(), "(n)".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_upgrade_with_default_db_alias() {
+        let args = vec!["upgrade".to_owned()];
+        assert_eq!(
+            parse_cli_command(&args),
+            Ok(CliCommand::Upgrade {
+                db_path: default_alias_db_path(),
+            })
+        );
+
+        let explicit = vec![
+            "upgrade".to_owned(),
+            "--db".to_owned(),
+            "db.cupld".to_owned(),
+        ];
+        assert_eq!(
+            parse_cli_command(&explicit),
+            Ok(CliCommand::Upgrade {
+                db_path: PathBuf::from("db.cupld"),
             })
         );
     }

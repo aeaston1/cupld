@@ -94,21 +94,34 @@ fn run_cli_with_input_in_dir(
     input: &str,
     dir: Option<&Path>,
 ) -> std::process::Output {
+    run_cli_with_env_in_dir(args, input, dir, &[])
+}
+
+fn run_cli_with_env_in_dir(
+    args: &[&str],
+    input: &str,
+    dir: Option<&Path>,
+    envs: &[(&str, &str)],
+) -> std::process::Output {
     let home = TempDir::new("cli_home");
     let config = TempDir::new("cli_config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cupld"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cupld"));
+    command
         .args(args)
         .current_dir(dir.unwrap_or_else(|| Path::new(".")))
         .env("CUPLD_NO_INSTALL_PROMPT", "1")
+        .env("CUPLD_NO_UPGRADE_CHECK", "1")
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", config.path())
         .env("APPDATA", config.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
     child
         .stdin
         .take()
@@ -129,6 +142,25 @@ fn seed_workspace_default_db(workspace: &Path) -> PathBuf {
     seed_person_graph(&mut session);
     session.save_as(&db_path).unwrap();
     db_path
+}
+
+#[cfg(unix)]
+fn write_fake_curl(dir: &Path, body: &str, exit_code: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join("curl");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {exit_code}\n",
+            body.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }
 
 #[test]
@@ -1730,6 +1762,94 @@ fn cli_compact_resets_wal_for_generated_db() {
     assert!(check.status.success());
     let stdout = String::from_utf8(check.stdout).unwrap();
     assert!(stdout.contains("wal_records=0"));
+}
+
+#[test]
+fn cli_upgrade_backs_up_default_db_and_runs_checks() {
+    let workspace = TempDir::new("cli_upgrade_default");
+    let db_path = seed_workspace_default_db(workspace.path());
+    let notes_root = workspace.path().join(".cupld").join("data");
+    fs::create_dir_all(&notes_root).unwrap();
+
+    let output = run_cli_in_dir(&["upgrade"], workspace.path());
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("backup="));
+    assert!(stdout.contains("check=pass"));
+    assert!(stdout.contains("memory_check=pass"));
+    assert!(db_path.exists());
+
+    let backups = fs::read_dir(db_path.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("default.cupld.backup."))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_db_command_warns_when_latest_release_is_newer() {
+    let workspace = TempDir::new("cli_upgrade_hint_workspace");
+    seed_workspace_default_db(workspace.path());
+    let curl_dir = TempDir::new("cli_upgrade_hint_curl");
+    write_fake_curl(
+        curl_dir.path(),
+        r#"{"tag_name":"v99.0.0","html_url":"https://github.com/aeaston1/cupld/releases/tag/v99.0.0"}"#,
+        0,
+    );
+    let path = curl_dir.path().to_str().unwrap();
+
+    let output = run_cli_with_env_in_dir(
+        &["schema", "--db", "default"],
+        "",
+        Some(workspace.path()),
+        &[("CUPLD_NO_UPGRADE_CHECK", "0"), ("PATH", path)],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("A newer cupld release is available: v99.0.0"));
+    assert!(stderr.contains("cupld upgrade --db"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_db_command_stays_silent_when_latest_release_check_fails() {
+    let workspace = TempDir::new("cli_upgrade_hint_failure_workspace");
+    seed_workspace_default_db(workspace.path());
+    let curl_dir = TempDir::new("cli_upgrade_hint_failure_curl");
+    write_fake_curl(curl_dir.path(), "unavailable", 22);
+    let path = curl_dir.path().to_str().unwrap();
+
+    let output = run_cli_with_env_in_dir(
+        &["schema", "--db", "default"],
+        "",
+        Some(workspace.path()),
+        &[("CUPLD_NO_UPGRADE_CHECK", "0"), ("PATH", path)],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("A newer cupld release is available"));
 }
 
 #[test]
