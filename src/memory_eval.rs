@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     CupldEngine, Edge, Node, PropertyMap, RuntimeValue, Session, Value,
-    context::{ContextDirection, ContextRequest, context_as_json},
+    context::{ContextDirection, ContextRequest, context_as_json, context_as_ndjson},
     json::{self, JsonValue},
     sync_markdown_root,
 };
@@ -252,7 +252,10 @@ fn parse_case_spec(value: &JsonValue) -> Result<CaseSpec, String> {
 
 fn parse_assertion_spec(value: &JsonValue) -> Result<AssertionSpec, String> {
     let assertion_type = required_string(value, "type")?;
-    let query = if assertion_type == "graph_snapshot" || assertion_type == "citation_metadata" {
+    let query = if matches!(
+        assertion_type.as_str(),
+        "graph_snapshot" | "citation_metadata" | "context_export"
+    ) {
         value
             .get("query")
             .and_then(JsonValue::as_str)
@@ -350,6 +353,12 @@ fn run_assertion(
     if assertion.assertion_type == "citation_metadata" {
         return run_citation_metadata_assertion(session, db_path, fixture, case, assertion);
     }
+    if assertion.assertion_type == "query_paths" {
+        return run_query_paths_assertion(session, fixture, case, assertion);
+    }
+    if assertion.assertion_type == "context_export" {
+        return run_context_export_assertion(session, db_path, fixture, case, assertion);
+    }
 
     let results = session
         .execute_script(&assertion.query, &BTreeMap::<String, Value>::new())
@@ -372,6 +381,92 @@ fn run_assertion(
         actual,
         status,
         diff,
+    })
+}
+
+fn run_query_paths_assertion(
+    session: &mut Session,
+    fixture: &str,
+    case: &str,
+    assertion: &AssertionSpec,
+) -> Result<MemoryEvalAssertionReport, String> {
+    let results = session
+        .execute_script(&assertion.query, &BTreeMap::<String, Value>::new())
+        .map_err(|error| {
+            format!("failed query_paths assertion for fixture `{fixture}` case `{case}`: {error}")
+        })?;
+    let actual = JsonValue::array(results.iter().flat_map(query_path_status_rows));
+    let status = if actual == assertion.expected {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+
+    Ok(MemoryEvalAssertionReport {
+        fixture: fixture.to_owned(),
+        case: case.to_owned(),
+        assertion_type: assertion.assertion_type.clone(),
+        expected: assertion.expected.clone(),
+        actual: actual.clone(),
+        status,
+        diff: (status == EvalStatus::Fail).then(|| concise_diff(&assertion.expected, &actual)),
+    })
+}
+
+fn run_context_export_assertion(
+    session: &mut Session,
+    db_path: &Path,
+    fixture: &str,
+    case: &str,
+    assertion: &AssertionSpec,
+) -> Result<MemoryEvalAssertionReport, String> {
+    if !assertion.query.is_empty() {
+        return Err(format!(
+            "context_export assertion for fixture `{fixture}` case `{case}` must not contain `query`"
+        ));
+    }
+    if assertion.options.contains_key("seed_path") {
+        return Err(format!(
+            "context_export assertion for fixture `{fixture}` case `{case}` must not contain `seed_path`"
+        ));
+    }
+    session.save().map_err(|error| error.to_string())?;
+    let seed_node = assertion_option_u64(assertion, "seed_node")?.ok_or_else(|| {
+        format!(
+            "context_export assertion for fixture `{fixture}` case `{case}` requires `seed_node`"
+        )
+    })?;
+    let output = assertion_option_string(assertion, "output")?.unwrap_or_else(|| "json".to_owned());
+    let request = ContextRequest {
+        db_path: db_path.to_path_buf(),
+        nodes: vec![seed_node as usize],
+        paths: Vec::new(),
+        seeds: Vec::new(),
+        depth: assertion_option_u64(assertion, "depth")?.unwrap_or(1) as u8,
+        direction: ContextDirection::Both,
+        edge_types: Vec::new(),
+        labels: Vec::new(),
+        max_nodes: assertion_option_u64(assertion, "max_nodes")?.unwrap_or(25) as usize,
+        max_edges: assertion_option_u64(assertion, "max_edges")?.unwrap_or(100) as usize,
+    };
+    let response = request.run().map_err(|error| {
+        format!("failed context_export assertion for fixture `{fixture}` case `{case}`: {error}")
+    })?;
+    let actual = normalized_context_export(&response, &output)?;
+    let status = if actual == assertion.expected {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+
+    Ok(MemoryEvalAssertionReport {
+        fixture: fixture.to_owned(),
+        case: case.to_owned(),
+        assertion_type: assertion.assertion_type.clone(),
+        expected: assertion.expected.clone(),
+        actual: actual.clone(),
+        status,
+        diff: (status == EvalStatus::Fail).then(|| concise_diff(&assertion.expected, &actual)),
     })
 }
 
@@ -967,6 +1062,205 @@ fn query_result_json(result: &crate::QueryResult) -> JsonValue {
                     .iter()
                     .map(|row| JsonValue::array(row.iter().map(normalized_runtime_value_json))),
             ),
+        ),
+    ])
+}
+
+fn query_path_status_rows(result: &crate::QueryResult) -> Vec<JsonValue> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            JsonValue::object([
+                (
+                    "path",
+                    row.first()
+                        .map(normalized_runtime_value_json)
+                        .unwrap_or(JsonValue::Null),
+                ),
+                (
+                    "src_status",
+                    row.get(1)
+                        .map(normalized_runtime_value_json)
+                        .unwrap_or(JsonValue::Null),
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn normalized_context_export(
+    response: &crate::context::ContextEnvelope,
+    output: &str,
+) -> Result<JsonValue, String> {
+    match output {
+        "json" => {
+            let parsed = json::parse(&context_as_json(response))
+                .map_err(|error| format!("failed to parse context json output: {error}"))?;
+            Ok(JsonValue::object([
+                ("output", JsonValue::from("json")),
+                ("mode", field_string(&parsed, "mode")),
+                (
+                    "request",
+                    parsed.get("request").cloned().unwrap_or(JsonValue::Null),
+                ),
+                (
+                    "seed_count",
+                    JsonValue::from(array_len(&parsed, "seeds") as i64),
+                ),
+                (
+                    "node_count",
+                    JsonValue::from(array_len(&parsed, "nodes") as i64),
+                ),
+                (
+                    "edge_count",
+                    JsonValue::from(array_len(&parsed, "edges") as i64),
+                ),
+                ("warning_codes", warning_codes(&parsed)),
+                ("nodes", normalized_context_nodes(&parsed)),
+                ("has_query", JsonValue::from(parsed.get("query").is_some())),
+                ("has_score", JsonValue::from(parsed.get("score").is_some())),
+                ("has_items", JsonValue::from(parsed.get("items").is_some())),
+                (
+                    "has_snippets",
+                    JsonValue::from(parsed.get("snippets").is_some()),
+                ),
+            ]))
+        }
+        "ndjson" => {
+            let lines = context_as_ndjson(response);
+            let parsed = lines
+                .iter()
+                .map(|line| {
+                    json::parse(line)
+                        .map_err(|error| format!("failed to parse context ndjson output: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(JsonValue::object([
+                ("output", JsonValue::from("ndjson")),
+                (
+                    "kind_order",
+                    JsonValue::array(parsed.iter().map(|line| field_string(line, "kind"))),
+                ),
+                (
+                    "seed_count",
+                    JsonValue::from(kind_count(&parsed, "context_seed") as i64),
+                ),
+                (
+                    "node_count",
+                    JsonValue::from(kind_count(&parsed, "context_node") as i64),
+                ),
+                (
+                    "edge_count",
+                    JsonValue::from(kind_count(&parsed, "context_edge") as i64),
+                ),
+                (
+                    "warning_codes",
+                    parsed
+                        .first()
+                        .map(warning_codes)
+                        .unwrap_or_else(|| JsonValue::array(std::iter::empty::<JsonValue>())),
+                ),
+                (
+                    "nodes",
+                    JsonValue::array(parsed.iter().filter_map(normalized_context_ndjson_node)),
+                ),
+                (
+                    "has_query",
+                    JsonValue::from(parsed.iter().any(|line| line.get("query").is_some())),
+                ),
+                (
+                    "has_score",
+                    JsonValue::from(parsed.iter().any(|line| line.get("score").is_some())),
+                ),
+                (
+                    "has_items",
+                    JsonValue::from(parsed.iter().any(|line| line.get("items").is_some())),
+                ),
+                (
+                    "has_snippets",
+                    JsonValue::from(parsed.iter().any(|line| line.get("snippets").is_some())),
+                ),
+            ]))
+        }
+        other => Err(format!(
+            "context_export output must be `json` or `ndjson`, got `{other}`"
+        )),
+    }
+}
+
+fn field_string(value: &JsonValue, key: &str) -> JsonValue {
+    value
+        .get(key)
+        .and_then(JsonValue::as_str)
+        .map(JsonValue::from)
+        .unwrap_or(JsonValue::Null)
+}
+
+fn array_len(value: &JsonValue, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .map_or(0, <[JsonValue]>::len)
+}
+
+fn kind_count(values: &[JsonValue], kind: &str) -> usize {
+    values
+        .iter()
+        .filter(|value| value.get("kind").and_then(JsonValue::as_str) == Some(kind))
+        .count()
+}
+
+fn warning_codes(value: &JsonValue) -> JsonValue {
+    JsonValue::array(
+        value
+            .get("warnings")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|warning| warning.get("code").and_then(JsonValue::as_str))
+            .map(JsonValue::from),
+    )
+}
+
+fn normalized_context_nodes(value: &JsonValue) -> JsonValue {
+    JsonValue::array(
+        value
+            .get("nodes")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .map(normalized_context_node),
+    )
+}
+
+fn normalized_context_ndjson_node(value: &JsonValue) -> Option<JsonValue> {
+    value
+        .get("node")
+        .filter(|_| value.get("kind").and_then(JsonValue::as_str) == Some("context_node"))
+        .map(normalized_context_node)
+}
+
+fn normalized_context_node(node: &JsonValue) -> JsonValue {
+    let properties = node.get("properties").unwrap_or(&JsonValue::Null);
+    JsonValue::object([
+        (
+            "labels",
+            node.get("labels").cloned().unwrap_or(JsonValue::Null),
+        ),
+        (
+            "path",
+            properties
+                .get("src.path")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "src_status",
+            properties
+                .get("src.status")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
         ),
     ])
 }

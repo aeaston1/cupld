@@ -441,6 +441,209 @@ fn cli_eval_memory_json_is_deterministic_and_reports_summary() {
 }
 
 #[test]
+fn cli_eval_memory_query_paths_asserts_markdown_path_and_source_status() {
+    let fixtures = TempDir::new("eval_memory_query_paths");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "query-paths",
+        r#"{
+  "cases": [
+    {
+      "name": "current-documents",
+      "setup": [
+        "CREATE (:MarkdownDocument {`src.path`: 'notes/current.md', `src.status`: 'current'})",
+        "CREATE (:MarkdownDocument {`src.path`: 'notes/stale.md', `src.status`: 'stale'})"
+      ],
+      "assertions": [
+        {
+          "type": "query_paths",
+          "query": "MATCH (n:MarkdownDocument) RETURN n.`src.path`, n.`src.status` ORDER BY n.`src.path`",
+          "expected": [
+            {"path": "notes/current.md", "src_status": "current"},
+            {"path": "notes/stale.md", "src_status": "stale"}
+          ]
+        }
+      ]
+    }
+  ]
+}"#,
+    );
+
+    let first = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    let second = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    let parsed = json::parse(&String::from_utf8(first.stdout).unwrap()).unwrap();
+    let assertion = &parsed
+        .get("cases")
+        .and_then(json::JsonValue::as_array)
+        .unwrap()[0]
+        .get("assertions")
+        .and_then(json::JsonValue::as_array)
+        .unwrap()[0];
+    assert_eq!(
+        assertion
+            .get("assertion_type")
+            .and_then(json::JsonValue::as_str),
+        Some("query_paths")
+    );
+}
+
+#[test]
+fn cli_eval_memory_context_export_asserts_current_json_shape() {
+    let fixtures = TempDir::new("eval_memory_context_json");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "context-json",
+        r#"{
+  "cases": [
+    {
+      "name": "seeded-shape",
+      "setup": [
+        "CREATE EDGE TYPE MD_LINKS_TO",
+        "CREATE (:MarkdownDocument {`src.path`: 'notes/source.md', `src.status`: 'current'})-[:MD_LINKS_TO]->(:MarkdownDocument {`src.path`: 'notes/target.md', `src.status`: 'current'})"
+      ],
+      "assertions": [
+        {
+          "type": "context_export",
+          "seed_node": 1,
+          "output": "json",
+          "max_nodes": 2,
+          "expected": {
+            "output": "json",
+            "mode": "seeded",
+            "request": {
+              "depth": 1,
+              "direction": "both",
+              "edge_types": [],
+              "labels": [],
+              "max_nodes": 2,
+              "max_edges": 100
+            },
+            "seed_count": 1,
+            "node_count": 2,
+            "edge_count": 1,
+            "warning_codes": [],
+            "nodes": [
+              {"labels": ["MarkdownDocument"], "path": "notes/source.md", "src_status": "current"},
+              {"labels": ["MarkdownDocument"], "path": "notes/target.md", "src_status": "current"}
+            ],
+            "has_query": false,
+            "has_score": false,
+            "has_items": false,
+            "has_snippets": false
+          }
+        }
+      ]
+    }
+  ]
+}"#,
+    );
+
+    let first = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    let second = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+}
+
+#[test]
+fn cli_eval_memory_context_export_asserts_current_ndjson_shape() {
+    let fixtures = TempDir::new("eval_memory_context_ndjson");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "context-ndjson",
+        r#"{
+  "cases": [
+    {
+      "name": "seeded-shape",
+      "setup": [
+        "CREATE EDGE TYPE MD_LINKS_TO",
+        "CREATE (:MarkdownDocument {`src.path`: 'notes/source.md', `src.status`: 'current'})-[:MD_LINKS_TO]->(:MarkdownDocument {`src.path`: 'notes/target.md', `src.status`: 'current'})"
+      ],
+      "assertions": [
+        {
+          "type": "context_export",
+          "seed_node": 1,
+          "output": "ndjson",
+          "max_nodes": 2,
+          "expected": {
+            "output": "ndjson",
+            "kind_order": ["context_meta", "context_seed", "context_node", "context_node", "context_edge"],
+            "seed_count": 1,
+            "node_count": 2,
+            "edge_count": 1,
+            "warning_codes": [],
+            "nodes": [
+              {"labels": ["MarkdownDocument"], "path": "notes/source.md", "src_status": "current"},
+              {"labels": ["MarkdownDocument"], "path": "notes/target.md", "src_status": "current"}
+            ],
+            "has_query": false,
+            "has_score": false,
+            "has_items": false,
+            "has_snippets": false
+          }
+        }
+      ]
+    }
+  ]
+}"#,
+    );
+
+    let first = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+    ]);
+    let second = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+    ]);
+
+    assert!(first.status.success());
+    assert!(second.status.success());
+    assert_eq!(first.stdout, second.stdout);
+}
+
+#[test]
 fn cli_eval_memory_ndjson_orders_suite_case_assertion_events_and_filters_case() {
     let fixtures = TempDir::new("eval_memory_ndjson");
     write_memory_eval_fixture(
