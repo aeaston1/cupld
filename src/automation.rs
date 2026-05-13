@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use crate::json::{self, JsonNumber, JsonValue};
-use crate::{ExecutionError, QueryResult, RuntimeValue, SourceError, Value};
+use crate::{ExecutionError, QueryResult, SourceError, Value};
 
-const DEFAULT_CONTEXT_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const DEFAULT_CONTEXT_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutomationError {
@@ -90,13 +89,13 @@ impl AutomationPolicy {
         }
     }
 
-    pub fn context(max_nodes: usize) -> Self {
+    pub fn context(max_nodes: usize, max_edges: usize) -> Self {
         Self {
             execution_mode: ExecutionMode::AutomationReadOnly,
             max_rows: None,
             retrieval_budget: Some(RetrievalBudget {
                 nodes: max_nodes,
-                edges: 0,
+                edges: max_edges,
                 snippet_bytes: 0,
                 total_payload_bytes: DEFAULT_CONTEXT_MAX_PAYLOAD_BYTES,
             }),
@@ -111,39 +110,6 @@ pub struct RetrievalUsage {
     pub snippet_bytes: usize,
     pub total_payload_bytes: usize,
     pub truncated: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextEvidence {
-    pub field: String,
-    pub value: String,
-    pub source: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextItem {
-    pub node_id: i64,
-    pub labels: Vec<String>,
-    pub name: Option<String>,
-    pub title: Option<String>,
-    pub display: Option<String>,
-    pub evidence: Vec<ContextEvidence>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextProvenance {
-    pub db_path: String,
-    pub source: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextEnvelope {
-    pub ok: bool,
-    pub command: String,
-    pub policy: AutomationPolicy,
-    pub retrieval_usage: RetrievalUsage,
-    pub provenance: ContextProvenance,
-    pub items: Vec<ContextItem>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,95 +199,6 @@ pub fn query_as_ndjson(results: &[QueryResult], policy: AutomationPolicy) -> Vec
     lines
 }
 
-pub fn build_context_response(
-    db_path: &Path,
-    top_k: usize,
-    result: &QueryResult,
-) -> Result<ContextEnvelope, AutomationError> {
-    let policy = AutomationPolicy::context(top_k);
-    let Some(retrieval_budget) = policy.retrieval_budget else {
-        unreachable!("context policy should include retrieval budget");
-    };
-    let mut items = result
-        .rows
-        .iter()
-        .map(|row| parse_context_item(&result.columns, row))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut truncated = items.len() > retrieval_budget.nodes;
-    items.truncate(retrieval_budget.nodes);
-    let mut buffer = String::new();
-
-    loop {
-        let mut response = ContextEnvelope {
-            ok: true,
-            command: "context".to_owned(),
-            policy,
-            retrieval_usage: RetrievalUsage {
-                nodes: items.len(),
-                edges: 0,
-                snippet_bytes: 0,
-                total_payload_bytes: 0,
-                truncated,
-            },
-            provenance: ContextProvenance {
-                db_path: db_path.display().to_string(),
-                source: "cupld.context".to_owned(),
-            },
-            items: items.clone(),
-        };
-        let payload_bytes = context_payload_bytes(&mut response, &mut buffer);
-        if payload_bytes <= retrieval_budget.total_payload_bytes || response.items.is_empty() {
-            return Ok(response);
-        }
-        response.items.pop();
-        items = response.items;
-        truncated = true;
-    }
-}
-
-pub fn context_as_json(response: &ContextEnvelope) -> String {
-    json::stringify(&context_json_value(response))
-}
-
-pub fn context_as_ndjson(response: &ContextEnvelope) -> Vec<String> {
-    let mut lines = vec![json::stringify(&JsonValue::object([
-        ("kind", JsonValue::from("context_meta")),
-        ("ok", JsonValue::Bool(response.ok)),
-        ("command", JsonValue::from(response.command.clone())),
-        ("policy", automation_policy_json_value(&response.policy)),
-        (
-            "retrieval_usage",
-            retrieval_usage_json_value(&response.retrieval_usage),
-        ),
-        (
-            "provenance",
-            context_provenance_json_value(&response.provenance),
-        ),
-    ]))];
-
-    for (item_index, item) in response.items.iter().enumerate() {
-        lines.push(json::stringify(&JsonValue::object([
-            ("kind", JsonValue::from("context_item")),
-            ("item_index", JsonValue::from(item_index)),
-            ("item", context_item_json_value(item)),
-        ])));
-    }
-
-    lines
-}
-
-fn context_payload_bytes(response: &mut ContextEnvelope, buffer: &mut String) -> usize {
-    loop {
-        buffer.clear();
-        json::write_to(buffer, &context_json_value(response));
-        let payload_bytes = buffer.len();
-        if response.retrieval_usage.total_payload_bytes == payload_bytes {
-            return payload_bytes;
-        }
-        response.retrieval_usage.total_payload_bytes = payload_bytes;
-    }
-}
-
 fn json_to_graph_value(value: JsonValue) -> Result<Value, AutomationError> {
     match value {
         JsonValue::Null => Ok(Value::Null),
@@ -376,7 +253,7 @@ fn query_result_json_value(result: &QueryResultEnvelope) -> JsonValue {
     ])
 }
 
-fn automation_policy_json_value(policy: &AutomationPolicy) -> JsonValue {
+pub(crate) fn automation_policy_json_value(policy: &AutomationPolicy) -> JsonValue {
     let mut fields = vec![(
         "execution_mode".to_owned(),
         JsonValue::from(policy.execution_mode.as_str()),
@@ -405,7 +282,7 @@ fn retrieval_budget_json_value(budget: &RetrievalBudget) -> JsonValue {
     ])
 }
 
-fn retrieval_usage_json_value(usage: &RetrievalUsage) -> JsonValue {
+pub(crate) fn retrieval_usage_json_value(usage: &RetrievalUsage) -> JsonValue {
     JsonValue::object([
         ("nodes", JsonValue::from(usage.nodes)),
         ("edges", JsonValue::from(usage.edges)),
@@ -418,195 +295,11 @@ fn retrieval_usage_json_value(usage: &RetrievalUsage) -> JsonValue {
     ])
 }
 
-fn context_evidence_json_value(evidence: &ContextEvidence) -> JsonValue {
-    JsonValue::object([
-        ("field", JsonValue::from(evidence.field.clone())),
-        ("value", JsonValue::from(evidence.value.clone())),
-        ("source", JsonValue::from(evidence.source.clone())),
-    ])
-}
-
-fn context_item_json_value(item: &ContextItem) -> JsonValue {
-    let mut fields = vec![
-        ("node_id".to_owned(), JsonValue::from(item.node_id)),
-        (
-            "labels".to_owned(),
-            JsonValue::array(item.labels.iter().cloned().map(JsonValue::from)),
-        ),
-    ];
-    if let Some(name) = &item.name {
-        fields.push(("name".to_owned(), JsonValue::from(name.clone())));
-    }
-    if let Some(title) = &item.title {
-        fields.push(("title".to_owned(), JsonValue::from(title.clone())));
-    }
-    if let Some(display) = &item.display {
-        fields.push(("display".to_owned(), JsonValue::from(display.clone())));
-    }
-    fields.push((
-        "evidence".to_owned(),
-        JsonValue::array(item.evidence.iter().map(context_evidence_json_value)),
-    ));
-    JsonValue::Object(fields)
-}
-
-fn context_provenance_json_value(provenance: &ContextProvenance) -> JsonValue {
-    JsonValue::object([
-        ("db_path", JsonValue::from(provenance.db_path.clone())),
-        ("source", JsonValue::from(provenance.source.clone())),
-    ])
-}
-
-fn context_json_value(response: &ContextEnvelope) -> JsonValue {
-    JsonValue::object([
-        ("ok", JsonValue::Bool(response.ok)),
-        ("command", JsonValue::from(response.command.clone())),
-        ("policy", automation_policy_json_value(&response.policy)),
-        (
-            "retrieval_usage",
-            retrieval_usage_json_value(&response.retrieval_usage),
-        ),
-        (
-            "provenance",
-            context_provenance_json_value(&response.provenance),
-        ),
-        (
-            "items",
-            JsonValue::array(response.items.iter().map(context_item_json_value)),
-        ),
-    ])
-}
-
-fn parse_context_item(
-    columns: &[String],
-    row: &[RuntimeValue],
-) -> Result<ContextItem, AutomationError> {
-    let node_id = expect_int(columns, row, "node_id")?;
-    let labels = expect_string_list(columns, row, "labels")?;
-    let name = optional_string(columns, row, "name")?;
-    let title = optional_string(columns, row, "title")?;
-    let display = name.clone().or_else(|| title.clone());
-    let mut evidence = Vec::new();
-    if let Some(name) = &name {
-        evidence.push(ContextEvidence {
-            field: "name".to_owned(),
-            value: name.clone(),
-            source: "property:name".to_owned(),
-        });
-    }
-    if let Some(title) = &title {
-        evidence.push(ContextEvidence {
-            field: "title".to_owned(),
-            value: title.clone(),
-            source: "property:title".to_owned(),
-        });
-    }
-    if !labels.is_empty() {
-        evidence.push(ContextEvidence {
-            field: "labels".to_owned(),
-            value: labels.join(","),
-            source: "labels(n)".to_owned(),
-        });
-    }
-
-    Ok(ContextItem {
-        node_id,
-        labels,
-        name,
-        title,
-        display,
-        evidence,
-    })
-}
-
-fn column_index(columns: &[String], expected: &str) -> Result<usize, AutomationError> {
-    columns
-        .iter()
-        .position(|column| column == expected)
-        .ok_or_else(|| {
-            AutomationError::new(
-                "context_contract",
-                format!("missing expected `{expected}` column in context result"),
-            )
-        })
-}
-
-fn expect_int(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<i64, AutomationError> {
-    let index = column_index(columns, column)?;
-    match row.get(index) {
-        Some(RuntimeValue::Int(value)) => Ok(*value),
-        Some(other) => Err(AutomationError::new(
-            "context_contract",
-            format!("expected `{column}` to be an integer, found {other:?}"),
-        )),
-        None => Err(AutomationError::new(
-            "context_contract",
-            format!("missing value for `{column}` in context result row"),
-        )),
-    }
-}
-
-fn expect_string_list(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<Vec<String>, AutomationError> {
-    let index = column_index(columns, column)?;
-    match row.get(index) {
-        Some(RuntimeValue::List(values)) => values
-            .iter()
-            .map(|value| match value {
-                RuntimeValue::String(value) => Ok(value.clone()),
-                other => Err(AutomationError::new(
-                    "context_contract",
-                    format!("expected `{column}` items to be strings, found {other:?}"),
-                )),
-            })
-            .collect(),
-        Some(other) => Err(AutomationError::new(
-            "context_contract",
-            format!("expected `{column}` to be a list, found {other:?}"),
-        )),
-        None => Err(AutomationError::new(
-            "context_contract",
-            format!("missing value for `{column}` in context result row"),
-        )),
-    }
-}
-
-fn optional_string(
-    columns: &[String],
-    row: &[RuntimeValue],
-    column: &str,
-) -> Result<Option<String>, AutomationError> {
-    let index = column_index(columns, column)?;
-    match row.get(index) {
-        Some(RuntimeValue::Null) => Ok(None),
-        Some(RuntimeValue::String(value)) => Ok(Some(value.clone())),
-        Some(other) => Err(AutomationError::new(
-            "context_contract",
-            format!("expected `{column}` to be a string or null, found {other:?}"),
-        )),
-        None => Err(AutomationError::new(
-            "context_contract",
-            format!("missing value for `{column}` in context result row"),
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        AutomationPolicy, build_context_response, context_as_json, format_error_json,
-        parse_params_json, query_as_json,
-    };
+    use super::{AutomationPolicy, format_error_json, parse_params_json, query_as_json};
     use crate::json;
     use crate::{QueryResult, RuntimeValue, Value};
-    use std::path::Path;
 
     #[test]
     fn parses_params_json_with_standard_json_layer() {
@@ -658,44 +351,6 @@ mod tests {
                 .and_then(|rows| rows[0].get("name"))
                 .and_then(json::JsonValue::as_str),
             Some("Ada")
-        );
-    }
-
-    #[test]
-    fn builds_context_envelope_with_budgets_and_evidence() {
-        let result = QueryResult {
-            columns: vec![
-                "node_id".to_owned(),
-                "labels".to_owned(),
-                "name".to_owned(),
-                "title".to_owned(),
-            ],
-            rows: vec![vec![
-                RuntimeValue::Int(7),
-                RuntimeValue::List(vec![RuntimeValue::String("Person".to_owned())]),
-                RuntimeValue::String("Ada".to_owned()),
-                RuntimeValue::Null,
-            ]],
-        };
-
-        let envelope = build_context_response(Path::new("/tmp/test.cupld"), 5, &result).unwrap();
-
-        assert_eq!(envelope.policy.retrieval_budget.unwrap().nodes, 5);
-        assert_eq!(envelope.items[0].display.as_deref(), Some("Ada"));
-        assert!(
-            envelope.items[0]
-                .evidence
-                .iter()
-                .any(|evidence| evidence.field == "name")
-        );
-
-        let parsed = json::parse(&context_as_json(&envelope)).unwrap();
-        assert_eq!(
-            parsed.get("items").unwrap().as_array().unwrap()[0]
-                .get("node_id")
-                .unwrap()
-                .as_i64(),
-            Some(7)
         );
     }
 }

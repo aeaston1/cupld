@@ -13,11 +13,15 @@ use cupld::{
     MemoryMaintenanceCheck, MemoryMaintenanceReport, MemoryMaintenanceStatus, QueryResult,
     RuntimeValue, Session, Value,
     automation::{
-        AutomationError, AutomationPolicy, build_context_response, context_as_json,
-        context_as_ndjson, format_error_json as machine_error_json,
+        AutomationError, AutomationPolicy, format_error_json as machine_error_json,
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
     },
-    configured_markdown_root, json, markdown_alias_diagnostics,
+    configured_markdown_root,
+    context::{
+        ContextDirection, ContextRequest, context_as_json, context_as_ndjson,
+        context_as_query_result,
+    },
+    json, markdown_alias_diagnostics,
     mcp::{self, McpConfig},
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
@@ -192,7 +196,7 @@ fn run() -> Result<(), String> {
             max_rows,
             query_args: &query_args,
         }),
-        CliCommand::Context { config } => run_context(config),
+        CliCommand::Context { output, request } => run_context(output, request),
         CliCommand::Schema { db_path } => run_schema(&db_path),
         CliCommand::Compact { db_path } => run_compact(db_path),
         CliCommand::Check { db_path } => run_check(db_path),
@@ -249,7 +253,8 @@ enum CliCommand {
         query_args: Vec<String>,
     },
     Context {
-        config: ContextRunConfig,
+        output: OutputFormat,
+        request: ContextRequest,
     },
     Schema {
         db_path: PathBuf,
@@ -282,27 +287,6 @@ enum CliCommand {
         read_only: bool,
     },
     Install(InstallCommand),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContextDirection {
-    In,
-    Out,
-    Both,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ContextRunConfig {
-    db_path: PathBuf,
-    output: OutputFormat,
-    nodes: Vec<usize>,
-    paths: Vec<String>,
-    depth: u8,
-    direction: ContextDirection,
-    edge_types: Vec<String>,
-    labels: Vec<String>,
-    max_nodes: usize,
-    max_edges: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -844,9 +828,9 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
         return Err("context_seed_required".to_owned());
     }
     Ok(CliCommand::Context {
-        config: ContextRunConfig {
+        output,
+        request: ContextRequest {
             db_path,
-            output,
             nodes,
             paths,
             depth,
@@ -1493,42 +1477,16 @@ fn run_query(config: QueryRunConfig<'_>) -> Result<(), String> {
     Ok(())
 }
 
-fn run_context(config: ContextRunConfig) -> Result<(), String> {
-    let output = config.output;
-    let top_k = config.max_nodes;
-    let db_path = config.db_path;
-    let query = format!(
-        "MATCH (n) RETURN id(n) AS node_id, labels(n) AS labels, n.name AS name, n.title AS title ORDER BY id(n) LIMIT {top_k}"
-    );
-    let mut session = Session::open(&db_path)
-        .map_err(AutomationError::from)
-        .map_err(|error| format_command_error(output, &error))?;
-    let results = session
-        .execute_script(&query, &BTreeMap::new())
-        .map_err(AutomationError::from)
+fn run_context(output: OutputFormat, request: ContextRequest) -> Result<(), String> {
+    let envelope = request
+        .run()
         .map_err(|error| format_command_error(output, &error))?;
     match output {
-        OutputFormat::Table => print_results(&results, output),
-        OutputFormat::Json | OutputFormat::Ndjson => {
-            let Some(result) = results.first() else {
-                return Err(format_command_error(
-                    output,
-                    &AutomationError::new(
-                        "context_contract",
-                        "context query returned no result set",
-                    ),
-                ));
-            };
-            let envelope = build_context_response(&db_path, top_k, result)
-                .map_err(|error| format_command_error(output, &error))?;
-            match output {
-                OutputFormat::Json => println!("{}", context_as_json(&envelope)),
-                OutputFormat::Ndjson => {
-                    for line in context_as_ndjson(&envelope) {
-                        println!("{line}");
-                    }
-                }
-                OutputFormat::Table => unreachable!(),
+        OutputFormat::Table => print_results(&[context_as_query_result(&envelope)], output),
+        OutputFormat::Json => println!("{}", context_as_json(&envelope)),
+        OutputFormat::Ndjson => {
+            for line in context_as_ndjson(&envelope) {
+                println!("{line}");
             }
         }
     }
@@ -3041,12 +2999,12 @@ fn value_string(value: &RuntimeValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, ContextDirection, ContextRunConfig, InputEvent, MemoryCommand, OutputFormat,
-        ReplInput, cap_results, cli_usage_text, format_error_json, parse_cli_command,
-        parse_params_json, result_as_json, result_as_ndjson, should_offer_skill_install_prompt,
-        table_value, version_text,
+        CliCommand, InputEvent, MemoryCommand, OutputFormat, ReplInput, cap_results,
+        cli_usage_text, format_error_json, parse_cli_command, parse_params_json, result_as_json,
+        result_as_ndjson, should_offer_skill_install_prompt, table_value, version_text,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
+    use cupld::context::{ContextDirection, ContextRequest};
     use cupld::{MAX_TRAVERSAL_DEPTH, QueryResult, RuntimeValue, Value, json};
     use std::path::PathBuf;
 
@@ -3215,9 +3173,9 @@ mod tests {
                 "42".to_owned(),
             ]),
             Ok(CliCommand::Context {
-                config: ContextRunConfig {
+                output: OutputFormat::Json,
+                request: ContextRequest {
                     db_path: PathBuf::from("db.cupld"),
-                    output: OutputFormat::Json,
                     nodes: vec![42],
                     paths: Vec::new(),
                     depth: 1,
@@ -3263,9 +3221,9 @@ mod tests {
                 "150".to_owned(),
             ]),
             Ok(CliCommand::Context {
-                config: ContextRunConfig {
+                output: OutputFormat::Ndjson,
+                request: ContextRequest {
                     db_path: PathBuf::from("db.cupld"),
-                    output: OutputFormat::Ndjson,
                     nodes: vec![7, 8],
                     paths: vec!["notes/a.md".to_owned(), "notes/b.md".to_owned()],
                     depth: 3,
@@ -3290,9 +3248,9 @@ mod tests {
                 "notes/a.md".to_owned(),
             ]),
             Ok(CliCommand::Context {
-                config: ContextRunConfig {
+                output: OutputFormat::Json,
+                request: ContextRequest {
                     db_path: default_alias_db_path(),
-                    output: OutputFormat::Json,
                     nodes: Vec::new(),
                     paths: vec!["notes/a.md".to_owned()],
                     depth: 1,

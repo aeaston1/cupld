@@ -1,4 +1,5 @@
 pub mod automation;
+pub mod context;
 pub mod engine;
 pub mod json;
 pub mod mcp;
