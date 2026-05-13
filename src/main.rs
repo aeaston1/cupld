@@ -18,7 +18,7 @@ use cupld::{
     },
     configured_markdown_root,
     context::{
-        ContextDirection, ContextRequest, ContextSeed, context_as_json, context_as_ndjson,
+        ContextDirection, ContextRequest, ContextSeedRequest, context_as_json, context_as_ndjson,
         context_as_query_result,
     },
     json, markdown_alias_diagnostics,
@@ -764,7 +764,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
                         .parse::<usize>()
                         .map_err(|_| "expected --node <id> for `context` command".to_owned())?,
                 );
-                seeds.push(ContextSeed::Node(*nodes.last().unwrap()));
+                seeds.push(ContextSeedRequest::Node(*nodes.last().unwrap()));
                 index += 2;
             }
             "--path" => {
@@ -772,7 +772,7 @@ fn parse_context_command(args: &[String]) -> Result<CliCommand, String> {
                     return Err("expected --path <src.path> for `context` command".to_owned());
                 };
                 paths.push(value.to_owned());
-                seeds.push(ContextSeed::Path(value.to_owned()));
+                seeds.push(ContextSeedRequest::Path(value.to_owned()));
                 index += 2;
             }
             "--depth" => {
@@ -3377,7 +3377,7 @@ mod tests {
         should_offer_skill_install_prompt, table_value, version_text, write_release_check_cache,
     };
     use crate::skill_install::{InstallCommand, InstallScope, SkillInstallTarget};
-    use cupld::context::{ContextDirection, ContextRequest, ContextSeed};
+    use cupld::context::{ContextDirection, ContextRequest, ContextSeedRequest};
     use cupld::{MAX_TRAVERSAL_DEPTH, QueryResult, RuntimeValue, Value, json};
     use std::fs;
     use std::path::PathBuf;
@@ -3665,7 +3665,7 @@ mod tests {
                     db_path: PathBuf::from("db.cupld"),
                     nodes: vec![42],
                     paths: Vec::new(),
-                    seeds: vec![ContextSeed::Node(42)],
+                    seeds: vec![ContextSeedRequest::Node(42)],
                     depth: 1,
                     direction: ContextDirection::Both,
                     edge_types: Vec::new(),
@@ -3715,10 +3715,10 @@ mod tests {
                     nodes: vec![7, 8],
                     paths: vec!["notes/a.md".to_owned(), "notes/b.md".to_owned()],
                     seeds: vec![
-                        ContextSeed::Node(7),
-                        ContextSeed::Node(8),
-                        ContextSeed::Path("notes/a.md".to_owned()),
-                        ContextSeed::Path("notes/b.md".to_owned()),
+                        ContextSeedRequest::Node(7),
+                        ContextSeedRequest::Node(8),
+                        ContextSeedRequest::Path("notes/a.md".to_owned()),
+                        ContextSeedRequest::Path("notes/b.md".to_owned()),
                     ],
                     depth: 3,
                     direction: ContextDirection::Out,
@@ -3747,7 +3747,7 @@ mod tests {
                     db_path: default_alias_db_path(),
                     nodes: Vec::new(),
                     paths: vec!["notes/a.md".to_owned()],
-                    seeds: vec![ContextSeed::Path("notes/a.md".to_owned())],
+                    seeds: vec![ContextSeedRequest::Path("notes/a.md".to_owned())],
                     depth: 1,
                     direction: ContextDirection::Both,
                     edge_types: Vec::new(),
