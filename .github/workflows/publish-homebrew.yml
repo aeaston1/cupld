@@ -54,6 +54,7 @@ jobs:
           ruby - "${{ steps.formula.outputs.path }}" <<'RUBY'
           path = ARGV.fetch(0)
           text = File.read(path)
+          text = text.sub(/^(  desc ".*)\."$/, '\\1"')
 
           text = text.sub(
             /  if OS\.mac\?\n    if Hardware::CPU\.arm\?\n(      url "[^"]*aarch64-apple-darwin[^"]*"\n      sha256 "[^"]*"\n)    end\n    if Hardware::CPU\.intel\?\n(      url "[^"]*x86_64-apple-darwin[^"]*"\n      sha256 "[^"]*"\n)    end\n  end\n  if OS\.linux\? && Hardware::CPU\.intel\?\n/,
