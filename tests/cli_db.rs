@@ -766,6 +766,7 @@ fn cli_context_fails_missing_node_and_path_seeds() {
             .and_then(json::JsonValue::as_str),
         Some("context_seed_not_found")
     );
+    assert!(missing_node.stdout.is_empty());
 
     let missing_path = run_cli(&[
         "context",
@@ -783,6 +784,95 @@ fn cli_context_fails_missing_node_and_path_seeds() {
             .and_then(|error| error.get("code"))
             .and_then(json::JsonValue::as_str),
         Some("context_seed_path_not_found")
+    );
+    assert!(missing_path.stdout.is_empty());
+}
+
+#[test]
+fn cli_context_parse_errors_are_machine_readable() {
+    let cases = [
+        (vec!["context", "--db", "default"], "context_seed_required"),
+        (
+            vec!["context", "--db", "default", "--top-k", "20"],
+            "context_legacy_top_k_removed",
+        ),
+        (
+            vec![
+                "context", "--db", "default", "--node", "1", "--depth", "wide",
+            ],
+            "context_invalid_depth",
+        ),
+        (
+            vec![
+                "context",
+                "--db",
+                "default",
+                "--node",
+                "1",
+                "--direction",
+                "sideways",
+            ],
+            "context_invalid_direction",
+        ),
+    ];
+
+    for (args, expected_code) in cases {
+        let output = run_cli(&args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let parsed = json::parse(&stderr).unwrap();
+        assert_eq!(
+            parsed.get("ok").and_then(json::JsonValue::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            parsed
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(json::JsonValue::as_str),
+            Some(expected_code)
+        );
+        assert!(
+            parsed
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(json::JsonValue::as_str)
+                .is_some_and(|message| !message.is_empty())
+        );
+    }
+}
+
+#[test]
+fn cli_context_payload_too_large_errors_to_stderr() {
+    let db = TestDb::new("cli_context_payload_too_large");
+    let mut session = db.open();
+    run(
+        &mut session,
+        &format!("CREATE (:Seed {{blob: '{}'}})", "x".repeat(80_000)),
+    );
+    drop(session);
+
+    let output = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--node",
+        "1",
+        "--depth",
+        "0",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let parsed = json::parse(&stderr).unwrap();
+    assert_eq!(
+        parsed
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(json::JsonValue::as_str),
+        Some("context_payload_too_large")
     );
 }
 
