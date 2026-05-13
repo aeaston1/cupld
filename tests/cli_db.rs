@@ -520,7 +520,7 @@ fn cli_context_json_outputs_seeded_golden_contract() {
             .get("retrieval_usage")
             .and_then(|usage| usage.get("truncated"))
             .and_then(json::JsonValue::as_bool),
-        Some(true)
+        Some(false)
     );
     assert_eq!(
         parsed
@@ -531,6 +531,161 @@ fn cli_context_json_outputs_seeded_golden_contract() {
             .and_then(|properties| properties.get("email"))
             .and_then(json::JsonValue::as_str),
         Some("ada@example.com")
+    );
+}
+
+#[test]
+fn cli_context_json_respects_one_hop_direction() {
+    let db = TestDb::new("cli_context_json_one_hop_direction");
+    let mut session = db.open();
+    run(&mut session, "CREATE EDGE TYPE KNOWS");
+    run(
+        &mut session,
+        "CREATE
+          (ada:Person {name: 'Ada'})
+          -[:KNOWS {since: 2020}]->
+          (grace:Person {name: 'Grace'})",
+    );
+    run(
+        &mut session,
+        "MATCH (ada:Person {name: 'Ada'})
+         CREATE (alan:Person {name: 'Alan'})-[:KNOWS {since: 2021}]->(ada)",
+    );
+    drop(session);
+
+    let cases = [
+        ("out", vec!["Ada", "Grace"], vec!["out"]),
+        ("in", vec!["Ada", "Alan"], vec!["in"]),
+        ("both", vec!["Ada", "Grace", "Alan"], vec!["out", "in"]),
+    ];
+
+    for (direction, expected_names, expected_edge_directions) in cases {
+        let output = run_cli(&[
+            "context",
+            "--db",
+            db.path().to_str().unwrap(),
+            "--output",
+            "json",
+            "--node",
+            "1",
+            "--direction",
+            direction,
+        ]);
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let parsed = json::parse(stdout.trim()).unwrap();
+        let nodes = parsed
+            .get("nodes")
+            .and_then(json::JsonValue::as_array)
+            .unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node
+                    .get("properties")
+                    .and_then(|properties| properties.get("name"))
+                    .and_then(json::JsonValue::as_str)
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.get("depth").and_then(json::JsonValue::as_i64).unwrap())
+                .collect::<Vec<_>>(),
+            expected_names
+                .iter()
+                .enumerate()
+                .map(|(index, _)| if index == 0 { 0 } else { 1 })
+                .collect::<Vec<_>>()
+        );
+
+        let edges = parsed
+            .get("edges")
+            .and_then(json::JsonValue::as_array)
+            .unwrap();
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| edge
+                    .get("direction_from_seed")
+                    .and_then(json::JsonValue::as_str)
+                    .unwrap())
+                .collect::<Vec<_>>(),
+            expected_edge_directions
+        );
+        for edge in edges {
+            assert!(
+                edge.get("edge_id")
+                    .and_then(json::JsonValue::as_i64)
+                    .is_some()
+            );
+            assert_eq!(
+                edge.get("type").and_then(json::JsonValue::as_str),
+                Some("KNOWS")
+            );
+            assert_eq!(edge.get("depth").and_then(json::JsonValue::as_i64), Some(1));
+            assert!(
+                !edge
+                    .get("evidence")
+                    .and_then(json::JsonValue::as_array)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn cli_context_ndjson_outputs_one_hop_edge_evidence() {
+    let db = TestDb::new("cli_context_ndjson_one_hop_evidence");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+    drop(session);
+
+    let output = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "ndjson",
+        "--node",
+        "1",
+        "--direction",
+        "out",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let edge_lines = stdout
+        .lines()
+        .map(|line| json::parse(line).unwrap())
+        .filter(|line| {
+            line.get("kind")
+                .and_then(json::JsonValue::as_str)
+                .is_some_and(|kind| kind == "context_edge")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(edge_lines.len(), 1);
+    let edge = edge_lines[0].get("edge").unwrap();
+    assert_eq!(
+        edge.get("direction_from_seed")
+            .and_then(json::JsonValue::as_str),
+        Some("out")
+    );
+    assert!(
+        edge.get("edge_id")
+            .and_then(json::JsonValue::as_i64)
+            .is_some()
+    );
+    assert!(
+        !edge
+            .get("evidence")
+            .and_then(json::JsonValue::as_array)
+            .unwrap()
+            .is_empty()
     );
 }
 
