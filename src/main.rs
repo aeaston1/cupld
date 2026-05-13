@@ -23,6 +23,7 @@ use cupld::{
     },
     json, markdown_alias_diagnostics,
     mcp::{self, McpConfig},
+    memory_eval,
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
     watch_markdown_root_with_sync_options,
@@ -1632,66 +1633,27 @@ fn run_context(output: OutputFormat, request: ContextRequest) -> Result<(), Stri
 }
 
 fn run_eval_memory(config: MemoryEvalConfig) -> Result<(), String> {
+    let report = memory_eval::run(memory_eval::MemoryEvalConfig {
+        fixtures: config.fixtures,
+        case: config.case,
+        update_snapshots: config.update_snapshots,
+    })?;
     match config.output {
         OutputFormat::Table => {
-            println!("fixtures | case | update_snapshots | status");
-            println!("---------+------+------------------+--------");
-            println!(
-                "{} | {} | {} | parsed",
-                config.fixtures.display(),
-                config.case.as_deref().unwrap_or("*"),
-                config.update_snapshots
-            );
+            print!("{}", memory_eval::report_as_table(&report));
         }
-        OutputFormat::Json => println!(
-            "{}",
-            json::stringify(&json::JsonValue::object([
-                ("ok", json::JsonValue::from(true)),
-                ("command", json::JsonValue::from("eval memory")),
-                (
-                    "fixtures",
-                    json::JsonValue::from(config.fixtures.display().to_string()),
-                ),
-                (
-                    "case",
-                    config
-                        .case
-                        .as_deref()
-                        .map(json::JsonValue::from)
-                        .unwrap_or(json::JsonValue::Null),
-                ),
-                (
-                    "update_snapshots",
-                    json::JsonValue::from(config.update_snapshots),
-                ),
-                ("results", json::JsonValue::array([])),
-            ]))
-        ),
-        OutputFormat::Ndjson => println!(
-            "{}",
-            json::stringify(&json::JsonValue::object([
-                ("kind", json::JsonValue::from("eval_memory_meta")),
-                ("ok", json::JsonValue::from(true)),
-                (
-                    "fixtures",
-                    json::JsonValue::from(config.fixtures.display().to_string()),
-                ),
-                (
-                    "case",
-                    config
-                        .case
-                        .as_deref()
-                        .map(json::JsonValue::from)
-                        .unwrap_or(json::JsonValue::Null),
-                ),
-                (
-                    "update_snapshots",
-                    json::JsonValue::from(config.update_snapshots),
-                ),
-            ]))
-        ),
+        OutputFormat::Json => println!("{}", memory_eval::report_as_json(&report)),
+        OutputFormat::Ndjson => {
+            for line in memory_eval::report_as_ndjson(&report) {
+                println!("{line}");
+            }
+        }
     }
-    Ok(())
+    if report.ok {
+        Ok(())
+    } else {
+        Err("memory eval failed".to_owned())
+    }
 }
 
 fn cap_results(results: &[QueryResult], max_rows: usize) -> Vec<QueryResult> {
