@@ -21,10 +21,26 @@
     {
       "columns": ["col_1", "col_2", "col_3"],
       "rows": [
-        ["appendix.md", ["frontmatter"], ["link"]],
-        ["index.md", ["frontmatter"], ["up"]],
-        ["next-step.md", ["frontmatter"], ["next"]],
-        ["sibling.md", ["frontmatter", "body"], ["related"]]
+        [
+          "appendix.md",
+          ["frontmatter"],
+          ["link"]
+        ],
+        [
+          "index.md",
+          ["frontmatter"],
+          ["up"]
+        ],
+        [
+          "next-step.md",
+          ["frontmatter"],
+          ["next"]
+        ],
+        [
+          "sibling.md",
+          ["frontmatter", "body"],
+          ["related"]
+        ]
       ]
     }
   ]

@@ -744,6 +744,51 @@ fn cli_eval_memory_failed_assertion_includes_expected_actual_and_diff() {
 }
 
 #[test]
+fn cli_eval_memory_update_snapshots_rewrites_expected_json_idempotently() {
+    let fixtures = TempDir::new("eval_memory_update_snapshots");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "people",
+        r#"{"cases":[{"name":"names","setup":["CREATE (:Person {name: 'Grace'})","CREATE (:Person {name: 'Ada'})"],"assertions":[{"type":"query_rows","query":"MATCH (n:Person) RETURN n.name ORDER BY n.name","expected":[{"columns":["col_1"],"rows":[["Wrong"]]}]}]}]}"#,
+    );
+    let expected = fixtures.path().join("people").join("expected");
+    fs::create_dir_all(&expected).unwrap();
+    let expected_file = expected.join("names.json");
+    fs::write(
+        &expected_file,
+        r#"{"names":[{"columns":["col_1"],"rows":[["Wrong"]]}]}"#,
+    )
+    .unwrap();
+
+    let first = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--update-snapshots",
+    ]);
+    assert!(first.status.success());
+    let first_stdout = String::from_utf8(first.stdout).unwrap();
+    assert!(first_stdout.contains(expected_file.to_str().unwrap()));
+    let snapshot = fs::read_to_string(&expected_file).unwrap();
+    assert!(snapshot.contains("\"names\": ["));
+    assert!(snapshot.contains("[\"Ada\"]"));
+    assert!(snapshot.contains("[\"Grace\"]"));
+
+    let second = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--update-snapshots",
+    ]);
+    assert!(second.status.success());
+    let second_stdout = String::from_utf8(second.stdout).unwrap();
+    assert!(!second_stdout.contains("snapshot_updates:"));
+    assert_eq!(snapshot, fs::read_to_string(&expected_file).unwrap());
+}
+
+#[test]
 fn cli_eval_memory_syncs_stale_docs_through_before_and_after_vaults() {
     let fixtures = TempDir::new("eval_memory_stale_docs");
     write_stale_memory_eval_fixture(

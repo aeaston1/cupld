@@ -2,15 +2,27 @@
   "links": [
     {
       "columns": ["col_1"],
-      "rows": [[["target-one", "Missing Note", "target-two.md"]]]
+      "rows": [
+        [
+          ["target-one", "Missing Note", "target-two.md"]
+        ]
+      ]
     }
   ],
   "resolved_edges": [
     {
       "columns": ["col_1", "col_2", "col_3"],
       "rows": [
-        ["target-one.md", "target-one", ["body"]],
-        ["target-two.md", "target-two.md", ["body"]]
+        [
+          "target-one.md",
+          "target-one",
+          ["body"]
+        ],
+        [
+          "target-two.md",
+          "target-two.md",
+          ["body"]
+        ]
       ]
     }
   ]

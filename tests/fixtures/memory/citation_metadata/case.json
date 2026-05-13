@@ -4,10 +4,12 @@
       "name": "auditability-metadata",
       "assertions": [
         {
+          "name": "graph_citation_metadata",
           "type": "citation_metadata",
           "source": "graph"
         },
         {
+          "name": "stable_metadata",
           "type": "query_rows",
           "query": "MATCH (d:MarkdownDocument {`src.path`: 'audit-source.md'}) RETURN d.`src.connector`, d.`src.kind`, d.`src.status`, d.`md.title`, d.`md.tags`, d.`md.has_frontmatter`",
           "expected": [
@@ -18,6 +20,7 @@
           ]
         },
         {
+          "name": "required_source_fields_present",
           "type": "query_rows",
           "query": "MATCH (d:MarkdownDocument {`src.path`: 'audit-source.md'}) WHERE d.`src.root` IS NOT NULL AND d.`src.hash` IS NOT NULL AND d.`md.raw` IS NOT NULL AND d.`md.body` IS NOT NULL RETURN d.`src.path`, d.`md.title`",
           "expected": [
@@ -28,6 +31,7 @@
           ]
         },
         {
+          "name": "query_citation_metadata",
           "type": "citation_metadata",
           "source": "query",
           "query": "MATCH (d:MarkdownDocument {`src.path`: 'audit-source.md'}) RETURN d.`src.path`, d.`src.status`, d.`src.hash`, d.`md.title`",
@@ -39,6 +43,7 @@
           }
         },
         {
+          "name": "context_citation_metadata",
           "type": "citation_metadata",
           "source": "context",
           "seed_path": "audit-source.md"
