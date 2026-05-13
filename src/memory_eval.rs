@@ -53,6 +53,7 @@ pub struct MemoryEvalCaseReport {
 pub struct MemoryEvalAssertionReport {
     pub fixture: String,
     pub case: String,
+    pub assertion: String,
     pub assertion_type: String,
     pub expected: JsonValue,
     pub actual: JsonValue,
@@ -188,6 +189,40 @@ pub fn report_as_table(report: &MemoryEvalReport) -> String {
         output.push_str("snapshot_updates:\n");
         for path in &report.snapshot_updates {
             output.push_str(&format!("{path}\n"));
+        }
+    }
+    output
+}
+
+pub fn report_as_ci(report: &MemoryEvalReport) -> String {
+    let mut output = format!(
+        "memory evals: fixtures={} cases={} passed={} failed={} warnings={}\n",
+        report.summary.fixtures,
+        report.summary.cases,
+        report.summary.passed,
+        report.summary.failed,
+        report.summary.warnings
+    );
+    for case in report
+        .cases
+        .iter()
+        .filter(|case| case.status == EvalStatus::Fail)
+    {
+        for assertion in case
+            .assertions
+            .iter()
+            .filter(|assertion| assertion.status == EvalStatus::Fail)
+        {
+            output.push_str(&format!(
+                "\nfixture: {}\ncase: {}\nassertion: {} ({})\nexpected: {}\nactual: {}\ndiff: {}\n",
+                assertion.fixture,
+                assertion.case,
+                assertion.assertion,
+                assertion.assertion_type,
+                truncate(&json::stringify(&assertion.expected), 400),
+                truncate(&json::stringify(&assertion.actual), 400),
+                assertion.diff.as_deref().unwrap_or("none")
+            ));
         }
     }
     output
@@ -532,6 +567,7 @@ fn run_assertion(
     Ok(MemoryEvalAssertionReport {
         fixture: fixture.to_owned(),
         case: case.to_owned(),
+        assertion: assertion.snapshot_key.clone(),
         assertion_type: assertion.assertion_type.clone(),
         expected: assertion.expected.clone(),
         actual,
@@ -561,6 +597,7 @@ fn run_query_paths_assertion(
     Ok(MemoryEvalAssertionReport {
         fixture: fixture.to_owned(),
         case: case.to_owned(),
+        assertion: assertion.snapshot_key.clone(),
         assertion_type: assertion.assertion_type.clone(),
         expected: assertion.expected.clone(),
         actual: actual.clone(),
@@ -618,6 +655,7 @@ fn run_context_export_assertion(
     Ok(MemoryEvalAssertionReport {
         fixture: fixture.to_owned(),
         case: case.to_owned(),
+        assertion: assertion.snapshot_key.clone(),
         assertion_type: assertion.assertion_type.clone(),
         expected: assertion.expected.clone(),
         actual: actual.clone(),
@@ -686,6 +724,7 @@ fn run_citation_metadata_assertion(
     Ok(MemoryEvalAssertionReport {
         fixture: fixture.to_owned(),
         case: case.to_owned(),
+        assertion: assertion.snapshot_key.clone(),
         assertion_type: assertion.assertion_type.clone(),
         expected: JsonValue::object([
             (
@@ -733,6 +772,7 @@ fn run_graph_snapshot_assertion(
     Ok(MemoryEvalAssertionReport {
         fixture: fixture.to_owned(),
         case: case.to_owned(),
+        assertion: assertion.snapshot_key.clone(),
         assertion_type: assertion.assertion_type.clone(),
         expected: assertion.expected.clone(),
         actual,
@@ -1704,6 +1744,10 @@ fn assertion_json_fields(assertion: &MemoryEvalAssertionReport) -> Vec<(String, 
         ),
         ("case".to_owned(), JsonValue::from(assertion.case.clone())),
         (
+            "assertion".to_owned(),
+            JsonValue::from(assertion.assertion.clone()),
+        ),
+        (
             "assertion_type".to_owned(),
             JsonValue::from(assertion.assertion_type.clone()),
         ),
@@ -1871,6 +1915,7 @@ mod tests {
         let assertion = MemoryEvalAssertionReport {
             fixture: "basic".to_owned(),
             case: "counts".to_owned(),
+            assertion: "row_count".to_owned(),
             assertion_type: "query".to_owned(),
             expected: JsonValue::from(1_i64),
             actual: JsonValue::from(2_i64),
@@ -1881,6 +1926,10 @@ mod tests {
         let fields = assertion_json_fields(&assertion);
         let rendered = json::stringify(&JsonValue::object(fields));
         let parsed = json::parse(&rendered).unwrap();
+        assert_eq!(
+            parsed.get("assertion").and_then(JsonValue::as_str),
+            Some("row_count")
+        );
         assert_eq!(parsed.get("expected"), Some(&JsonValue::from(1_i64)));
         assert_eq!(parsed.get("actual"), Some(&JsonValue::from(2_i64)));
         assert_eq!(

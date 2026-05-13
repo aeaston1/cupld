@@ -744,6 +744,34 @@ fn cli_eval_memory_failed_assertion_includes_expected_actual_and_diff() {
 }
 
 #[test]
+fn cli_eval_memory_ci_output_reports_concise_failure_context() {
+    let fixtures = TempDir::new("eval_memory_ci_failure");
+    write_memory_eval_fixture(
+        fixtures.path(),
+        "broken",
+        r#"{"cases":[{"name":"wrong-count","setup":["CREATE (:Person {name: 'Ada'})"],"assertions":[{"name":"person_names","type":"query_rows","query":"MATCH (n:Person) RETURN n.name","expected":[{"columns":["col_1"],"rows":[["Grace"]]}]}]}]}"#,
+    );
+
+    let output = run_cli(&[
+        "eval",
+        "memory",
+        "--fixtures",
+        fixtures.path().to_str().unwrap(),
+        "--ci",
+    ]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("memory evals: fixtures=1 cases=1 passed=0 failed=1 warnings=0"));
+    assert!(stdout.contains("fixture: broken"));
+    assert!(stdout.contains("case: wrong-count"));
+    assert!(stdout.contains("assertion: person_names (query_rows)"));
+    assert!(stdout.contains("expected:"));
+    assert!(stdout.contains("actual:"));
+    assert!(stdout.contains("diff:"));
+}
+
+#[test]
 fn cli_eval_memory_update_snapshots_rewrites_expected_json_idempotently() {
     let fixtures = TempDir::new("eval_memory_update_snapshots");
     write_memory_eval_fixture(
