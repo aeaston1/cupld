@@ -4,6 +4,10 @@
       "name": "auditability-metadata",
       "assertions": [
         {
+          "type": "citation_metadata",
+          "source": "graph"
+        },
+        {
           "type": "query_rows",
           "query": "MATCH (d:MarkdownDocument {`src.path`: 'audit-source.md'}) RETURN d.`src.connector`, d.`src.kind`, d.`src.status`, d.`md.title`, d.`md.tags`, d.`md.has_frontmatter`",
           "expected": [
@@ -22,6 +26,22 @@
               "rows": [["audit-source.md", "Audit Source"]]
             }
           ]
+        },
+        {
+          "type": "citation_metadata",
+          "source": "query",
+          "query": "MATCH (d:MarkdownDocument {`src.path`: 'audit-source.md'}) RETURN d.`src.path`, d.`src.status`, d.`src.hash`, d.`md.title`",
+          "field_columns": {
+            "src.path": 1,
+            "src.status": 2,
+            "src.hash": 3,
+            "md.title": 4
+          }
+        },
+        {
+          "type": "citation_metadata",
+          "source": "context",
+          "seed_path": "audit-source.md"
         }
       ]
     }
