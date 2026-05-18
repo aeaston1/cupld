@@ -161,7 +161,7 @@ Successful output is a JSON object in the MCP text content:
 
 - `ok`: `true`.
 - `query`: the trimmed query string used for matching.
-- `retrieval`: machine-readable retrieval contract metadata. Current values are `mode: "lexical"`, `deterministic: true`, `semantic: false`, and `index_used: false`, plus string descriptions of the ranking and score policies.
+- `retrieval`: machine-readable retrieval contract metadata. Current values are `mode: "lexical"`, `deterministic: true`, `semantic: false`, and `index_used`, plus string descriptions of the ranking and score policies. `index_used` is `true` only when existing ready MarkdownDocument indexes were used to generate candidates; ranking and result shape remain the same as deterministic fallback.
 - `items`: ordered result items.
 - `truncated`: `true` when more matched rows existed than the returned `limit`.
 - `provenance`: local DB provenance, including `source: "cupld_db"` and `network_used: false`.
@@ -177,6 +177,22 @@ Each `items[]` entry preserves the existing compatibility fields `id`, `uri`, `p
 Ranking policy is intentionally simple and stable: exact title/path matches score `0`, partial title/path matches score `1`, tag/alias/heading matches score `2`, and body matches score `3`. Results sort by ascending `score`, then ascending `path` for ties. The score is a deterministic tier, not a semantic relevance probability.
 
 Snippets are capped at 500 Unicode scalar values. When `md.body` is present, the snippet comes from `md.body`; when `md.body` is empty, it falls back to `md.raw` and sets `empty_body_fallback: true`. `snippet_metadata.truncated` reports whether the selected snippet source exceeded the cap.
+
+Recommended optional MarkdownDocument search indexes are explicit operator actions using existing query syntax:
+
+```bash
+cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.body\`) KIND FULLTEXT"
+cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.tags\`) KIND LIST"
+```
+
+Inspect the configured indexes and planner path with:
+
+```bash
+cupld query --db default "SHOW INDEXES ON :MarkdownDocument"
+cupld query --db default "EXPLAIN MATCH (d:MarkdownDocument) WHERE d.\`md.body\` CONTAINS 'term' RETURN d.\`src.path\`"
+```
+
+`memory_search` never creates these indexes during read-only MCP search. `memory reindex` continues to inspect and report existing schema index definitions without creating new indexes.
 
 ## Agent Workflow
 

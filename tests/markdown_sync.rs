@@ -63,6 +63,146 @@ Body\n",
 }
 
 #[test]
+fn mdx_files_sync_with_markdown_metadata_and_cross_extension_links() {
+    let db = TestDb::new("markdown_mdx_sync");
+    let root = temp_dir("markdown_mdx_sync");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(
+        root.join("docs/component.mdx"),
+        "---\n\
+title: Component Note\n\
+tags: [mdx, ui]\n\
+aliases: [Component Alias]\n\
+related: ../guide.md\n\
+---\n\
+import Thing from './Thing'\n\
+\n\
+# Component Heading\n\
+\n\
+<Thing prop={value} />\n\
+\n\
+Body with [[Guide Alias]] and [peer](peer.mdx) and #inline-tag.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("guide.md"),
+        "---\n\
+aliases: [Guide Alias]\n\
+---\n\
+# Guide\n\
+\n\
+[Component](docs/component)\n",
+    )
+    .unwrap();
+    fs::write(root.join("docs/peer.mdx"), "# Peer").unwrap();
+    fs::write(root.join("ignored.txt"), "# Ignored").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let documents = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument)
+         RETURN d.`src.path`, d.`src.ext`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`src.status`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        documents.rows,
+        vec![
+            vec![
+                RuntimeValue::String("docs/component.mdx".to_owned()),
+                RuntimeValue::String("mdx".to_owned()),
+                RuntimeValue::String("Component Note".to_owned()),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("mdx".to_owned()),
+                    RuntimeValue::String("ui".to_owned()),
+                    RuntimeValue::String("inline-tag".to_owned()),
+                ]),
+                RuntimeValue::List(vec![RuntimeValue::String("Component Alias".to_owned())]),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("docs/peer.mdx".to_owned()),
+                RuntimeValue::String("mdx".to_owned()),
+                RuntimeValue::String("Peer".to_owned()),
+                RuntimeValue::List(vec![]),
+                RuntimeValue::List(vec![]),
+                RuntimeValue::String("current".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("guide.md".to_owned()),
+                RuntimeValue::String("md".to_owned()),
+                RuntimeValue::String("Guide".to_owned()),
+                RuntimeValue::List(vec![]),
+                RuntimeValue::List(vec![RuntimeValue::String("Guide Alias".to_owned())]),
+                RuntimeValue::String("current".to_owned()),
+            ],
+        ]
+    );
+
+    let mdx_links = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'docs/component.mdx'})-[e:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`, e.`md.link_targets`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        mdx_links.rows,
+        vec![
+            vec![
+                RuntimeValue::String("docs/peer.mdx".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("peer.mdx".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("guide.md".to_owned()),
+                RuntimeValue::List(vec![
+                    RuntimeValue::String("../guide.md".to_owned()),
+                    RuntimeValue::String("Guide Alias".to_owned()),
+                ]),
+            ],
+        ]
+    );
+
+    let md_to_mdx_link = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'guide.md'})-[:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`",
+    );
+    assert_eq!(
+        md_to_mdx_link.rows,
+        vec![vec![RuntimeValue::String("docs/component.mdx".to_owned())]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mdx_files_participate_in_filesystem_graph() {
+    let db = TestDb::new("markdown_mdx_fs_graph");
+    let root = temp_dir("markdown_mdx_fs_graph");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs/component.mdx"), "# Component").unwrap();
+
+    sync_root_into_db_with_fs_graph(db.path(), &root);
+
+    let mut reopened = db.open();
+    let location = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'docs/component.mdx'})-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+         RETURN dir.`src.path`, e.`md.edge_source`",
+    );
+    assert_eq!(
+        location.rows,
+        vec![vec![
+            RuntimeValue::String("docs".to_owned()),
+            RuntimeValue::String("filesystem".to_owned()),
+        ]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn default_sync_does_not_create_filesystem_graph_data() {
     let db = TestDb::new("markdown_fs_default_off");
     let root = temp_dir("markdown_fs_default_off");
@@ -1491,6 +1631,76 @@ fn watch_mode_preserves_filesystem_graph_option() {
         vec![
             vec![RuntimeValue::String("notes/later.md".to_owned())],
             vec![RuntimeValue::String("notes/start.md".to_owned())],
+        ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn watch_mode_tracks_mdx_create_update_rename_and_delete() {
+    let db = TestDb::new("markdown_watch_mdx_lifecycle");
+    let root = temp_dir("markdown_watch_mdx_lifecycle");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("old.mdx"), "# Old\nBody").unwrap();
+    fs::write(root.join("delete.mdx"), "# Delete").unwrap();
+    sync_root_into_db(db.path(), &root);
+
+    let writer_root = root.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(40));
+        fs::write(writer_root.join("old.mdx"), "# Old\nUpdated").unwrap();
+        fs::write(writer_root.join("created.mdx"), "# Created").unwrap();
+        fs::rename(writer_root.join("old.mdx"), writer_root.join("renamed.mdx")).unwrap();
+        fs::remove_file(writer_root.join("delete.mdx")).unwrap();
+    });
+
+    let report = watch_root_into_db(
+        db.path(),
+        &root,
+        MarkdownWatchOptions {
+            poll_interval: Duration::from_millis(10),
+            debounce: Duration::from_millis(40),
+            max_batch_window: Duration::from_millis(150),
+            idle_timeout: Some(Duration::from_millis(500)),
+            max_runs: Some(2),
+        },
+    );
+    writer.join().unwrap();
+
+    assert_eq!(report.sync_runs, 2);
+    assert!(report.events_seen >= 1);
+
+    let mut reopened = db.open();
+    let result = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument)
+         RETURN d.`src.path`, d.`src.status`, d.`md.body`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                RuntimeValue::String("created.mdx".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+                RuntimeValue::String("# Created".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("delete.mdx".to_owned()),
+                RuntimeValue::String("missing".to_owned()),
+                RuntimeValue::String("# Delete".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("old.mdx".to_owned()),
+                RuntimeValue::String("missing".to_owned()),
+                RuntimeValue::String("# Old\nBody".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("renamed.mdx".to_owned()),
+                RuntimeValue::String("current".to_owned()),
+                RuntimeValue::String("# Old\nUpdated".to_owned()),
+            ],
         ]
     );
 

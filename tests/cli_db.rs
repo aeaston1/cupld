@@ -1363,8 +1363,14 @@ fn cli_context_json_records_repeated_filters_and_budgets() {
             }),
         Some(vec!["Person", "Topic"])
     );
-    assert_eq!(request.get("max_nodes").and_then(json::JsonValue::as_i64), Some(2));
-    assert_eq!(request.get("max_edges").and_then(json::JsonValue::as_i64), Some(1));
+    assert_eq!(
+        request.get("max_nodes").and_then(json::JsonValue::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        request.get("max_edges").and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
     assert_eq!(
         parsed
             .get("nodes")
@@ -2303,6 +2309,68 @@ fn cli_memory_find_stale_ndjson_reports_changed_markdown() {
             .and_then(|item| item.get("current_hash"))
             .and_then(json::JsonValue::as_str)
             .is_some()
+    );
+}
+
+#[test]
+fn cli_memory_check_and_find_stale_include_changed_mdx() {
+    let db = TestDb::new("cli_memory_mdx_stale");
+    let root = TempDir::new("cli_memory_mdx_stale_root");
+    fs::write(root.path().join("note.mdx"), "# Original").unwrap();
+
+    let sync = run_cli(&[
+        "sync",
+        "markdown",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+    ]);
+    assert!(sync.status.success());
+    fs::write(root.path().join("note.mdx"), "# Changed").unwrap();
+
+    let check = run_cli(&[
+        "memory",
+        "check",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert!(check.status.success());
+    let check_stdout = String::from_utf8(check.stdout).unwrap();
+    let check_json = json::parse(&check_stdout).unwrap();
+    assert_eq!(
+        check_json.get("status").and_then(json::JsonValue::as_str),
+        Some("warn")
+    );
+
+    let stale = run_cli(&[
+        "memory",
+        "find-stale",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--root",
+        root.path().to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert!(stale.status.success());
+    let stale_stdout = String::from_utf8(stale.stdout).unwrap();
+    let stale_json = json::parse(&stale_stdout).unwrap();
+    let items = stale_json
+        .get("items")
+        .and_then(json::JsonValue::as_array)
+        .unwrap();
+    let item = items
+        .iter()
+        .find(|item| item.get("path").and_then(json::JsonValue::as_str) == Some("note.mdx"))
+        .unwrap_or_else(|| panic!("missing mdx stale item: {stale_stdout}"));
+    assert_eq!(
+        item.get("kind").and_then(json::JsonValue::as_str),
+        Some("hash_mismatch")
     );
 }
 

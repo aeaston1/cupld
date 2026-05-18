@@ -997,6 +997,62 @@ fn wave6_index_kinds_and_temporal_fields_survive_reopen() {
 }
 
 #[test]
+fn markdowndocument_search_indexes_are_planner_visible() {
+    let db = TestDb::new("markdown_document_search_indexes");
+    let mut session = db.open();
+
+    run(
+        &mut session,
+        "CREATE (:MarkdownDocument {
+            `src.path`: 'notes/rust.md',
+            `md.title`: 'Rust Systems',
+            `md.tags`: ['rust', 'systems'],
+            `md.body`: 'Rust compiler notes'
+        })",
+    );
+    run(
+        &mut session,
+        "CREATE INDEX ON :MarkdownDocument(`md.body`) KIND FULLTEXT",
+    );
+    run(
+        &mut session,
+        "CREATE INDEX ON :MarkdownDocument(`md.tags`) KIND LIST",
+    );
+
+    let indexes = run(&mut session, "SHOW INDEXES ON :MarkdownDocument");
+    assert!(indexes.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("MarkdownDocument".to_owned())
+            && row[3] == RuntimeValue::String("md.body".to_owned())
+            && row[5] == RuntimeValue::String("ready".to_owned())
+            && row[6] == RuntimeValue::String("fulltext".to_owned())
+    }));
+    assert!(indexes.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("MarkdownDocument".to_owned())
+            && row[3] == RuntimeValue::String("md.tags".to_owned())
+            && row[5] == RuntimeValue::String("ready".to_owned())
+            && row[6] == RuntimeValue::String("list".to_owned())
+    }));
+
+    let explain_text = run(
+        &mut session,
+        "EXPLAIN MATCH (d:MarkdownDocument) WHERE d.`md.body` CONTAINS 'compiler' RETURN d.`src.path`",
+    );
+    assert!(explain_text.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("NodeFullTextIndexScan".to_owned())
+            && format!("{:?}", row[3]).contains(":MarkdownDocument(md.body)")
+    }));
+
+    let explain_tags = run(
+        &mut session,
+        "EXPLAIN MATCH (d:MarkdownDocument) WHERE 'rust' IN d.`md.tags` RETURN d.`src.path`",
+    );
+    assert!(explain_tags.rows.iter().any(|row| {
+        row[2] == RuntimeValue::String("NodeListIndexScan".to_owned())
+            && format!("{:?}", row[3]).contains(":MarkdownDocument(md.tags)")
+    }));
+}
+
+#[test]
 fn wave6_index_kind_benchmark_smoke() {
     let db = TestDb::new("wave6_bench");
     let mut session = db.open();
