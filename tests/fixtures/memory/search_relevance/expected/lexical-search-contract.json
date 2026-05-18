@@ -1,0 +1,349 @@
+{
+  "title-path-match": {
+    "ok": true,
+    "query": "Project Atlas",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "atlas.md",
+        "title": "Project Atlas",
+        "tags": ["keep", "atlas"],
+        "snippet": "# Atlas Retrieval\n\nProject Atlas keeps retrieval notes for search relevance.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "exact_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "drop.md",
+        "title": "Dropped Atlas",
+        "tags": ["drop"],
+        "snippet": "# Dropped Atlas\n\natlas should not pass the keep tag filter.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "alias-match": {
+    "ok": true,
+    "query": "Atlas Memory",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "atlas.md",
+        "title": "Project Atlas",
+        "tags": ["keep", "atlas"],
+        "snippet": "# Atlas Retrieval\n\nProject Atlas keeps retrieval notes for search relevance.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "drop.md",
+        "title": "Dropped Atlas",
+        "tags": ["drop"],
+        "snippet": "# Dropped Atlas\n\natlas should not pass the keep tag filter.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "tag-match": {
+    "ok": true,
+    "query": "atlas",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "atlas.md",
+        "title": "Project Atlas",
+        "tags": ["keep", "atlas"],
+        "snippet": "# Atlas Retrieval\n\nProject Atlas keeps retrieval notes for search relevance.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "drop.md",
+        "title": "Dropped Atlas",
+        "tags": ["drop"],
+        "snippet": "# Dropped Atlas\n\natlas should not pass the keep tag filter.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "heading-match": {
+    "ok": true,
+    "query": "retrieval",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "atlas.md",
+        "title": "Project Atlas",
+        "tags": ["keep", "atlas"],
+        "snippet": "Atlas Retrieval",
+        "score": null,
+        "matched_fields": ["headings"],
+        "matched_category": "structured_metadata",
+        "snippet_metadata": {
+          "source": "headings",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "body-match": {
+    "ok": true,
+    "query": "calibrated signal",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "body.md",
+        "title": "Body Evidence",
+        "tags": ["keep"],
+        "snippet": "The calibrated signal appears in this body line for snippet selection.",
+        "score": null,
+        "matched_fields": ["body"],
+        "matched_category": "body",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "multi-term-query": {
+    "ok": true,
+    "query": "atlas retrieval",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "atlas.md",
+        "title": "Project Atlas",
+        "tags": ["keep", "atlas"],
+        "snippet": "# Atlas Retrieval\n\nProject Atlas keeps retrieval notes for search relevance.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "drop.md",
+        "title": "Dropped Atlas",
+        "tags": ["drop"],
+        "snippet": "# Dropped Atlas\n\natlas should not pass the keep tag filter.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "tag-filtering": {
+    "ok": true,
+    "query": "atlas",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "atlas.md",
+        "title": "Project Atlas",
+        "tags": ["keep", "atlas"],
+        "snippet": "# Atlas Retrieval\n\nProject Atlas keeps retrieval notes for search relevance.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "no-match": {
+    "ok": true,
+    "query": "unfindable",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "tie-breaking": {
+    "ok": true,
+    "query": "stable tie",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "ties/a-first.md",
+        "title": "Tie Alpha",
+        "tags": ["tie"],
+        "snippet": "# Tie Alpha\n\nstable tie evidence in the body.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "ties/b-second.md",
+        "title": "Tie Beta",
+        "tags": ["tie"],
+        "snippet": "# Tie Beta\n\nstable tie evidence in the body.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  }
+}
