@@ -130,7 +130,7 @@ fn memory_search_exposes_retrieval_contract_metadata() {
         Some("notes/title.md")
     );
     assert_eq!(first.get("rank").and_then(JsonValue::as_i64), Some(1));
-    assert_eq!(first.get("score").and_then(JsonValue::as_i64), Some(1));
+    assert_eq!(first.get("score").and_then(JsonValue::as_i64), Some(100));
     assert_eq!(
         first.get("matched_category").and_then(JsonValue::as_str),
         Some("partial_title_or_path")
@@ -143,7 +143,7 @@ fn memory_search_exposes_retrieval_contract_metadata() {
 
     let second = &items[1];
     assert_eq!(second.get("rank").and_then(JsonValue::as_i64), Some(2));
-    assert_eq!(second.get("score").and_then(JsonValue::as_i64), Some(3));
+    assert_eq!(second.get("score").and_then(JsonValue::as_i64), Some(300));
     assert_eq!(
         second.get("matched_category").and_then(JsonValue::as_str),
         Some("body")
@@ -203,6 +203,177 @@ fn memory_search_snippet_falls_back_to_raw_when_body_is_empty() {
     assert!(text.contains(r#""source":"raw""#), "{text}");
     assert!(text.contains(r#""empty_body_fallback":true"#), "{text}");
     assert!(text.contains(r#""truncated":false"#), "{text}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_ranks_exact_partial_structured_body_and_ties_deterministically() {
+    let db = TestDb::new("mcp_search_lexical_ranking");
+    let root = temp_dir("mcp_search_lexical_ranking");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join("alpha.md"), "# Alpha Project\n\nUnrelated").unwrap();
+    fs::write(root.join("alpha project.md"), "# Other\n\nUnrelated").unwrap();
+    fs::write(
+        root.join("notes/alpha-project.md"),
+        "# Something Else\n\nUnrelated",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/structured.md"),
+        "---\naliases: [Alpha Project]\ntags: [research]\n---\n# Planning\n\nUnrelated",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/body-a.md"),
+        "# Body A\n\nThe alpha project details live here.",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/body-b.md"),
+        "# Body B\n\nThe alpha project details live here too.",
+    )
+    .unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let response = call(
+        &config,
+        "memory_search",
+        r#"{"query":"Alpha Project","limit":10}"#,
+    );
+    let payload = tool_payload(&response);
+    let paths = item_paths(&payload);
+    assert_eq!(
+        paths,
+        vec![
+            "alpha.md",
+            "alpha project.md",
+            "notes/alpha-project.md",
+            "notes/structured.md",
+            "notes/body-a.md",
+            "notes/body-b.md",
+        ]
+    );
+
+    let items = payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array");
+    assert_eq!(items[0].get("score").and_then(JsonValue::as_i64), Some(0));
+    assert_eq!(items[1].get("score").and_then(JsonValue::as_i64), Some(110));
+    assert_eq!(items[2].get("score").and_then(JsonValue::as_i64), Some(110));
+    assert_eq!(items[3].get("score").and_then(JsonValue::as_i64), Some(200));
+    assert_eq!(items[4].get("score").and_then(JsonValue::as_i64), Some(300));
+    assert_eq!(
+        items[3].get("matched_category").and_then(JsonValue::as_str),
+        Some("structured_metadata")
+    );
+    assert!(json_text(&items[3]).contains(r#""matched_fields":["aliases"]"#));
+
+    let exact_path = call(
+        &config,
+        "memory_search",
+        r#"{"query":"alpha project.md","limit":10}"#,
+    );
+    let exact_path_payload = tool_payload(&exact_path);
+    let exact_path_items = exact_path_payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array");
+    assert_eq!(
+        exact_path_items[0].get("path").and_then(JsonValue::as_str),
+        Some("alpha project.md")
+    );
+    assert_eq!(
+        exact_path_items[0]
+            .get("matched_category")
+            .and_then(JsonValue::as_str),
+        Some("exact_title_or_path")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_ranks_more_matched_terms_within_a_tier() {
+    let db = TestDb::new("mcp_search_multi_term");
+    let root = temp_dir("mcp_search_multi_term");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(root.join("notes/one.md"), "# Alpha Note\n\nUnrelated").unwrap();
+    fs::write(root.join("notes/two.md"), "# Alpha Beta Note\n\nUnrelated").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let response = call(
+        &config,
+        "memory_search",
+        r#"{"query":"alpha beta","limit":10}"#,
+    );
+    let payload = tool_payload(&response);
+    let items = payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array");
+    assert_eq!(
+        items[0].get("path").and_then(JsonValue::as_str),
+        Some("notes/two.md")
+    );
+    assert_eq!(items[0].get("score").and_then(JsonValue::as_i64), Some(100));
+    assert_eq!(
+        items[1].get("path").and_then(JsonValue::as_str),
+        Some("notes/one.md")
+    );
+    assert_eq!(items[1].get("score").and_then(JsonValue::as_i64), Some(101));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_filters_tags_before_ranking_and_uses_matching_snippets() {
+    let db = TestDb::new("mcp_search_tags_snippets");
+    let root = temp_dir("mcp_search_tags_snippets");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/body.md"),
+        "---\ntags: [keep]\n---\n# Body\n\nIntro line.\nThe useful needle context is here.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/heading.md"),
+        "---\ntitle: Metadata Title\ntags: [keep]\n---\n# Needle Heading\n\nBody without query.",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/filtered.md"),
+        "---\ntags: [drop]\n---\n# Needle Exact\n\nShould not appear.",
+    )
+    .unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let response = call(
+        &config,
+        "memory_search",
+        r#"{"query":"needle","tags":["keep"],"limit":10}"#,
+    );
+    let payload = tool_payload(&response);
+    let paths = item_paths(&payload);
+    assert_eq!(paths, vec!["notes/heading.md", "notes/body.md"]);
+    let items = payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array");
+    assert_eq!(
+        items[0].get("snippet").and_then(JsonValue::as_str),
+        Some("Needle Heading")
+    );
+    assert!(json_text(&items[0]).contains(r#""source":"headings""#));
+    assert_eq!(
+        items[1].get("snippet").and_then(JsonValue::as_str),
+        Some("The useful needle context is here.")
+    );
+    assert!(json_text(&items[1]).contains(r#""source":"body""#));
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -327,6 +498,16 @@ fn tool_text(value: &JsonValue) -> String {
 
 fn tool_payload(value: &JsonValue) -> JsonValue {
     json::parse(&tool_text(value)).unwrap()
+}
+
+fn item_paths(payload: &JsonValue) -> Vec<&str> {
+    payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array")
+        .iter()
+        .map(|item| item.get("path").and_then(JsonValue::as_str).unwrap())
+        .collect()
 }
 
 fn sync_root(db_path: &Path, root: &Path) {
