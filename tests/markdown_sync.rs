@@ -500,6 +500,158 @@ Body with [[other]] and [deep](other.md#intro) and [misc](misc.md)
 }
 
 #[test]
+fn syncs_typed_frontmatter_relationship_edges_with_compatibility_links() {
+    let db = TestDb::new("markdown_typed_frontmatter_edges");
+    let root = temp_dir("markdown_typed_frontmatter_edges");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("note.md"),
+        "---\n\
+up: parent\n\
+related: related\n\
+next: next\n\
+previous: previous\n\
+links: [generic]\n\
+---\n\
+Body link to [[body]].\n",
+    )
+    .unwrap();
+    for path in [
+        "parent.md",
+        "related.md",
+        "next.md",
+        "previous.md",
+        "generic.md",
+        "body.md",
+    ] {
+        fs::write(root.join(path), "# Target").unwrap();
+    }
+
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    let compatibility = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'note.md'})-[e:MD_LINKS_TO]->(d:MarkdownDocument)
+         RETURN d.`src.path`, e.`md.link_rels`
+         ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        compatibility.rows,
+        vec![
+            vec![
+                RuntimeValue::String("body.md".to_owned()),
+                RuntimeValue::List(vec![]),
+            ],
+            vec![
+                RuntimeValue::String("generic.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("link".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("next.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("next".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("parent.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("up".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("previous.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("previous".to_owned())]),
+            ],
+            vec![
+                RuntimeValue::String("related.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("related".to_owned())]),
+            ],
+        ]
+    );
+
+    let typed = run(
+        &mut reopened,
+        "MATCH (:MarkdownDocument {`src.path`: 'note.md'})-[e]->(d:MarkdownDocument)
+         WHERE edge_type(e) =~ '^MD_(UP|RELATED|NEXT|PREVIOUS)$'
+         RETURN edge_type(e), d.`src.path`, e.`md.link_sources`, e.`src.connector`
+         ORDER BY edge_type(e), d.`src.path`",
+    );
+    assert_eq!(
+        typed.rows,
+        vec![
+            vec![
+                RuntimeValue::String("MD_NEXT".to_owned()),
+                RuntimeValue::String("next.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("frontmatter".to_owned())]),
+                RuntimeValue::String("markdown".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("MD_PREVIOUS".to_owned()),
+                RuntimeValue::String("previous.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("frontmatter".to_owned())]),
+                RuntimeValue::String("markdown".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("MD_RELATED".to_owned()),
+                RuntimeValue::String("related.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("frontmatter".to_owned())]),
+                RuntimeValue::String("markdown".to_owned()),
+            ],
+            vec![
+                RuntimeValue::String("MD_UP".to_owned()),
+                RuntimeValue::String("parent.md".to_owned()),
+                RuntimeValue::List(vec![RuntimeValue::String("frontmatter".to_owned())]),
+                RuntimeValue::String("markdown".to_owned()),
+            ],
+        ]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_frontmatter_relationship_edges_are_idempotent_and_cleaned_up() {
+    let db = TestDb::new("markdown_typed_frontmatter_cleanup");
+    let root = temp_dir("markdown_typed_frontmatter_cleanup");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("note.md"),
+        "---\n\
+parent: [[parent]]\n\
+related: [[related]]\n\
+---\n",
+    )
+    .unwrap();
+    fs::write(root.join("parent.md"), "# Parent").unwrap();
+    fs::write(root.join("related.md"), "# Related").unwrap();
+
+    sync_root_into_db(db.path(), &root);
+    sync_root_into_db(db.path(), &root);
+
+    let mut reopened = db.open();
+    assert_edge_count(&mut reopened, "MD_LINKS_TO", 2);
+    assert_edge_count(&mut reopened, "MD_UP", 1);
+    assert_edge_count(&mut reopened, "MD_RELATED", 1);
+    drop(reopened);
+
+    fs::write(root.join("note.md"), "Body only [[related]].\n").unwrap();
+    sync_root_into_db(db.path(), &root);
+
+    let mut updated = db.open();
+    assert_edge_count(&mut updated, "MD_LINKS_TO", 1);
+    assert_edge_count(&mut updated, "MD_UP", 0);
+    assert_edge_count(&mut updated, "MD_RELATED", 0);
+    drop(updated);
+
+    fs::remove_file(root.join("note.md")).unwrap();
+    sync_root_into_db(db.path(), &root);
+
+    let mut tombstoned = db.open();
+    assert_edge_count(&mut tombstoned, "MD_LINKS_TO", 0);
+    assert_edge_count(&mut tombstoned, "MD_UP", 0);
+    assert_edge_count(&mut tombstoned, "MD_RELATED", 0);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn syncs_document_directory_and_parent_directory_edges_with_metadata() {
     let db = TestDb::new("markdown_structural_edges");
     let root = temp_dir("markdown_structural_edges");

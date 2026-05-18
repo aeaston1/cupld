@@ -14,6 +14,11 @@ const CONFIG_KIND: &str = "config";
 const CONFIG_NAME: &str = "markdown_source";
 const CONNECTOR_NAME: &str = "markdown";
 const LINK_EDGE_TYPE: &str = "MD_LINKS_TO";
+const MD_UP: &str = "MD_UP";
+const MD_RELATED: &str = "MD_RELATED";
+const MD_NEXT: &str = "MD_NEXT";
+const MD_PREVIOUS: &str = "MD_PREVIOUS";
+const AUTHORED_EDGE_TYPES: [&str; 5] = [LINK_EDGE_TYPE, MD_UP, MD_RELATED, MD_NEXT, MD_PREVIOUS];
 pub const MD_IN_DIRECTORY: &str = "MD_IN_DIRECTORY";
 pub const MD_PARENT_DIRECTORY: &str = "MD_PARENT_DIRECTORY";
 const STRUCTURAL_EDGE_TYPES: [&str; 2] = [MD_IN_DIRECTORY, MD_PARENT_DIRECTORY];
@@ -791,7 +796,7 @@ fn sync_link_edges(
         let Some(source_id) = node_ids.get(&source_key).copied() else {
             continue;
         };
-        delete_connector_edges_of_types(engine, source_id, &[LINK_EDGE_TYPE])?;
+        delete_connector_edges_of_types(engine, source_id, &AUTHORED_EDGE_TYPES)?;
 
         let mut resolved_targets = BTreeMap::new();
         for link_ref in extract_document_link_refs(document.frontmatter.as_ref(), &document.body) {
@@ -809,24 +814,55 @@ fn sync_link_edges(
             let Some(target_id) = node_ids.get(&target).copied() else {
                 continue;
             };
-            let mut properties = PropertyMap::from_pairs([
-                ("src.connector", Value::from(CONNECTOR_NAME)),
-                ("src.kind", Value::from("link")),
-                (
-                    "md.link_target",
-                    Value::from(resolved.raw_targets.first().cloned().unwrap_or_default()),
-                ),
-                ("md.link_targets", list_value(&resolved.raw_targets)),
-                ("md.link_sources", list_value(&resolved.sources)),
-                ("md.link_rels", list_value(&resolved.relations)),
-            ]);
-            properties.insert("src.status", Value::from("current"));
-            engine.create_edge(source_id, target_id, LINK_EDGE_TYPE, properties)?;
+            let properties = authored_edge_properties(&resolved);
+            engine.create_edge(source_id, target_id, LINK_EDGE_TYPE, properties.clone())?;
             created_edges += 1;
+
+            for edge_type in typed_frontmatter_edge_types(&resolved.relations) {
+                engine.create_edge(source_id, target_id, edge_type, properties.clone())?;
+            }
         }
     }
 
     Ok(created_edges)
+}
+
+fn authored_edge_properties(resolved: &ResolvedMarkdownTarget) -> PropertyMap {
+    let mut properties = PropertyMap::from_pairs([
+        ("src.connector", Value::from(CONNECTOR_NAME)),
+        ("src.kind", Value::from("link")),
+        (
+            "md.link_target",
+            Value::from(resolved.raw_targets.first().cloned().unwrap_or_default()),
+        ),
+        ("md.link_targets", list_value(&resolved.raw_targets)),
+        ("md.link_sources", list_value(&resolved.sources)),
+        ("md.link_rels", list_value(&resolved.relations)),
+    ]);
+    properties.insert("src.status", Value::from("current"));
+    properties
+}
+
+fn typed_frontmatter_edge_types(relations: &[String]) -> Vec<&'static str> {
+    let mut edge_types = Vec::new();
+    for relation in relations {
+        match relation.as_str() {
+            "up" => push_unique_edge_type(&mut edge_types, MD_UP),
+            "related" => push_unique_edge_type(&mut edge_types, MD_RELATED),
+            "next" => push_unique_edge_type(&mut edge_types, MD_NEXT),
+            "previous" => push_unique_edge_type(&mut edge_types, MD_PREVIOUS),
+            "link" => {}
+            _ => {}
+        }
+    }
+    edge_types
+}
+
+fn push_unique_edge_type(values: &mut Vec<&'static str>, value: &'static str) {
+    if values.iter().any(|existing| existing == &value) {
+        return;
+    }
+    values.push(value);
 }
 
 fn tombstone_missing_documents(
@@ -835,7 +871,7 @@ fn tombstone_missing_documents(
 ) -> Result<usize, SourceError> {
     for node_id in existing_docs.values().copied() {
         engine.set_node_property(node_id, "src.status", Value::from("missing"))?;
-        delete_connector_edges_of_types(engine, node_id, &[LINK_EDGE_TYPE])?;
+        delete_connector_edges_of_types(engine, node_id, &AUTHORED_EDGE_TYPES)?;
         delete_connector_edges_touching_of_types(engine, node_id, &STRUCTURAL_EDGE_TYPES)?;
     }
     Ok(existing_docs.len())
