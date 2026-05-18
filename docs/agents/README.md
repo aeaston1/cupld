@@ -361,9 +361,10 @@ Markdown root resolution order is:
 Markdown behavior:
 
 - `cupld query --with-md` overlays markdown into a temporary query session and does not persist imported notes.
-- `cupld sync markdown` persists markdown documents and `:MD_LINKS_TO` edges from body links plus supported frontmatter relationship keys into the database.
+- `cupld sync markdown` persists markdown documents and broad compatibility `:MD_LINKS_TO` edges from body links plus supported frontmatter relationship keys into the database.
+- Typed frontmatter relationships also create authored signal edges while preserving `:MD_LINKS_TO`: `up` / `parent` create `:MD_UP`, `related` creates `:MD_RELATED`, `next` creates `:MD_NEXT`, and `previous` creates `:MD_PREVIOUS`. Generic `link` / `links` frontmatter and body links do not create typed relationship edges.
 - `cupld sync markdown --db default --include-fs-graph` opts in to persisted filesystem structure: `:MarkdownDirectory` nodes, `:MD_IN_DIRECTORY` document-to-directory edges, and `:MD_PARENT_DIRECTORY` child-to-parent directory edges.
-- `:MD_LINKS_TO` remains authored-only. Filesystem structure uses the filesystem edge types instead of link edges.
+- `:MD_LINKS_TO` remains authored-only and compatibility-focused. Filesystem structure uses the filesystem edge types instead of link edges.
 - Filesystem sync does not create `:MD_SIBLING_OF` or other pairwise sibling edges.
 - Filesystem edges persist `md.edge_weight` for downstream context and retrieval work; core ranking does not consume that property in this issue.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
