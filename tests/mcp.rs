@@ -87,6 +87,127 @@ fn memory_sync_makes_markdown_visible_to_reads() {
 }
 
 #[test]
+fn memory_search_exposes_retrieval_contract_metadata() {
+    let db = TestDb::new("mcp_search_contract");
+    let root = temp_dir("mcp_search_contract");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/body.md"),
+        format!("# Body Match\n\nNeedle {}", "x".repeat(600)),
+    )
+    .unwrap();
+    fs::write(root.join("notes/title.md"), "# Needle Title\n\nOther").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let response = call(
+        &config,
+        "memory_search",
+        r#"{"query":"  Needle  ","limit":10}"#,
+    );
+    let payload = tool_payload(&response);
+    assert_eq!(
+        payload.get("query").and_then(JsonValue::as_str),
+        Some("Needle")
+    );
+    let text = json_text(&payload);
+    assert!(text.contains(r#""mode":"lexical""#), "{text}");
+    assert!(text.contains(r#""deterministic":true"#), "{text}");
+    assert!(text.contains(r#""semantic":false"#), "{text}");
+    assert!(text.contains(r#""index_used":false"#), "{text}");
+    assert!(text.contains(r#""source":"cupld_db""#), "{text}");
+    assert!(text.contains(r#""network_used":false"#), "{text}");
+
+    let items = payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array");
+    assert_eq!(items.len(), 2);
+
+    let first = &items[0];
+    assert_eq!(
+        first.get("path").and_then(JsonValue::as_str),
+        Some("notes/title.md")
+    );
+    assert_eq!(first.get("rank").and_then(JsonValue::as_i64), Some(1));
+    assert_eq!(first.get("score").and_then(JsonValue::as_i64), Some(1));
+    assert_eq!(
+        first.get("matched_category").and_then(JsonValue::as_str),
+        Some("partial_title_or_path")
+    );
+    assert!(json_text(first).contains(r#""matched_fields":["title"]"#));
+    assert!(first.get("uri").and_then(JsonValue::as_str).is_some());
+    assert!(first.get("title").and_then(JsonValue::as_str).is_some());
+    assert!(first.get("tags").and_then(JsonValue::as_array).is_some());
+    assert!(first.get("snippet").and_then(JsonValue::as_str).is_some());
+
+    let second = &items[1];
+    assert_eq!(second.get("rank").and_then(JsonValue::as_i64), Some(2));
+    assert_eq!(second.get("score").and_then(JsonValue::as_i64), Some(3));
+    assert_eq!(
+        second.get("matched_category").and_then(JsonValue::as_str),
+        Some("body")
+    );
+    assert!(json_text(second).contains(r#""matched_fields":["body"]"#));
+    assert!(json_text(second).contains(r#""truncated":true"#));
+    assert!(json_text(second).contains(r#""max_chars":500"#));
+    assert!(json_text(second).contains(r#""source":"body""#));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_rejects_missing_and_blank_queries() {
+    let db = TestDb::new("mcp_search_validation");
+    let root = temp_dir("mcp_search_validation");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Note\n\nShould not match").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let missing = call(&config, "memory_search", "{}");
+    assert!(tool_text(&missing).contains(r#""code":"validation_error""#));
+    assert!(tool_text(&missing).contains("expected query"));
+
+    let blank = call(&config, "memory_search", r#"{"query":"   "}"#);
+    let text = tool_text(&blank);
+    assert!(text.contains(r#""code":"validation_error""#), "{text}");
+    assert!(text.contains("expected non-empty query"), "{text}");
+    assert!(!text.contains(r#""items":["#), "{text}");
+    assert!(!text.contains("note.md"), "{text}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_snippet_falls_back_to_raw_when_body_is_empty() {
+    let db = TestDb::new("mcp_search_empty_body");
+    let root = temp_dir("mcp_search_empty_body");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("heading.md"), "---\ntitle: Heading Only\n---\n").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let response = call(&config, "memory_search", r#"{"query":"Heading Only"}"#);
+    let payload = tool_payload(&response);
+    let item = payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .and_then(|items| items.first())
+        .expect("search item");
+    assert_eq!(
+        item.get("snippet").and_then(JsonValue::as_str),
+        Some("---\ntitle: Heading Only\n---\n")
+    );
+    let text = json_text(item);
+    assert!(text.contains(r#""source":"raw""#), "{text}");
+    assert!(text.contains(r#""empty_body_fallback":true"#), "{text}");
+    assert!(text.contains(r#""truncated":false"#), "{text}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_add_writes_markdown_and_syncs_before_success() {
     let db = TestDb::new("mcp_add");
     let root = temp_dir("mcp_add");
@@ -202,6 +323,10 @@ fn tool_text(value: &JsonValue) -> String {
         .and_then(JsonValue::as_str)
         .unwrap()
         .to_owned()
+}
+
+fn tool_payload(value: &JsonValue) -> JsonValue {
+    json::parse(&tool_text(value)).unwrap()
 }
 
 fn sync_root(db_path: &Path, root: &Path) {

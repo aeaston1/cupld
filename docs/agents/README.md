@@ -141,6 +141,37 @@ MCP resources:
 
 MCP reads are DB-backed only and never run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1.
 
+### `memory_search` Contract
+
+`memory_search` is a local, deterministic lexical retriever over synced `MarkdownDocument` rows in the configured cupld DB. It does not call networks, embedding services, model APIs, vector indexes, or other external services. Semantic or vector retrieval is future optional work and must be explicitly opt-in if added later.
+
+Input arguments:
+
+- `query` string, required. The server trims surrounding whitespace before matching. Missing, empty, or whitespace-only queries return `{"ok":false,"error":{"code":"validation_error",...}}` and never match every document.
+- `limit` unsigned integer, optional. Defaults to `10` and is capped at `50`.
+- `tags` array of strings, optional. Every requested tag must be present on a document before lexical scoring is applied.
+
+Successful output is a JSON object in the MCP text content:
+
+- `ok`: `true`.
+- `query`: the trimmed query string used for matching.
+- `retrieval`: machine-readable retrieval contract metadata. Current values are `mode: "lexical"`, `deterministic: true`, `semantic: false`, and `index_used: false`, plus string descriptions of the ranking and score policies.
+- `items`: ordered result items.
+- `truncated`: `true` when more matched rows existed than the returned `limit`.
+- `provenance`: local DB provenance, including `source: "cupld_db"` and `network_used: false`.
+
+Each `items[]` entry preserves the existing compatibility fields `id`, `uri`, `path`, `title`, `tags`, `snippet`, and `updated_at`. Search also adds:
+
+- `rank`: 1-based position after deterministic sorting.
+- `score`: lexical score tier. Lower is more relevant.
+- `matched_fields`: one or more fields explaining why the row matched, such as `title`, `path`, `tags`, `aliases`, `headings`, or `body`.
+- `matched_category`: the score category: `exact_title_or_path`, `partial_title_or_path`, `structured_metadata`, or `body`.
+- `snippet_metadata`: `source`, `max_chars`, `truncated`, and `empty_body_fallback`.
+
+Ranking policy is intentionally simple and stable: exact title/path matches score `0`, partial title/path matches score `1`, tag/alias/heading matches score `2`, and body matches score `3`. Results sort by ascending `score`, then ascending `path` for ties. The score is a deterministic tier, not a semantic relevance probability.
+
+Snippets are capped at 500 Unicode scalar values. When `md.body` is present, the snippet comes from `md.body`; when `md.body` is empty, it falls back to `md.raw` and sets `empty_body_fallback: true`. `snippet_metadata.truncated` reports whether the selected snippet source exceeded the cap.
+
 ## Agent Workflow
 
 For safe automation, prefer this order:
