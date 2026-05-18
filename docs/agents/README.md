@@ -422,7 +422,7 @@ Maintenance command behavior:
 - `memory find-orphans` and `memory reindex` do not accept `--root`; machine output reports `root: null`.
 - `pass` means no issue was found, `warn` means stale or suspicious state was reported but the command completed, and `fail` is reserved for hard command failures.
 - `memory check --strict` exits with code 2 when the aggregate report status is `warn`. The emitted report still uses `status: "warn"` so automation can distinguish warnings from command failures.
-- `memory check` validates storage integrity, markdown freshness, required markdown metadata, duplicate current paths, duplicate connector-owned `MD_LINKS_TO` edges, schema index readiness, stale items, orphan items, and ambiguous markdown aliases.
+- `cupld check --db ...` is the storage integrity check. `memory check` reports markdown-derived maintenance diagnostics: markdown freshness, required markdown metadata, duplicate current paths, duplicate connector-owned `MD_LINKS_TO` edges, schema index readiness, stale items, orphan items, and ambiguous markdown aliases.
 - `memory find-stale` reports filesystem freshness problems such as changed files, missing current files, tombstoned documents, incomplete metadata, and root mismatches.
 - `memory find-orphans` reports current markdown documents with no markdown or native graph connectivity.
 - `memory reindex` inspects existing schema index definitions and reports their current status; it does not create new indexes.
@@ -477,7 +477,7 @@ Markdown notes:
 - `cupld query --output ndjson` writes one `query_meta` line, one `query_result` line per result set, and one `query_row` line per returned row.
 - `cupld context --output json` writes one seeded JSON envelope to stdout with `ok`, `command`, `mode`, `policy`, `retrieval_usage`, `provenance`, `request`, `seeds`, `nodes`, `edges`, and `warnings`.
 - `cupld context --output ndjson` writes one `context_meta` line followed by deterministic `context_seed`, `context_node`, and `context_edge` lines.
-- `cupld check --output json` includes storage integrity plus markdown alias diagnostics, including ambiguous alias counts and colliding paths.
+- `cupld check --db ...` reports the database storage integrity summary. Use `cupld memory check --output json` when automation needs the full markdown maintenance envelope.
 - `cupld memory check|find-stale|find-orphans|reindex --output json` writes one JSON envelope to stdout with `ok`, `command`, `status`, resolved `db_path`, resolved `root` where applicable, `summary`, `checks`, and `items`.
 - `cupld memory ... --output ndjson` writes one `memory_meta` line, one `memory_check` line per check, and one `memory_item` line per item.
 - `cupld memory ... --output table` is the default human-readable sectioned table format.
