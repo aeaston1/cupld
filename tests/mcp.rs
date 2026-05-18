@@ -157,6 +157,54 @@ fn memory_search_exposes_retrieval_contract_metadata() {
 }
 
 #[test]
+fn memory_search_uses_markdown_indexes_without_changing_ranked_results() {
+    let fallback_db = TestDb::new("mcp_search_fallback_candidates");
+    let indexed_db = TestDb::new("mcp_search_indexed_candidates");
+    let root = temp_dir("mcp_search_indexed_candidates");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/body.md"),
+        "# Body Match\n\nNeedle appears in the body.",
+    )
+    .unwrap();
+    fs::write(root.join("notes/title.md"), "# Needle Title\n\nOther").unwrap();
+    fs::write(root.join("notes/other.md"), "# Other\n\nNo match").unwrap();
+    sync_root(fallback_db.path(), &root);
+    sync_root(indexed_db.path(), &root);
+    create_markdown_search_indexes(indexed_db.path());
+
+    let fallback = tool_payload(&call(
+        &config(fallback_db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"Needle","limit":10}"#,
+    ));
+    let indexed = tool_payload(&call(
+        &config(indexed_db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"Needle","limit":10}"#,
+    ));
+
+    assert_eq!(
+        fallback
+            .get("retrieval")
+            .and_then(|retrieval| retrieval.get("index_used"))
+            .and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        indexed
+            .get("retrieval")
+            .and_then(|retrieval| retrieval.get("index_used"))
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(result_paths(&fallback), result_paths(&indexed));
+    assert_eq!(result_scores(&fallback), result_scores(&indexed));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_search_rejects_missing_and_blank_queries() {
     let db = TestDb::new("mcp_search_validation");
     let root = temp_dir("mcp_search_validation");
@@ -336,6 +384,48 @@ fn sync_root(db_path: &Path, root: &Path) {
     engine.commit().unwrap();
     session.replace_engine(engine).unwrap();
     session.save().unwrap();
+}
+
+fn create_markdown_search_indexes(db_path: &Path) {
+    let mut session = Session::open(db_path).unwrap();
+    session
+        .execute_script(
+            "CREATE INDEX ON :MarkdownDocument(`md.body`) KIND FULLTEXT",
+            &Default::default(),
+        )
+        .unwrap();
+    session
+        .execute_script(
+            "CREATE INDEX ON :MarkdownDocument(`md.tags`) KIND LIST",
+            &Default::default(),
+        )
+        .unwrap();
+    session.save().unwrap();
+}
+
+fn result_paths(payload: &JsonValue) -> Vec<String> {
+    payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .unwrap()
+        .iter()
+        .map(|item| {
+            item.get("path")
+                .and_then(JsonValue::as_str)
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+fn result_scores(payload: &JsonValue) -> Vec<i64> {
+    payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .unwrap()
+        .iter()
+        .map(|item| item.get("score").and_then(JsonValue::as_i64).unwrap())
+        .collect()
 }
 
 fn temp_dir(prefix: &str) -> PathBuf {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
@@ -351,23 +351,13 @@ fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
     let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
     let tags = arg_strings(args.get("tags"));
     let normalized_query = query.to_ascii_lowercase();
-    match load_docs(config) {
-        Ok(docs) => {
-            let mut scored = filter_tags(docs, &tags)
-                .into_iter()
-                .filter_map(|doc| {
-                    doc.search_match(&normalized_query)
-                        .map(|search_match| (search_match, doc))
-                })
-                .collect::<Vec<_>>();
-            scored.sort_by(|(left_match, left), (right_match, right)| {
-                left_match
-                    .score
-                    .cmp(&right_match.score)
-                    .then_with(|| left.path.cmp(&right.path))
-            });
-            search_payload(query, scored, limit)
-        }
+    match load_search_docs(config, query, &tags) {
+        Ok((docs, index_used)) => search_payload(
+            query,
+            score_search_docs(docs, &normalized_query, &tags),
+            limit,
+            index_used,
+        ),
         Err(error) => error_payload("db_query_failed", &error),
     }
 }
@@ -389,7 +379,12 @@ fn list_payload(docs: Vec<MemoryDoc>, limit: usize) -> JsonValue {
     ])
 }
 
-fn search_payload(query: &str, docs: Vec<(SearchMatch, MemoryDoc)>, limit: usize) -> JsonValue {
+fn search_payload(
+    query: &str,
+    docs: Vec<(SearchMatch, MemoryDoc)>,
+    limit: usize,
+    index_used: bool,
+) -> JsonValue {
     let truncated = docs.len() > limit;
     JsonValue::object([
         ("ok", true.into()),
@@ -400,7 +395,7 @@ fn search_payload(query: &str, docs: Vec<(SearchMatch, MemoryDoc)>, limit: usize
                 ("mode", JsonValue::from("lexical")),
                 ("deterministic", true.into()),
                 ("semantic", false.into()),
-                ("index_used", false.into()),
+                ("index_used", index_used.into()),
                 (
                     "ranking_policy",
                     JsonValue::from("ascending lexical score tier, then ascending path for ties"),
@@ -546,6 +541,26 @@ fn resolve_markdown_root(config: &McpConfig, session: Option<&Session>) -> Optio
 
 fn load_docs(config: &McpConfig) -> Result<Vec<MemoryDoc>, String> {
     let mut session = open_session(config)?;
+    load_docs_from_session(&mut session)
+}
+
+fn load_search_docs(
+    config: &McpConfig,
+    query: &str,
+    tags: &[String],
+) -> Result<(Vec<MemoryDoc>, bool), String> {
+    let mut session = open_session(config)?;
+    let indexes = markdown_search_indexes(&session);
+    if tags.is_empty() && indexes.body_fulltext {
+        return load_indexed_body_candidates(&mut session, query);
+    }
+    if !tags.is_empty() && indexes.tags_list {
+        return load_indexed_tag_candidates(&mut session, tags);
+    }
+    Ok((load_docs_from_session(&mut session)?, false))
+}
+
+fn load_docs_from_session(session: &mut Session) -> Result<Vec<MemoryDoc>, String> {
     let result = session
         .execute_script(
             "MATCH (d:MarkdownDocument)
@@ -556,6 +571,117 @@ fn load_docs(config: &McpConfig) -> Result<Vec<MemoryDoc>, String> {
         .map_err(|error| error.to_string())?
         .remove(0);
     Ok(result.rows.into_iter().map(MemoryDoc::from_row).collect())
+}
+
+fn load_indexed_body_candidates(
+    session: &mut Session,
+    query: &str,
+) -> Result<(Vec<MemoryDoc>, bool), String> {
+    let indexed = session
+        .execute_script(
+            &format!(
+                "MATCH (d:MarkdownDocument)
+                 WHERE d.`md.body` CONTAINS {}
+                 RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
+                 ORDER BY d.`src.path`",
+                cypher_string(query)
+            ),
+            &BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .remove(0)
+        .rows
+        .into_iter()
+        .map(MemoryDoc::from_row)
+        .collect::<Vec<_>>();
+
+    let indexed_ids = indexed.iter().map(|doc| doc.id).collect::<BTreeSet<_>>();
+    let mut docs = indexed;
+    for doc in load_docs_from_session(session)? {
+        if indexed_ids.contains(&doc.id) {
+            continue;
+        }
+        if doc.metadata_match(&query.to_ascii_lowercase()) {
+            docs.push(doc);
+        }
+    }
+    Ok((docs, true))
+}
+
+fn load_indexed_tag_candidates(
+    session: &mut Session,
+    tags: &[String],
+) -> Result<(Vec<MemoryDoc>, bool), String> {
+    let mut clauses = Vec::new();
+    for tag in tags {
+        clauses.push(format!("{} IN d.`md.tags`", cypher_string(tag)));
+    }
+    let result = session
+        .execute_script(
+            &format!(
+                "MATCH (d:MarkdownDocument)
+                 WHERE {}
+                 RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
+                 ORDER BY d.`src.path`",
+                clauses.join(" AND ")
+            ),
+            &BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .remove(0);
+    Ok((
+        result.rows.into_iter().map(MemoryDoc::from_row).collect(),
+        true,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MarkdownSearchIndexes {
+    body_fulltext: bool,
+    tags_list: bool,
+}
+
+fn markdown_search_indexes(session: &Session) -> MarkdownSearchIndexes {
+    let mut indexes = MarkdownSearchIndexes::default();
+    for index in session.engine().show_indexes(None) {
+        if index.target_kind == "label"
+            && index.target_name == "MarkdownDocument"
+            && index.status == "ready"
+        {
+            if index.property == "md.body" && index.kind == "fulltext" {
+                indexes.body_fulltext = true;
+            }
+            if index.property == "md.tags" && index.kind == "list" {
+                indexes.tags_list = true;
+            }
+        }
+    }
+    indexes
+}
+
+fn score_search_docs(
+    docs: Vec<MemoryDoc>,
+    normalized_query: &str,
+    tags: &[String],
+) -> Vec<(SearchMatch, MemoryDoc)> {
+    let mut scored = filter_tags(docs, tags)
+        .into_iter()
+        .filter_map(|doc| {
+            doc.search_match(normalized_query)
+                .map(|search_match| (search_match, doc))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_match, left), (right_match, right)| {
+        left_match
+            .score
+            .cmp(&right_match.score)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    scored
+}
+
+fn cypher_string(input: &str) -> String {
+    format!("'{}'", input.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 #[derive(Clone, Debug)]
@@ -711,6 +837,27 @@ impl MemoryDoc {
             .to_ascii_lowercase()
             .contains(query)
             .then(|| SearchMatch::new(3, "body", vec!["body"]))
+    }
+
+    fn metadata_match(&self, query: &str) -> bool {
+        let title = self.title.to_ascii_lowercase();
+        let path = self.path.to_ascii_lowercase();
+        title == query
+            || path == query
+            || title.contains(query)
+            || path.contains(query)
+            || self
+                .tags
+                .iter()
+                .any(|value| value.to_ascii_lowercase().contains(query))
+            || self
+                .aliases
+                .iter()
+                .any(|value| value.to_ascii_lowercase().contains(query))
+            || self
+                .headings
+                .iter()
+                .any(|value| value.to_ascii_lowercase().contains(query))
     }
 }
 

@@ -146,6 +146,15 @@ cupld memory reindex --db default --output json
 
 Use `cupld check --db default` for storage integrity before relying on a database. Use `cupld memory check` for markdown-derived memory diagnostics: it reports markdown freshness, metadata, duplicate markdown paths and edges, schema index readiness, stale items, orphans, and ambiguous markdown aliases. `memory find-stale` lists markdown documents whose persisted state no longer matches the filesystem, `memory find-orphans` lists current markdown documents without markdown or native graph connectivity, and `memory reindex` inspects existing schema index definitions and reports their status. These memory commands are diagnostic: use `cupld sync markdown --db default` or `cupld sync markdown --db default --root notes` to refresh markdown-derived DB state after editing notes.
 
+For large MarkdownDocument sets, operators can explicitly add optional search indexes with existing query syntax:
+
+```bash
+cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.body\`) KIND FULLTEXT"
+cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.tags\`) KIND LIST"
+cupld query --db default "SHOW INDEXES ON :MarkdownDocument"
+cupld query --db default "EXPLAIN MATCH (d:MarkdownDocument) WHERE d.\`md.body\` CONTAINS 'term' RETURN d.\`src.path\`"
+```
+
 Markdown root resolution for commands that accept `--root` is: explicit `--root`, `.cupld/config.toml`, the DB root saved by `cupld source set-root`, then `./.cupld/data`. Relative roots are resolved against the workspace package root. `memory find-orphans` and `memory reindex` do not need a markdown root and report `root: null` in machine output.
 
 Maintenance reports use stable statuses: `pass` means no problem was found, `warn` means the command found stale or suspicious state but completed successfully, and `fail` is reserved for hard failures. `memory check --strict` keeps warning details in the report but exits with code 2 when the aggregate status is `warn`; without `--strict`, warnings exit successfully. Table output is the default. `--output json` emits one report envelope with `ok`, `command`, `status`, `db_path`, `root`, `summary`, `checks`, and `items`; `--output ndjson` emits one `memory_meta` line followed by `memory_check` and `memory_item` lines.
