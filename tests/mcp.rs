@@ -111,6 +111,52 @@ fn memory_add_writes_markdown_and_syncs_before_success() {
 }
 
 #[test]
+fn memory_search_matches_multi_term_and_reordered_queries() {
+    let db = TestDb::new("mcp_multiterm");
+    let root = temp_dir("mcp_multiterm");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("berth.md"),
+        "# Mallorca Annual Berth — Inquiry Log\nOutbound annual-berth inquiries for Rocinante.",
+    )
+    .unwrap();
+
+    let config = config(db.path(), &root, false);
+    call(&config, "memory_sync", "{}");
+
+    // Reordered terms: previously required one contiguous substring, so
+    // this silently returned nothing despite both words being present.
+    let reordered = call(&config, "memory_search", r#"{"query":"berth annual"}"#);
+    assert!(
+        tool_text(&reordered).contains("berth.md"),
+        "{}",
+        tool_text(&reordered)
+    );
+
+    // Multi-term query spanning title + body.
+    let spanning = call(
+        &config,
+        "memory_search",
+        r#"{"query":"annual berth Rocinante inquiry"}"#,
+    );
+    assert!(
+        tool_text(&spanning).contains("berth.md"),
+        "{}",
+        tool_text(&spanning)
+    );
+
+    // A token that appears nowhere still yields no match.
+    let absent = call(&config, "memory_search", r#"{"query":"berth helicopter"}"#);
+    assert!(
+        tool_text(&absent).contains(r#""items":[]"#),
+        "{}",
+        tool_text(&absent)
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn read_only_rejects_write_and_sync_tools() {
     let db = TestDb::new("mcp_read_only");
     let root = temp_dir("mcp_read_only");

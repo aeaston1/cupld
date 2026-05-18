@@ -572,22 +572,48 @@ impl MemoryDoc {
     fn search_score(&self, query: &str) -> Option<u8> {
         let title = self.title.to_ascii_lowercase();
         let path = self.path.to_ascii_lowercase();
+
+        // Whole-query exact match on title/path keeps the strongest rank.
         if title == query || path == query {
             return Some(0);
         }
-        if title.contains(query) || path.contains(query) {
-            return Some(1);
+
+        // Tokenize on whitespace and require *every* term to be found
+        // somewhere. Previously the entire query had to appear as a single
+        // contiguous substring, so any multi-word or reordered query (e.g.
+        // "berth annual" vs "annual berth") silently returned nothing even
+        // when all terms were present in the note.
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        if tokens.is_empty() {
+            return None;
         }
-        if self
+
+        let metadata = self
             .tags
             .iter()
             .chain(self.aliases.iter())
             .chain(self.headings.iter())
-            .any(|value| value.to_ascii_lowercase().contains(query))
-        {
-            return Some(2);
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        let body = self.body.to_ascii_lowercase();
+
+        // Each token's best (lowest) field rank; doc score is the worst of
+        // them, so title-concentrated matches still outrank body-only ones.
+        let mut score: u8 = 1;
+        for token in tokens {
+            let rank = if title.contains(token) || path.contains(token) {
+                1
+            } else if metadata.contains(token) {
+                2
+            } else if body.contains(token) {
+                3
+            } else {
+                return None;
+            };
+            score = score.max(rank);
         }
-        self.body.to_ascii_lowercase().contains(query).then_some(3)
+        Some(score)
     }
 }
 
