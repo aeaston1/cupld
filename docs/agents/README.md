@@ -149,19 +149,20 @@ MCP reads are DB-backed only and never run hidden markdown syncs. Use `memory_sy
 
 ### `memory_search` Contract
 
-`memory_search` is a local, deterministic lexical retriever over synced `MarkdownDocument` rows in the configured cupld DB. It does not call networks, embedding services, model APIs, vector indexes, or other external services. Semantic or vector retrieval is future optional work and must be explicitly opt-in if added later.
+`memory_search` is a local, deterministic lexical retriever over synced `MarkdownDocument` rows in the configured cupld DB by default. It does not call networks, embedding services, model APIs, vector indexes, or other external services. Semantic or vector retrieval is an explicit opt-in boundary only; cupld does not generate embeddings, download models, contact providers, or silently fall back to lexical results when semantic retrieval is requested but unconfigured.
 
 Input arguments:
 
 - `query` string, required. The server trims surrounding whitespace before matching. Missing, empty, or whitespace-only queries return `{"ok":false,"error":{"code":"validation_error",...}}` and never match every document.
 - `limit` unsigned integer, optional. Defaults to `10` and is capped at `50`.
 - `tags` array of strings, optional. Every requested tag must be present on a document before lexical scoring is applied.
+- `retrieval_mode` string, optional. Omitted or `lexical` uses deterministic local lexical search. `semantic` or `vector` requests the semantic backend boundary. With no configured local vector backend, semantic/vector mode returns `{"ok":false,"error":{"code":"unconfigured",...}}`, `items: []`, `retrieval.network_used: false`, and never runs lexical fallback. `mode` and `retrieval` are accepted aliases for compatibility with callers that already reserve those names.
 
 Successful output is a JSON object in the MCP text content:
 
 - `ok`: `true`.
 - `query`: the trimmed query string used for matching.
-- `retrieval`: machine-readable retrieval contract metadata. Current values are `mode: "lexical"`, `deterministic: true`, `semantic: false`, and `index_used`, plus string descriptions of the ranking and score policies. `index_used` is `true` only when existing ready MarkdownDocument indexes were used to generate candidates; ranking and result shape remain the same as deterministic fallback.
+- `retrieval`: machine-readable retrieval contract metadata. Default values are `mode: "lexical"`, `deterministic: true`, `semantic: false`, and `index_used`, plus string descriptions of the ranking and score policies. `index_used` is `true` only when existing ready MarkdownDocument indexes were used to generate candidates; ranking and result shape remain the same as deterministic fallback.
 - `items`: ordered result items.
 - `truncated`: `true` when more matched rows existed than the returned `limit`.
 - `provenance`: local DB provenance, including `source: "cupld_db"` and `network_used: false`.
@@ -170,6 +171,9 @@ Each `items[]` entry preserves the existing compatibility fields `id`, `uri`, `p
 
 - `rank`: 1-based position after deterministic sorting.
 - `score`: lexical score tier. Lower is more relevant.
+- `lexical_score`: the lexical score tier, matching `score` for compatibility.
+- `semantic_score`: `null` for lexical results.
+- `blended_score`: `null` for lexical results.
 - `matched_fields`: one or more fields explaining why the row matched, such as `title`, `path`, `tags`, `aliases`, `headings`, or `body`.
 - `matched_category`: the score category: `exact_title_or_path`, `partial_title_or_path`, `structured_metadata`, or `body`.
 - `snippet_metadata`: `source`, `max_chars`, `truncated`, and `empty_body_fallback`.

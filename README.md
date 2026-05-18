@@ -134,6 +134,8 @@ cupld sync markdown --db default --root notes --watch --idle-ms 500 --max-runs 2
 
 Use `cupld query --with-md` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state. By default sync persists markdown documents and authored `MD_LINKS_TO` compatibility edges. Body links and generic frontmatter `link` / `links` relationships create only `MD_LINKS_TO`; typed frontmatter relationships also add authored signal edges: `up` / `parent` as `MD_UP`, `related` as `MD_RELATED`, `next` as `MD_NEXT`, and `previous` as `MD_PREVIOUS`. `--include-fs-graph` also persists `MarkdownDirectory` nodes plus `MD_IN_DIRECTORY` and `MD_PARENT_DIRECTORY` edges; it does not create `MD_SIBLING_OF` pairwise sibling edges. MCP `memory_search` can consume the persisted filesystem `md.edge_weight` values as weak deterministic tie-break signals after lexical ranking; authored link evidence remains separate.
 
+MCP `memory_search` defaults to deterministic local lexical retrieval. Semantic or vector retrieval is opt-in with `retrieval_mode: "semantic"` or `"vector"` and currently requires an explicitly configured local vector backend. When that backend is not configured, cupld returns a stable `unconfigured` result with no items and `network_used: false`; it does not generate embeddings, contact model providers, download models, call external services, or silently fall back to lexical search for explicit semantic requests.
+
 Maintain markdown-derived memory state:
 
 ```bash
