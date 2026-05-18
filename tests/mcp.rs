@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cupld::json::{self, JsonValue};
 use cupld::mcp::{self, McpConfig};
-use cupld::{Session, sync_markdown_root};
+use cupld::{MarkdownSyncOptions, Session, sync_markdown_root, sync_markdown_root_with_options};
 
 use support::TestDb;
 
@@ -378,6 +378,192 @@ fn memory_search_ranks_more_matched_terms_within_a_tier() {
 }
 
 #[test]
+fn memory_search_uses_same_directory_signal_as_weak_tie_breaker() {
+    let db = TestDb::new("mcp_search_same_directory_signal");
+    let root = temp_dir("mcp_search_same_directory_signal");
+    fs::create_dir_all(root.join("projects/alpha")).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("projects/alpha/source.md"),
+        "# Needle Source\n\nTop lexical anchor.",
+    )
+    .unwrap();
+    fs::write(root.join("a-outside.md"), "# Outside\n\nNeedle detail.").unwrap();
+    fs::write(
+        root.join("projects/alpha/z-near.md"),
+        "# Near\n\nNeedle detail.",
+    )
+    .unwrap();
+    sync_root_with_fs_graph(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let payload = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Needle","limit":10}"#,
+    ));
+    assert_eq!(
+        item_paths(&payload),
+        vec![
+            "projects/alpha/source.md",
+            "projects/alpha/z-near.md",
+            "a-outside.md",
+        ]
+    );
+    assert_eq!(
+        payload
+            .get("retrieval")
+            .and_then(|retrieval| retrieval.get("structural_signal_available"))
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    let items = payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array");
+    let near_text = json_text(&items[1]);
+    assert!(
+        near_text.contains(r#""kind":"same_directory""#),
+        "{near_text}"
+    );
+    assert!(
+        near_text.contains(r#""edge_types":["MD_IN_DIRECTORY"]"#),
+        "{near_text}"
+    );
+    assert!(near_text.contains(r#""edge_weight":25"#), "{near_text}");
+    assert_eq!(items[1].get("score").and_then(JsonValue::as_i64), Some(300));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_uses_parent_child_directory_signal_as_weak_tie_breaker() {
+    let db = TestDb::new("mcp_search_parent_child_signal");
+    let root = temp_dir("mcp_search_parent_child_signal");
+    fs::create_dir_all(root.join("projects/alpha/child")).unwrap();
+    fs::create_dir_all(root.join("projects/zeta")).unwrap();
+    fs::write(
+        root.join("projects/alpha/source.md"),
+        "# Needle Source\n\nTop lexical anchor.",
+    )
+    .unwrap();
+    fs::write(
+        root.join("projects/zeta/a-outside.md"),
+        "# Outside\n\nNeedle detail.",
+    )
+    .unwrap();
+    fs::write(
+        root.join("projects/alpha/child/z-child.md"),
+        "# Child\n\nNeedle detail.",
+    )
+    .unwrap();
+    sync_root_with_fs_graph(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let payload = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Needle","limit":10}"#,
+    ));
+    assert_eq!(
+        item_paths(&payload),
+        vec![
+            "projects/alpha/source.md",
+            "projects/alpha/child/z-child.md",
+            "projects/zeta/a-outside.md",
+        ]
+    );
+    let items = payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("items array");
+    let child_text = json_text(&items[1]);
+    assert!(
+        child_text.contains(r#""kind":"parent_child_directory""#),
+        "{child_text}"
+    );
+    assert!(
+        child_text.contains(r#""edge_types":["MD_IN_DIRECTORY","MD_PARENT_DIRECTORY"]"#),
+        "{child_text}"
+    );
+    assert_eq!(items[1].get("score").and_then(JsonValue::as_i64), Some(300));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_without_filesystem_graph_keeps_lexical_order() {
+    let db = TestDb::new("mcp_search_no_filesystem_signal");
+    let root = temp_dir("mcp_search_no_filesystem_signal");
+    fs::create_dir_all(root.join("projects/alpha")).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("projects/alpha/source.md"),
+        "# Needle Source\n\nTop lexical anchor.",
+    )
+    .unwrap();
+    fs::write(root.join("a-outside.md"), "# Outside\n\nNeedle detail.").unwrap();
+    fs::write(
+        root.join("projects/alpha/z-near.md"),
+        "# Near\n\nNeedle detail.",
+    )
+    .unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let payload = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Needle","limit":10}"#,
+    ));
+    assert_eq!(
+        item_paths(&payload),
+        vec![
+            "projects/alpha/source.md",
+            "a-outside.md",
+            "projects/alpha/z-near.md",
+        ]
+    );
+    assert_eq!(
+        payload
+            .get("retrieval")
+            .and_then(|retrieval| retrieval.get("structural_signal_available"))
+            .and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert!(json_text(&payload).contains(r#""structural_signal":{"score":0,"evidence":[]}"#));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_keeps_authored_links_separate_from_filesystem_signal() {
+    let db = TestDb::new("mcp_search_authored_link_separation");
+    let root = temp_dir("mcp_search_authored_link_separation");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/source.md"),
+        "# Needle Source\n\n[[linked]]",
+    )
+    .unwrap();
+    fs::write(root.join("notes/linked.md"), "# Linked\n\nNeedle detail.").unwrap();
+    sync_root_with_fs_graph(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let payload = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Needle","limit":10}"#,
+    ));
+    let text = json_text(&payload);
+    assert!(text.contains(r#""kind":"same_directory""#), "{text}");
+    assert!(text.contains("MD_IN_DIRECTORY"), "{text}");
+    assert!(!text.contains("MD_LINKS_TO"), "{text}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_search_filters_tags_before_ranking_and_uses_matching_snippets() {
     let db = TestDb::new("mcp_search_tags_snippets");
     let root = temp_dir("mcp_search_tags_snippets");
@@ -562,6 +748,22 @@ fn sync_root(db_path: &Path, root: &Path) {
     let mut session = Session::open(db_path).unwrap();
     let mut engine = session.engine().clone();
     sync_markdown_root(&mut engine, root).unwrap();
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+}
+
+fn sync_root_with_fs_graph(db_path: &Path, root: &Path) {
+    let mut session = Session::open(db_path).unwrap();
+    let mut engine = session.engine().clone();
+    sync_markdown_root_with_options(
+        &mut engine,
+        root,
+        &MarkdownSyncOptions {
+            include_fs_graph: true,
+        },
+    )
+    .unwrap();
     engine.commit().unwrap();
     session.replace_engine(engine).unwrap();
     session.save().unwrap();

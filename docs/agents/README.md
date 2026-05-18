@@ -413,7 +413,7 @@ Markdown behavior:
 - `cupld sync markdown --db default --include-fs-graph` opts in to persisted filesystem structure: `:MarkdownDirectory` nodes, `:MD_IN_DIRECTORY` document-to-directory edges, and `:MD_PARENT_DIRECTORY` child-to-parent directory edges.
 - `:MD_LINKS_TO` remains authored-only and compatibility-focused. Filesystem structure uses the filesystem edge types instead of link edges.
 - Filesystem sync does not create `:MD_SIBLING_OF` or other pairwise sibling edges.
-- Filesystem edges persist `md.edge_weight` for downstream context and retrieval work; core ranking does not consume that property in this issue.
+- Filesystem edges persist `md.edge_weight`; MCP `memory_search` consumes that opt-in structure only as a weak deterministic retrieval signal for lexical ties. Lexical relevance remains primary, and authored `:MD_LINKS_TO` evidence remains distinct from filesystem structural evidence.
 - `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
 - `--poll-ms` controls the poll interval.
 - `--debounce-ms` controls the stable-change debounce window.
