@@ -350,11 +350,11 @@ fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
     }
     let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
     let tags = arg_strings(args.get("tags"));
-    let normalized_query = query.to_ascii_lowercase();
+    let search_query = SearchQuery::new(query);
     match load_search_docs(config, query, &tags) {
         Ok((docs, index_used)) => search_payload(
             query,
-            score_search_docs(docs, &normalized_query, &tags),
+            score_search_docs(docs, &search_query, &tags),
             limit,
             index_used,
         ),
@@ -398,12 +398,14 @@ fn search_payload(
                 ("index_used", index_used.into()),
                 (
                     "ranking_policy",
-                    JsonValue::from("ascending lexical score tier, then ascending path for ties"),
+                    JsonValue::from(
+                        "ascending deterministic lexical score, then ascending path for ties",
+                    ),
                 ),
                 (
                     "score_policy",
                     JsonValue::from(
-                        "lower score is more relevant: exact title/path=0, partial title/path=1, tag/alias/heading=2, body=3",
+                        "lower score is more relevant: exact title/path, partial title/path, alias/tag/heading, body, with multi-term coverage bonuses inside each tier",
                     ),
                 ),
             ]),
@@ -661,13 +663,13 @@ fn markdown_search_indexes(session: &Session) -> MarkdownSearchIndexes {
 
 fn score_search_docs(
     docs: Vec<MemoryDoc>,
-    normalized_query: &str,
+    search_query: &SearchQuery,
     tags: &[String],
 ) -> Vec<(SearchMatch, MemoryDoc)> {
     let mut scored = filter_tags(docs, tags)
         .into_iter()
         .filter_map(|doc| {
-            doc.search_match(normalized_query)
+            doc.search_match(search_query)
                 .map(|search_match| (search_match, doc))
         })
         .collect::<Vec<_>>();
@@ -721,8 +723,7 @@ impl MemoryDoc {
         rank: usize,
         max_chars: usize,
     ) -> JsonValue {
-        let (snippet, truncated) = self.snippet(max_chars);
-        let snippet_source = if self.body.is_empty() { "raw" } else { "body" };
+        let (snippet, truncated, snippet_source) = self.search_snippet(search_match, max_chars);
         let mut fields = match self.to_json_with_body(&snippet) {
             JsonValue::Object(fields) => fields,
             _ => Vec::new(),
@@ -768,6 +769,28 @@ impl MemoryDoc {
         )
     }
 
+    fn search_snippet(
+        &self,
+        search_match: &SearchMatch,
+        max_chars: usize,
+    ) -> (String, bool, &'static str) {
+        if search_match.fields.contains(&"headings")
+            && let Some(heading) = best_matching_text(&self.headings, &search_match.terms)
+        {
+            let (snippet, truncated) = truncate(heading, max_chars);
+            return (snippet, truncated, "headings");
+        }
+        if search_match.fields.contains(&"body")
+            && let Some(line) = best_matching_line(&self.body, &search_match.terms)
+        {
+            let (snippet, truncated) = truncate(line, max_chars);
+            return (snippet, truncated, "body");
+        }
+        let (snippet, truncated) = self.snippet(max_chars);
+        let source = if self.body.is_empty() { "raw" } else { "body" };
+        (snippet, truncated, source)
+    }
+
     fn to_json_with_body(&self, body: &str) -> JsonValue {
         JsonValue::object([
             ("id", JsonValue::from(self.id)),
@@ -786,57 +809,27 @@ impl MemoryDoc {
         ])
     }
 
-    fn search_match(&self, query: &str) -> Option<SearchMatch> {
+    fn search_match(&self, query: &SearchQuery) -> Option<SearchMatch> {
         let title = self.title.to_ascii_lowercase();
         let path = self.path.to_ascii_lowercase();
-        if title == query || path == query {
+        let exact_title = title == query.normalized;
+        let exact_path = path == query.normalized;
+        if exact_title || exact_path {
             return Some(SearchMatch::new(
                 0,
                 "exact_title_or_path",
-                matched_fields([("title", title == query), ("path", path == query)]),
+                matched_fields([("title", exact_title), ("path", exact_path)]),
+                query.terms.clone(),
             ));
         }
-        if title.contains(query) || path.contains(query) {
-            return Some(SearchMatch::new(
-                1,
-                "partial_title_or_path",
-                matched_fields([
-                    ("title", title.contains(query)),
-                    ("path", path.contains(query)),
-                ]),
-            ));
-        }
-        let structured_fields = matched_fields([
-            (
-                "tags",
-                self.tags
-                    .iter()
-                    .any(|value| value.to_ascii_lowercase().contains(query)),
-            ),
-            (
-                "aliases",
-                self.aliases
-                    .iter()
-                    .any(|value| value.to_ascii_lowercase().contains(query)),
-            ),
-            (
-                "headings",
-                self.headings
-                    .iter()
-                    .any(|value| value.to_ascii_lowercase().contains(query)),
-            ),
-        ]);
-        if !structured_fields.is_empty() {
-            return Some(SearchMatch::new(
-                2,
-                "structured_metadata",
-                structured_fields,
-            ));
-        }
-        self.body
-            .to_ascii_lowercase()
-            .contains(query)
-            .then(|| SearchMatch::new(3, "body", vec!["body"]))
+        let mut score = LexicalScore::new();
+        score.add_field("title", 100, &title, query);
+        score.add_field("path", 110, &path, query);
+        score.add_values("aliases", 200, &self.aliases, query);
+        score.add_values("tags", 210, &self.tags, query);
+        score.add_values("headings", 220, &self.headings, query);
+        score.add_field("body", 300, &self.body.to_ascii_lowercase(), query);
+        score.into_match()
     }
 
     fn metadata_match(&self, query: &str) -> bool {
@@ -863,19 +856,181 @@ impl MemoryDoc {
 
 #[derive(Clone, Debug)]
 struct SearchMatch {
-    score: u8,
+    score: usize,
     category: &'static str,
     fields: Vec<&'static str>,
+    terms: Vec<String>,
 }
 
 impl SearchMatch {
-    fn new(score: u8, category: &'static str, fields: Vec<&'static str>) -> Self {
+    fn new(
+        score: usize,
+        category: &'static str,
+        fields: Vec<&'static str>,
+        terms: Vec<String>,
+    ) -> Self {
         Self {
             score,
             category,
             fields,
+            terms,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SearchQuery {
+    normalized: String,
+    terms: Vec<String>,
+}
+
+impl SearchQuery {
+    fn new(query: &str) -> Self {
+        let normalized = query.to_ascii_lowercase();
+        let mut terms = normalized
+            .split_ascii_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        terms.sort();
+        terms.dedup();
+        Self { normalized, terms }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LexicalScore {
+    score: usize,
+    category: &'static str,
+    fields: Vec<&'static str>,
+    terms: Vec<String>,
+}
+
+impl LexicalScore {
+    fn new() -> Self {
+        Self {
+            score: usize::MAX,
+            category: "",
+            fields: Vec::new(),
+            terms: Vec::new(),
+        }
+    }
+
+    fn add_field(
+        &mut self,
+        field: &'static str,
+        tier: usize,
+        normalized_value: &str,
+        query: &SearchQuery,
+    ) {
+        let matched_terms = matched_terms(normalized_value, query);
+        if matched_terms.is_empty() {
+            return;
+        }
+        let score = lexical_score(tier, matched_terms.len(), query.terms.len());
+        if score < self.score {
+            self.score = score;
+            self.category = category_for_field(field);
+            self.fields.clear();
+            self.terms = matched_terms.clone();
+        }
+        if score == self.score {
+            push_unique_field(&mut self.fields, field);
+            merge_terms(&mut self.terms, matched_terms);
+        }
+    }
+
+    fn add_values(
+        &mut self,
+        field: &'static str,
+        tier: usize,
+        values: &[String],
+        query: &SearchQuery,
+    ) {
+        for value in values {
+            self.add_field(field, tier, &value.to_ascii_lowercase(), query);
+        }
+    }
+
+    fn into_match(self) -> Option<SearchMatch> {
+        (self.score != usize::MAX)
+            .then(|| SearchMatch::new(self.score, self.category, self.fields, self.terms))
+    }
+}
+
+fn lexical_score(tier: usize, matched_terms: usize, query_terms: usize) -> usize {
+    tier + query_terms.saturating_sub(matched_terms)
+}
+
+fn category_for_field(field: &str) -> &'static str {
+    match field {
+        "title" | "path" => "partial_title_or_path",
+        "aliases" | "tags" | "headings" => "structured_metadata",
+        "body" => "body",
+        _ => "lexical",
+    }
+}
+
+fn matched_terms(normalized_value: &str, query: &SearchQuery) -> Vec<String> {
+    let mut terms = if normalized_value.contains(&query.normalized) {
+        query.terms.clone()
+    } else {
+        query
+            .terms
+            .iter()
+            .filter(|term| normalized_value.contains(term.as_str()))
+            .cloned()
+            .collect()
+    };
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn matched_term_count(normalized_value: &str, terms: &[String]) -> usize {
+    terms
+        .iter()
+        .filter(|term| normalized_value.contains(term.as_str()))
+        .count()
+}
+
+fn merge_terms(target: &mut Vec<String>, terms: Vec<String>) {
+    for term in terms {
+        if !target.contains(&term) {
+            target.push(term);
+        }
+    }
+    target.sort();
+}
+
+fn push_unique_field(fields: &mut Vec<&'static str>, field: &'static str) {
+    if !fields.contains(&field) {
+        fields.push(field);
+    }
+}
+
+fn best_matching_text<'a>(values: &'a [String], terms: &[String]) -> Option<&'a str> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let count = matched_term_count(&value.to_ascii_lowercase(), terms);
+            (count > 0).then_some((count, value.as_str()))
+        })
+        .max_by(|(left_count, left), (right_count, right)| {
+            left_count.cmp(right_count).then_with(|| right.cmp(left))
+        })
+        .map(|(_, value)| value)
+}
+
+fn best_matching_line<'a>(body: &'a str, terms: &[String]) -> Option<&'a str> {
+    body.lines()
+        .filter_map(|line| {
+            let count = matched_term_count(&line.to_ascii_lowercase(), terms);
+            (count > 0).then_some((count, line))
+        })
+        .max_by(|(left_count, left), (right_count, right)| {
+            left_count.cmp(right_count).then_with(|| right.cmp(left))
+        })
+        .map(|(_, line)| line)
 }
 
 fn matched_fields<const N: usize>(fields: [(&'static str, bool); N]) -> Vec<&'static str> {

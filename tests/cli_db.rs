@@ -1363,8 +1363,14 @@ fn cli_context_json_records_repeated_filters_and_budgets() {
             }),
         Some(vec!["Person", "Topic"])
     );
-    assert_eq!(request.get("max_nodes").and_then(json::JsonValue::as_i64), Some(2));
-    assert_eq!(request.get("max_edges").and_then(json::JsonValue::as_i64), Some(1));
+    assert_eq!(
+        request.get("max_nodes").and_then(json::JsonValue::as_i64),
+        Some(2)
+    );
+    assert_eq!(
+        request.get("max_edges").and_then(json::JsonValue::as_i64),
+        Some(1)
+    );
     assert_eq!(
         parsed
             .get("nodes")
