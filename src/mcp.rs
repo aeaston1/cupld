@@ -352,6 +352,13 @@ fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
     }
     let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
     let tags = arg_strings(args.get("tags"));
+    let retrieval_mode = match SearchRetrievalMode::from_args(args) {
+        Ok(mode) => mode,
+        Err(error) => return error_payload("validation_error", &error),
+    };
+    if retrieval_mode.is_semantic() {
+        return SemanticSearchBackend::unconfigured().search(retrieval_mode, query, limit);
+    }
     let search_query = SearchQuery::new(query);
     match load_search_docs(config, query, &tags) {
         Ok((docs, structural_index, index_used)) => search_payload(
@@ -381,12 +388,13 @@ pub fn memory_search_payload_for_db(
         root_override: None,
         read_only: true,
     };
-    let (docs, index_used) = load_search_docs(&config, query, tags)?;
+    let (docs, structural_index, index_used) = load_search_docs(&config, query, tags)?;
     Ok(search_payload(
         query,
-        score_search_docs(docs, &search_query, tags),
+        score_search_docs(docs, &search_query, tags, &structural_index),
         limit.min(MAX_LIMIT),
         index_used,
+        structural_index.has_filesystem_graph_data(),
     ))
 }
 
@@ -459,6 +467,108 @@ fn search_payload(
         ),
         ("truncated", truncated.into()),
         ("provenance", provenance()),
+    ])
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchRetrievalMode {
+    Lexical,
+    Semantic,
+    Vector,
+}
+
+impl SearchRetrievalMode {
+    fn from_args(args: &JsonValue) -> Result<Self, String> {
+        let Some(value) = args
+            .get("retrieval_mode")
+            .or_else(|| args.get("mode"))
+            .or_else(|| args.get("retrieval"))
+        else {
+            return Ok(Self::Lexical);
+        };
+        let Some(mode) = value.as_str() else {
+            return Err("expected retrieval_mode to be lexical, semantic, or vector".to_owned());
+        };
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "" | "lexical" => Ok(Self::Lexical),
+            "semantic" => Ok(Self::Semantic),
+            "vector" => Ok(Self::Vector),
+            _ => Err("expected retrieval_mode to be lexical, semantic, or vector".to_owned()),
+        }
+    }
+
+    fn is_semantic(self) -> bool {
+        matches!(self, Self::Semantic | Self::Vector)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Vector => "vector",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SemanticSearchBackend {
+    Unconfigured,
+}
+
+impl SemanticSearchBackend {
+    fn unconfigured() -> Self {
+        Self::Unconfigured
+    }
+
+    fn search(self, mode: SearchRetrievalMode, query: &str, _limit: usize) -> JsonValue {
+        match self {
+            Self::Unconfigured => semantic_unconfigured_payload(mode, query),
+        }
+    }
+}
+
+fn semantic_unconfigured_payload(mode: SearchRetrievalMode, query: &str) -> JsonValue {
+    JsonValue::object([
+        ("ok", false.into()),
+        ("query", JsonValue::from(query.to_owned())),
+        (
+            "retrieval",
+            JsonValue::object([
+                ("mode", JsonValue::from(mode.as_str())),
+                ("deterministic", true.into()),
+                ("semantic", true.into()),
+                ("index_used", false.into()),
+                ("backend", JsonValue::from("unconfigured")),
+                ("network_used", false.into()),
+                (
+                    "ranking_policy",
+                    JsonValue::from(
+                        "semantic retrieval is opt-in and requires precomputed local vector data",
+                    ),
+                ),
+                (
+                    "score_policy",
+                    JsonValue::from(
+                        "semantic_score and blended_score are unavailable until a local semantic backend is configured",
+                    ),
+                ),
+            ]),
+        ),
+        ("items", JsonValue::array([])),
+        ("truncated", false.into()),
+        ("provenance", provenance()),
+        (
+            "error",
+            JsonValue::object([
+                ("code", JsonValue::from("unconfigured")),
+                (
+                    "message",
+                    JsonValue::from(
+                        "semantic memory_search requires an explicitly configured local vector backend",
+                    ),
+                ),
+            ]),
+        ),
     ])
 }
 
@@ -787,6 +897,12 @@ impl MemoryDoc {
             "score".to_owned(),
             JsonValue::from(search_match.score as usize),
         ));
+        fields.push((
+            "lexical_score".to_owned(),
+            JsonValue::from(search_match.score as usize),
+        ));
+        fields.push(("semantic_score".to_owned(), JsonValue::Null));
+        fields.push(("blended_score".to_owned(), JsonValue::Null));
         fields.push((
             "matched_fields".to_owned(),
             JsonValue::array(

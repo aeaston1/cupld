@@ -132,6 +132,12 @@ fn memory_search_exposes_retrieval_contract_metadata() {
     assert_eq!(first.get("rank").and_then(JsonValue::as_i64), Some(1));
     assert_eq!(first.get("score").and_then(JsonValue::as_i64), Some(100));
     assert_eq!(
+        first.get("lexical_score").and_then(JsonValue::as_i64),
+        Some(100)
+    );
+    assert!(matches!(first.get("semantic_score"), Some(JsonValue::Null)));
+    assert!(matches!(first.get("blended_score"), Some(JsonValue::Null)));
+    assert_eq!(
         first.get("matched_category").and_then(JsonValue::as_str),
         Some("partial_title_or_path")
     );
@@ -152,6 +158,91 @@ fn memory_search_exposes_retrieval_contract_metadata() {
     assert!(json_text(second).contains(r#""truncated":true"#));
     assert!(json_text(second).contains(r#""max_chars":500"#));
     assert!(json_text(second).contains(r#""source":"body""#));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_defaults_to_lexical_when_retrieval_mode_is_omitted() {
+    let db = TestDb::new("mcp_search_default_lexical_mode");
+    let root = temp_dir("mcp_search_default_lexical_mode");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Needle\n\nDefault retrieval").unwrap();
+    sync_root(db.path(), &root);
+
+    let response = call(
+        &config(db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"Needle"}"#,
+    );
+    let payload = tool_payload(&response);
+
+    assert_eq!(payload.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        payload
+            .get("retrieval")
+            .and_then(|retrieval| retrieval.get("mode"))
+            .and_then(JsonValue::as_str),
+        Some("lexical")
+    );
+    assert_eq!(result_paths(&payload), vec!["note.md"]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_semantic_opt_in_returns_stable_unconfigured_boundary() {
+    let db = TestDb::new("mcp_search_semantic_unconfigured");
+    let root = temp_dir("mcp_search_semantic_unconfigured");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Needle\n\nNo semantic fallback").unwrap();
+    sync_root(db.path(), &root);
+
+    let response = call(
+        &config(db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"Needle","retrieval_mode":"semantic"}"#,
+    );
+    let payload = tool_payload(&response);
+    let text = json_text(&payload);
+
+    assert_eq!(payload.get("ok").and_then(JsonValue::as_bool), Some(false));
+    assert!(text.contains(r#""code":"unconfigured""#), "{text}");
+    assert!(text.contains(r#""mode":"semantic""#), "{text}");
+    assert!(text.contains(r#""semantic":true"#), "{text}");
+    assert!(text.contains(r#""backend":"unconfigured""#), "{text}");
+    assert!(text.contains(r#""network_used":false"#), "{text}");
+    assert_eq!(
+        payload
+            .get("items")
+            .and_then(JsonValue::as_array)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(!text.contains("note.md"), "{text}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_rejects_unknown_retrieval_mode() {
+    let db = TestDb::new("mcp_search_unknown_retrieval_mode");
+    let root = temp_dir("mcp_search_unknown_retrieval_mode");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Needle\n\nBody").unwrap();
+    sync_root(db.path(), &root);
+
+    let response = call(
+        &config(db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"Needle","retrieval_mode":"remote"}"#,
+    );
+    let text = tool_text(&response);
+
+    assert!(text.contains(r#""code":"validation_error""#), "{text}");
+    assert!(text.contains("expected retrieval_mode"), "{text}");
+    assert!(!text.contains("note.md"), "{text}");
 
     fs::remove_dir_all(root).unwrap();
 }
