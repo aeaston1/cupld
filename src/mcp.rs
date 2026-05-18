@@ -362,6 +362,31 @@ fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
     }
 }
 
+pub fn memory_search_payload_for_db(
+    db_path: PathBuf,
+    query: &str,
+    tags: &[String],
+    limit: usize,
+) -> Result<JsonValue, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("expected non-empty query".to_owned());
+    }
+    let search_query = SearchQuery::new(query);
+    let config = McpConfig {
+        db_path,
+        root_override: None,
+        read_only: true,
+    };
+    let (docs, index_used) = load_search_docs(&config, query, tags)?;
+    Ok(search_payload(
+        query,
+        score_search_docs(docs, &search_query, tags),
+        limit.min(MAX_LIMIT),
+        index_used,
+    ))
+}
+
 fn list_payload(docs: Vec<MemoryDoc>, limit: usize) -> JsonValue {
     let truncated = docs.len() > limit;
     JsonValue::object([

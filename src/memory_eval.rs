@@ -10,6 +10,7 @@ use crate::{
     CupldEngine, Edge, Node, PropertyMap, RuntimeValue, Session, Value,
     context::{ContextDirection, ContextRequest, context_as_json, context_as_ndjson},
     json::{self, JsonValue},
+    mcp::memory_search_payload_for_db,
     sync_markdown_root,
 };
 
@@ -89,6 +90,7 @@ struct CaseSpec {
     setup: Vec<String>,
     assertions: Vec<AssertionSpec>,
     snapshot_path: PathBuf,
+    synthetic_markdown: Option<SyntheticMarkdownSpec>,
 }
 
 struct AssertionSpec {
@@ -97,6 +99,22 @@ struct AssertionSpec {
     expected: JsonValue,
     snapshot_key: String,
     options: BTreeMap<String, JsonValue>,
+}
+
+struct SyntheticMarkdownSpec {
+    count: usize,
+    directory: String,
+    title_prefix: String,
+    tag: String,
+    body_template: String,
+    special_docs: Vec<SyntheticMarkdownDoc>,
+}
+
+struct SyntheticMarkdownDoc {
+    path: String,
+    title: String,
+    tags: Vec<String>,
+    body: String,
 }
 
 pub fn run(config: MemoryEvalConfig) -> Result<MemoryEvalReport, String> {
@@ -306,6 +324,7 @@ fn parse_case_spec(value: &JsonValue, fixture_path: &Path) -> Result<CaseSpec, S
         setup,
         assertions,
         snapshot_path,
+        synthetic_markdown: parse_synthetic_markdown_spec(value)?,
     })
 }
 
@@ -380,6 +399,96 @@ fn parse_assertion_spec(
     })
 }
 
+fn parse_synthetic_markdown_spec(
+    value: &JsonValue,
+) -> Result<Option<SyntheticMarkdownSpec>, String> {
+    let Some(spec) = value.get("synthetic_markdown") else {
+        return Ok(None);
+    };
+    let count = spec
+        .get("count")
+        .and_then(JsonValue::as_i64)
+        .filter(|count| *count >= 0)
+        .ok_or_else(|| "`synthetic_markdown.count` must be a non-negative integer".to_owned())?
+        as usize;
+    let directory = spec
+        .get("directory")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("synthetic")
+        .to_owned();
+    let title_prefix = spec
+        .get("title_prefix")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("Synthetic Memory")
+        .to_owned();
+    let tag = spec
+        .get("tag")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("synthetic")
+        .to_owned();
+    let body_template = spec
+        .get("body_template")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("Synthetic memory {index} covers ordinary retrieval filler.")
+        .to_owned();
+    let special_docs = spec
+        .get("special_docs")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .map(parse_synthetic_markdown_doc)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(SyntheticMarkdownSpec {
+        count,
+        directory,
+        title_prefix,
+        tag,
+        body_template,
+        special_docs,
+    }))
+}
+
+fn parse_synthetic_markdown_doc(value: &JsonValue) -> Result<SyntheticMarkdownDoc, String> {
+    Ok(SyntheticMarkdownDoc {
+        path: required_string(value, "path")?,
+        title: required_string(value, "title")?,
+        tags: optional_json_string_array(value, "tags")?,
+        body: required_string(value, "body")?,
+    })
+}
+
+fn write_synthetic_markdown(
+    root: &Path,
+    spec: &SyntheticMarkdownSpec,
+) -> Result<(), std::io::Error> {
+    let directory = root.join(&spec.directory);
+    fs::create_dir_all(&directory)?;
+    for index in 0..spec.count {
+        let path = directory.join(format!("doc-{index:04}.md"));
+        let body = spec.body_template.replace("{index}", &index.to_string());
+        let content = format!(
+            "---\ntitle: {} {index:04}\ntags: [{}, filler]\n---\n# {} {index:04}\n\n{}\n",
+            spec.title_prefix, spec.tag, spec.title_prefix, body
+        );
+        fs::write(path, content)?;
+    }
+    for doc in &spec.special_docs {
+        let path = root.join(&doc.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = format!(
+            "---\ntitle: {}\ntags: [{}]\n---\n# {}\n\n{}\n",
+            doc.title,
+            doc.tags.join(", "),
+            doc.title,
+            doc.body
+        );
+        fs::write(path, content)?;
+    }
+    Ok(())
+}
+
 fn run_case(
     fixture: &Fixture,
     case: &CaseSpec,
@@ -392,6 +501,29 @@ fn run_case(
     let vault_before = fixture.path.join("vault-before");
     let vault_after = fixture.path.join("vault-after");
     let mut warnings = Vec::new();
+
+    let staged_markdown_root = if case.synthetic_markdown.is_some() {
+        let generated_root = sandbox.path.join("generated-markdown");
+        if markdown_root.exists() {
+            copy_dir_all(&markdown_root, &generated_root).map_err(|error| {
+                format!(
+                    "failed to stage markdown for fixture `{}` case `{}`: {error}",
+                    fixture.name, case.name
+                )
+            })?;
+        }
+        if let Some(spec) = &case.synthetic_markdown {
+            write_synthetic_markdown(&generated_root, spec).map_err(|error| {
+                format!(
+                    "failed to generate synthetic markdown for fixture `{}` case `{}`: {error}",
+                    fixture.name, case.name
+                )
+            })?;
+        }
+        Some(generated_root)
+    } else {
+        None
+    };
 
     if vault_before.exists() && vault_after.exists() {
         let transition_root = sandbox.path.join("vault");
@@ -415,6 +547,8 @@ fn run_case(
             )
         })?;
         sync_fixture_markdown_root(&mut engine, &transition_root, &fixture.name, &case.name)?;
+    } else if let Some(markdown_root) = staged_markdown_root.as_deref() {
+        sync_fixture_markdown_root(&mut engine, markdown_root, &fixture.name, &case.name)?;
     } else if markdown_root.exists() {
         sync_fixture_markdown_root(&mut engine, &markdown_root, &fixture.name, &case.name)?;
     } else {
@@ -550,6 +684,9 @@ fn run_assertion(
     if assertion.assertion_type == "context_export" {
         return run_context_export_assertion(session, db_path, fixture, case, assertion);
     }
+    if assertion.assertion_type == "memory_search" {
+        return run_memory_search_assertion(db_path, fixture, case, assertion);
+    }
 
     let results = session
         .execute_script(&assertion.query, &BTreeMap::<String, Value>::new())
@@ -573,6 +710,40 @@ fn run_assertion(
         actual,
         status,
         diff,
+    })
+}
+
+fn run_memory_search_assertion(
+    db_path: &Path,
+    fixture: &str,
+    case: &str,
+    assertion: &AssertionSpec,
+) -> Result<MemoryEvalAssertionReport, String> {
+    let tags = assertion_option_string_array(assertion, "tags")?.unwrap_or_default();
+    let limit = assertion_option_u64(assertion, "limit")?.unwrap_or(10) as usize;
+    let payload =
+        memory_search_payload_for_db(db_path.to_path_buf(), &assertion.query, &tags, limit)
+            .map_err(|error| {
+                format!(
+                    "failed memory_search assertion for fixture `{fixture}` case `{case}`: {error}"
+                )
+            })?;
+    let actual = normalized_memory_search_payload(&payload);
+    let status = if actual == assertion.expected {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+
+    Ok(MemoryEvalAssertionReport {
+        fixture: fixture.to_owned(),
+        case: case.to_owned(),
+        assertion: assertion.snapshot_key.clone(),
+        assertion_type: assertion.assertion_type.clone(),
+        expected: assertion.expected.clone(),
+        actual: actual.clone(),
+        status,
+        diff: (status == EvalStatus::Fail).then(|| concise_diff(&assertion.expected, &actual)),
     })
 }
 
@@ -1460,6 +1631,157 @@ fn normalized_context_node(node: &JsonValue) -> JsonValue {
             "src_status",
             properties
                 .get("src.status")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+    ])
+}
+
+fn normalized_memory_search_payload(payload: &JsonValue) -> JsonValue {
+    JsonValue::object([
+        ("ok", payload.get("ok").cloned().unwrap_or(JsonValue::Null)),
+        (
+            "query",
+            payload.get("query").cloned().unwrap_or(JsonValue::Null),
+        ),
+        (
+            "retrieval",
+            payload
+                .get("retrieval")
+                .map(normalized_memory_search_retrieval)
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "items",
+            JsonValue::array(
+                payload
+                    .get("items")
+                    .and_then(JsonValue::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(normalized_memory_search_item),
+            ),
+        ),
+        (
+            "truncated",
+            payload.get("truncated").cloned().unwrap_or(JsonValue::Null),
+        ),
+        (
+            "provenance",
+            payload
+                .get("provenance")
+                .map(normalized_memory_search_provenance)
+                .unwrap_or(JsonValue::Null),
+        ),
+    ])
+}
+
+fn normalized_memory_search_retrieval(retrieval: &JsonValue) -> JsonValue {
+    JsonValue::object([
+        (
+            "mode",
+            retrieval.get("mode").cloned().unwrap_or(JsonValue::Null),
+        ),
+        (
+            "deterministic",
+            retrieval
+                .get("deterministic")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "semantic",
+            retrieval
+                .get("semantic")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "index_used",
+            retrieval
+                .get("index_used")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+    ])
+}
+
+fn normalized_memory_search_provenance(provenance: &JsonValue) -> JsonValue {
+    JsonValue::object([
+        (
+            "source",
+            provenance.get("source").cloned().unwrap_or(JsonValue::Null),
+        ),
+        (
+            "network_used",
+            provenance
+                .get("network_used")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+    ])
+}
+
+fn normalized_memory_search_item(item: &JsonValue) -> JsonValue {
+    JsonValue::object([
+        ("rank", normalized_json_integer(item, "rank")),
+        ("path", item.get("path").cloned().unwrap_or(JsonValue::Null)),
+        (
+            "title",
+            item.get("title").cloned().unwrap_or(JsonValue::Null),
+        ),
+        ("tags", item.get("tags").cloned().unwrap_or(JsonValue::Null)),
+        (
+            "snippet",
+            item.get("snippet").cloned().unwrap_or(JsonValue::Null),
+        ),
+        ("score", normalized_json_integer(item, "score")),
+        (
+            "matched_fields",
+            item.get("matched_fields")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "matched_category",
+            item.get("matched_category")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "snippet_metadata",
+            item.get("snippet_metadata")
+                .map(normalized_memory_search_snippet_metadata)
+                .unwrap_or(JsonValue::Null),
+        ),
+    ])
+}
+
+fn normalized_json_integer(value: &JsonValue, key: &str) -> JsonValue {
+    value
+        .get(key)
+        .and_then(JsonValue::as_i64)
+        .map(JsonValue::from)
+        .unwrap_or(JsonValue::Null)
+}
+
+fn normalized_memory_search_snippet_metadata(metadata: &JsonValue) -> JsonValue {
+    JsonValue::object([
+        (
+            "source",
+            metadata.get("source").cloned().unwrap_or(JsonValue::Null),
+        ),
+        (
+            "truncated",
+            metadata
+                .get("truncated")
+                .cloned()
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "empty_body_fallback",
+            metadata
+                .get("empty_body_fallback")
                 .cloned()
                 .unwrap_or(JsonValue::Null),
         ),

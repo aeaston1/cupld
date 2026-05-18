@@ -1,0 +1,173 @@
+{
+  "large-vault-top-results": {
+    "ok": true,
+    "query": "Large Vault Needle",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "target/exact.md",
+        "title": "Large Vault Needle",
+        "tags": ["bulk", "target"],
+        "snippet": "# Large Vault Needle\n\nLarge vault retrieval should rank this exact title first.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "exact_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "target/body.md",
+        "title": "Large Vault Body",
+        "tags": ["bulk", "target"],
+        "snippet": "# Large Vault Body\n\nThe volume needle appears in this body line after many candidates.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "target/tie-a.md",
+        "title": "Large Tie A",
+        "tags": ["bulk", "target"],
+        "snippet": "# Large Tie A\n\nlarge deterministic tie marker\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": true,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "large-vault-candidate-volume": {
+    "ok": true,
+    "query": "volume needle",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "target/exact.md",
+        "title": "Large Vault Needle",
+        "tags": ["bulk", "target"],
+        "snippet": "# Large Vault Needle\n\nLarge vault retrieval should rank this exact title first.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "target/body.md",
+        "title": "Large Vault Body",
+        "tags": ["bulk", "target"],
+        "snippet": "The volume needle appears in this body line after many candidates.",
+        "score": null,
+        "matched_fields": ["body"],
+        "matched_category": "body",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": false,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  },
+  "large-vault-tie-breaking": {
+    "ok": true,
+    "query": "large deterministic tie",
+    "retrieval": {
+      "mode": "lexical",
+      "deterministic": true,
+      "semantic": false,
+      "index_used": false
+    },
+    "items": [
+      {
+        "rank": null,
+        "path": "target/tie-a.md",
+        "title": "Large Tie A",
+        "tags": ["bulk", "target"],
+        "snippet": "# Large Tie A\n\nlarge deterministic tie marker\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "target/tie-b.md",
+        "title": "Large Tie B",
+        "tags": ["bulk", "target"],
+        "snippet": "# Large Tie B\n\nlarge deterministic tie marker\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      },
+      {
+        "rank": null,
+        "path": "target/body.md",
+        "title": "Large Vault Body",
+        "tags": ["bulk", "target"],
+        "snippet": "# Large Vault Body\n\nThe volume needle appears in this body line after many candidates.\n",
+        "score": null,
+        "matched_fields": ["title"],
+        "matched_category": "partial_title_or_path",
+        "snippet_metadata": {
+          "source": "body",
+          "truncated": false,
+          "empty_body_fallback": false
+        }
+      }
+    ],
+    "truncated": true,
+    "provenance": {
+      "source": "cupld_db",
+      "network_used": false
+    }
+  }
+}

@@ -197,6 +197,15 @@ The CI memory eval command uses `tests/fixtures/memory` by default, does not upd
 cargo run --locked -- eval memory --update-snapshots
 ```
 
+Search relevance evals are included in the default CI suite. To run only the local deterministic `memory_search` subset, use:
+
+```bash
+cargo run --locked -- eval memory --case search_relevance --output table
+cargo run --locked -- eval memory --case search_large_vault --output table
+```
+
+The large-vault fixture generates 1,000 synthetic Markdown documents inside the eval sandbox, plus targeted search documents. On the development workspace used for this change, both search fixtures completed in under 2 seconds total, below the 30 second added-runtime budget.
+
 ## Documentation
 
 - Docs index: [`docs/README.md`](./docs/README.md)

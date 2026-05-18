@@ -1,0 +1,73 @@
+{
+  "cases": [
+    {
+      "name": "lexical-search-contract",
+      "assertions": [
+        {
+          "name": "title-path-match",
+          "type": "memory_search",
+          "query": "Project Atlas",
+          "limit": 5,
+          "expected": []
+        },
+        {
+          "name": "alias-match",
+          "type": "memory_search",
+          "query": "Atlas Memory",
+          "limit": 5,
+          "expected": []
+        },
+        {
+          "name": "tag-match",
+          "type": "memory_search",
+          "query": "atlas",
+          "limit": 5,
+          "expected": []
+        },
+        {
+          "name": "heading-match",
+          "type": "memory_search",
+          "query": "retrieval",
+          "limit": 10,
+          "expected": []
+        },
+        {
+          "name": "body-match",
+          "type": "memory_search",
+          "query": "calibrated signal",
+          "limit": 5,
+          "expected": []
+        },
+        {
+          "name": "multi-term-query",
+          "type": "memory_search",
+          "query": "atlas retrieval",
+          "limit": 5,
+          "expected": []
+        },
+        {
+          "name": "tag-filtering",
+          "type": "memory_search",
+          "query": "atlas",
+          "tags": ["keep"],
+          "limit": 5,
+          "expected": []
+        },
+        {
+          "name": "no-match",
+          "type": "memory_search",
+          "query": "unfindable",
+          "limit": 5,
+          "expected": []
+        },
+        {
+          "name": "tie-breaking",
+          "type": "memory_search",
+          "query": "stable tie",
+          "limit": 5,
+          "expected": []
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "cases": [
+    {
+      "name": "synthetic-large-vault-search",
+      "synthetic_markdown": {
+        "count": 1000,
+        "directory": "synthetic",
+        "title_prefix": "Synthetic Memory",
+        "tag": "bulk",
+        "body_template": "Synthetic filler document {index} contains ordinary archive text.",
+        "special_docs": [
+          {
+            "path": "target/exact.md",
+            "title": "Large Vault Needle",
+            "tags": ["bulk", "target"],
+            "body": "Large vault retrieval should rank this exact title first."
+          },
+          {
+            "path": "target/body.md",
+            "title": "Large Vault Body",
+            "tags": ["bulk", "target"],
+            "body": "The volume needle appears in this body line after many candidates."
+          },
+          {
+            "path": "target/tie-a.md",
+            "title": "Large Tie A",
+            "tags": ["bulk", "target"],
+            "body": "large deterministic tie marker"
+          },
+          {
+            "path": "target/tie-b.md",
+            "title": "Large Tie B",
+            "tags": ["bulk", "target"],
+            "body": "large deterministic tie marker"
+          }
+        ]
+      },
+      "assertions": [
+        {
+          "name": "large-vault-top-results",
+          "type": "memory_search",
+          "query": "Large Vault Needle",
+          "limit": 3,
+          "expected": []
+        },
+        {
+          "name": "large-vault-candidate-volume",
+          "type": "memory_search",
+          "query": "volume needle",
+          "tags": ["target"],
+          "limit": 3,
+          "expected": []
+        },
+        {
+          "name": "large-vault-tie-breaking",
+          "type": "memory_search",
+          "query": "large deterministic tie",
+          "tags": ["target"],
+          "limit": 3,
+          "expected": []
+        }
+      ]
+    }
+  ]
+}
