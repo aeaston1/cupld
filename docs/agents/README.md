@@ -71,12 +71,18 @@ cupld context --db default --node 42 --depth 1 --output table
 cupld context --db default --path notes/example.md --depth 2 --max-nodes 25 --output table
 ```
 
+Context traversal is bounded by explicit seeds. `--depth` controls hop depth, `--direction` accepts `in`, `out`, or `both`, repeated `--edge-type` values restrict traversed edge types, repeated `--label` values restrict non-seed reachable nodes, and `--max-nodes`/`--max-edges` bound returned traversal size. Table output columns are `row`, `depth`, `id`, `labels/type`, `display`, `source`, and `target`; use it for reading, not automation.
+
 For automation, prefer JSON or NDJSON. Those are the canonical contracts for seeded context:
 
 ```bash
 cupld context --db default --node 42 --depth 1 --output json
 cupld context --db default --path notes/example.md --depth 2 --output ndjson
 ```
+
+JSON output contains top-level `ok`, `command`, `mode`, `policy`, `retrieval_usage`, `provenance`, `request`, `seeds`, `nodes`, `edges`, and `warnings`. `request` records `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`; each seed has `kind`, `value`, and `node_ids`; each node has `node_id`, `depth`, `labels`, `properties`, optional `name`/`title`/`display`, and `evidence`; each edge has `edge_id`, `type`, `source_node_id`, `target_node_id`, `direction_from_seed`, `depth`, compatibility aliases `from_node_id`/`to_node_id`/`edge_type`, `properties`, and `evidence`; each warning has `code` and `message`.
+
+NDJSON output writes one `context_meta` line, then all `context_seed` lines in request order, then deterministic `context_node` lines, then deterministic `context_edge` lines. `context_meta` carries `ok`, `command`, `policy`, `retrieval_usage`, `provenance`, and `warnings`; seed/node/edge lines carry `seed`, `node_index` plus `node`, or `edge_index` plus `edge`.
 
 The hard cutover from legacy global top-k context is complete. `cupld context --top-k ...` is rejected with `context_legacy_top_k_removed`, and `cupld context` without `--node` or `--path` is rejected with `context_seed_required`.
 

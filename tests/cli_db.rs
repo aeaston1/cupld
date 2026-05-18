@@ -1290,6 +1290,107 @@ fn cli_context_json_respects_one_hop_direction() {
 }
 
 #[test]
+fn cli_context_json_records_repeated_filters_and_budgets() {
+    let db = TestDb::new("cli_context_json_filters_budgets");
+    let mut session = db.open();
+    run(&mut session, "CREATE EDGE TYPE KNOWS");
+    run(&mut session, "CREATE EDGE TYPE MENTIONS");
+    run(
+        &mut session,
+        "CREATE
+          (ada:Person {name: 'Ada'})
+          -[:KNOWS]->
+          (grace:Person {name: 'Grace'})",
+    );
+    run(
+        &mut session,
+        "MATCH (ada:Person {name: 'Ada'})
+         CREATE (ada)-[:MENTIONS]->(:Topic {name: 'Compiler'})",
+    );
+    drop(session);
+
+    let output = run_cli(&[
+        "context",
+        "--db",
+        db.path().to_str().unwrap(),
+        "--output",
+        "json",
+        "--node",
+        "1",
+        "--depth",
+        "1",
+        "--direction",
+        "out",
+        "--edge-type",
+        "KNOWS",
+        "--edge-type",
+        "MENTIONS",
+        "--label",
+        "Person",
+        "--label",
+        "Topic",
+        "--max-nodes",
+        "2",
+        "--max-edges",
+        "1",
+    ]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed = json::parse(stdout.trim()).unwrap();
+    let request = parsed.get("request").unwrap();
+    assert_eq!(
+        request
+            .get("edge_types")
+            .and_then(json::JsonValue::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            }),
+        Some(vec!["KNOWS", "MENTIONS"])
+    );
+    assert_eq!(
+        request
+            .get("labels")
+            .and_then(json::JsonValue::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            }),
+        Some(vec!["Person", "Topic"])
+    );
+    assert_eq!(request.get("max_nodes").and_then(json::JsonValue::as_i64), Some(2));
+    assert_eq!(request.get("max_edges").and_then(json::JsonValue::as_i64), Some(1));
+    assert_eq!(
+        parsed
+            .get("nodes")
+            .and_then(json::JsonValue::as_array)
+            .map(|values| values.len()),
+        Some(2)
+    );
+    assert_eq!(
+        parsed
+            .get("edges")
+            .and_then(json::JsonValue::as_array)
+            .map(|values| values.len()),
+        Some(1)
+    );
+    assert_eq!(
+        parsed
+            .get("warnings")
+            .and_then(json::JsonValue::as_array)
+            .and_then(|warnings| warnings.first())
+            .and_then(|warning| warning.get("code"))
+            .and_then(json::JsonValue::as_str),
+        Some("context_budget_truncated")
+    );
+}
+
+#[test]
 fn cli_context_ndjson_outputs_one_hop_edge_evidence() {
     let db = TestDb::new("cli_context_ndjson_one_hop_evidence");
     let mut session = db.open();
