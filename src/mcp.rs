@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 use crate::json::{self, JsonValue};
 use crate::package::WorkspacePackage;
 use crate::runtime::{RuntimeValue, Session};
-use crate::source::{configured_markdown_root, sync_markdown_root};
+use crate::source::{
+    MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, configured_markdown_root, sync_markdown_root,
+};
 use crate::{MarkdownSyncReport, Value};
 
 const MAX_LIMIT: usize = 50;
@@ -352,11 +354,12 @@ fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
     let tags = arg_strings(args.get("tags"));
     let search_query = SearchQuery::new(query);
     match load_search_docs(config, query, &tags) {
-        Ok((docs, index_used)) => search_payload(
+        Ok((docs, structural_index, index_used)) => search_payload(
             query,
-            score_search_docs(docs, &search_query, &tags),
+            score_search_docs(docs, &search_query, &tags, &structural_index),
             limit,
             index_used,
+            structural_index.has_filesystem_graph_data(),
         ),
         Err(error) => error_payload("db_query_failed", &error),
     }
@@ -384,6 +387,7 @@ fn search_payload(
     docs: Vec<(SearchMatch, MemoryDoc)>,
     limit: usize,
     index_used: bool,
+    structural_signal_available: bool,
 ) -> JsonValue {
     let truncated = docs.len() > limit;
     JsonValue::object([
@@ -399,13 +403,23 @@ fn search_payload(
                 (
                     "ranking_policy",
                     JsonValue::from(
-                        "ascending deterministic lexical score, then ascending path for ties",
+                        "ascending deterministic lexical score, weak filesystem structural signal for lexical ties, then ascending path",
                     ),
                 ),
                 (
                     "score_policy",
                     JsonValue::from(
                         "lower score is more relevant: exact title/path, partial title/path, alias/tag/heading, body, with multi-term coverage bonuses inside each tier",
+                    ),
+                ),
+                (
+                    "structural_signal_available",
+                    structural_signal_available.into(),
+                ),
+                (
+                    "structural_signal_policy",
+                    JsonValue::from(
+                        "opt-in filesystem graph edges can provide a weak deterministic tie-break signal; lexical score remains primary",
                     ),
                 ),
             ]),
@@ -550,16 +564,23 @@ fn load_search_docs(
     config: &McpConfig,
     query: &str,
     tags: &[String],
-) -> Result<(Vec<MemoryDoc>, bool), String> {
+) -> Result<(Vec<MemoryDoc>, StructuralIndex, bool), String> {
     let mut session = open_session(config)?;
     let indexes = markdown_search_indexes(&session);
+    let structural_index = load_structural_index(&mut session)?;
     if tags.is_empty() && indexes.body_fulltext {
-        return load_indexed_body_candidates(&mut session, query);
+        let (docs, index_used) = load_indexed_body_candidates(&mut session, query)?;
+        return Ok((docs, structural_index, index_used));
     }
     if !tags.is_empty() && indexes.tags_list {
-        return load_indexed_tag_candidates(&mut session, tags);
+        let (docs, index_used) = load_indexed_tag_candidates(&mut session, tags)?;
+        return Ok((docs, structural_index, index_used));
     }
-    Ok((load_docs_from_session(&mut session)?, false))
+    Ok((
+        load_docs_from_session(&mut session)?,
+        structural_index,
+        false,
+    ))
 }
 
 fn load_docs_from_session(session: &mut Session) -> Result<Vec<MemoryDoc>, String> {
@@ -665,6 +686,7 @@ fn score_search_docs(
     docs: Vec<MemoryDoc>,
     search_query: &SearchQuery,
     tags: &[String],
+    structural_index: &StructuralIndex,
 ) -> Vec<(SearchMatch, MemoryDoc)> {
     let mut scored = filter_tags(docs, tags)
         .into_iter()
@@ -673,10 +695,17 @@ fn score_search_docs(
                 .map(|search_match| (search_match, doc))
         })
         .collect::<Vec<_>>();
+    structural_index.apply(&mut scored);
     scored.sort_by(|(left_match, left), (right_match, right)| {
         left_match
             .score
             .cmp(&right_match.score)
+            .then_with(|| {
+                right_match
+                    .structural_signal
+                    .score
+                    .cmp(&left_match.structural_signal.score)
+            })
             .then_with(|| left.path.cmp(&right.path))
     });
     scored
@@ -745,6 +774,10 @@ impl MemoryDoc {
         fields.push((
             "matched_category".to_owned(),
             JsonValue::from(search_match.category),
+        ));
+        fields.push((
+            "structural_signal".to_owned(),
+            search_match.structural_signal.to_json(),
         ));
         fields.push((
             "snippet_metadata".to_owned(),
@@ -860,6 +893,7 @@ struct SearchMatch {
     category: &'static str,
     fields: Vec<&'static str>,
     terms: Vec<String>,
+    structural_signal: StructuralSignal,
 }
 
 impl SearchMatch {
@@ -874,8 +908,209 @@ impl SearchMatch {
             category,
             fields,
             terms,
+            structural_signal: StructuralSignal::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StructuralSignal {
+    score: usize,
+    evidence: Vec<StructuralEvidence>,
+}
+
+impl StructuralSignal {
+    fn to_json(&self) -> JsonValue {
+        JsonValue::object([
+            ("score", JsonValue::from(self.score)),
+            (
+                "evidence",
+                JsonValue::array(self.evidence.iter().map(StructuralEvidence::to_json)),
+            ),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StructuralEvidence {
+    kind: &'static str,
+    via: String,
+    edge_types: Vec<&'static str>,
+    edge_weight: usize,
+}
+
+impl Ord for StructuralEvidence {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.kind
+            .cmp(other.kind)
+            .then_with(|| self.via.cmp(&other.via))
+            .then_with(|| self.edge_types.cmp(&other.edge_types))
+    }
+}
+
+impl PartialOrd for StructuralEvidence {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl StructuralEvidence {
+    fn to_json(&self) -> JsonValue {
+        JsonValue::object([
+            ("kind", JsonValue::from(self.kind)),
+            ("via", JsonValue::from(self.via.clone())),
+            (
+                "edge_types",
+                JsonValue::array(
+                    self.edge_types
+                        .iter()
+                        .map(|edge_type| JsonValue::from(*edge_type)),
+                ),
+            ),
+            ("edge_weight", JsonValue::from(self.edge_weight)),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct StructuralIndex {
+    doc_directories: BTreeMap<i64, Vec<DirectoryEdge>>,
+    directory_parents: BTreeMap<String, Vec<DirectoryEdge>>,
+}
+
+impl StructuralIndex {
+    fn has_filesystem_graph_data(&self) -> bool {
+        !self.doc_directories.is_empty() || !self.directory_parents.is_empty()
+    }
+
+    fn apply(&self, scored: &mut [(SearchMatch, MemoryDoc)]) {
+        if !self.has_filesystem_graph_data() || scored.len() < 2 {
+            return;
+        }
+        let Some(best_score) = scored
+            .iter()
+            .map(|(search_match, _)| search_match.score)
+            .min()
+        else {
+            return;
+        };
+        let anchor_ids = scored
+            .iter()
+            .filter_map(|(search_match, doc)| (search_match.score == best_score).then_some(doc.id))
+            .collect::<BTreeSet<_>>();
+        for (search_match, doc) in scored.iter_mut() {
+            search_match.structural_signal = self.signal_for(doc.id, &anchor_ids);
+        }
+    }
+
+    fn signal_for(&self, doc_id: i64, anchor_ids: &BTreeSet<i64>) -> StructuralSignal {
+        let mut evidence = BTreeSet::new();
+        let Some(doc_dirs) = self.doc_directories.get(&doc_id) else {
+            return StructuralSignal::default();
+        };
+        for anchor_id in anchor_ids {
+            if *anchor_id == doc_id {
+                continue;
+            }
+            let Some(anchor_dirs) = self.doc_directories.get(anchor_id) else {
+                continue;
+            };
+            for doc_dir in doc_dirs {
+                for anchor_dir in anchor_dirs {
+                    if doc_dir.path == anchor_dir.path {
+                        evidence.insert(StructuralEvidence {
+                            kind: "same_directory",
+                            via: doc_dir.path.clone(),
+                            edge_types: vec![MD_IN_DIRECTORY],
+                            edge_weight: doc_dir.edge_weight.min(anchor_dir.edge_weight),
+                        });
+                    }
+                    if self.has_parent(&doc_dir.path, &anchor_dir.path) {
+                        evidence.insert(StructuralEvidence {
+                            kind: "parent_child_directory",
+                            via: anchor_dir.path.clone(),
+                            edge_types: vec![MD_IN_DIRECTORY, MD_PARENT_DIRECTORY],
+                            edge_weight: doc_dir.edge_weight.min(anchor_dir.edge_weight),
+                        });
+                    }
+                    if self.has_parent(&anchor_dir.path, &doc_dir.path) {
+                        evidence.insert(StructuralEvidence {
+                            kind: "parent_child_directory",
+                            via: doc_dir.path.clone(),
+                            edge_types: vec![MD_IN_DIRECTORY, MD_PARENT_DIRECTORY],
+                            edge_weight: doc_dir.edge_weight.min(anchor_dir.edge_weight),
+                        });
+                    }
+                }
+            }
+        }
+        let evidence = evidence.into_iter().collect::<Vec<_>>();
+        StructuralSignal {
+            score: evidence.iter().map(|item| item.edge_weight).sum(),
+            evidence,
+        }
+    }
+
+    fn has_parent(&self, child: &str, parent: &str) -> bool {
+        self.directory_parents
+            .get(child)
+            .is_some_and(|parents| parents.iter().any(|edge| edge.path == parent))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirectoryEdge {
+    path: String,
+    edge_weight: usize,
+}
+
+fn load_structural_index(session: &mut Session) -> Result<StructuralIndex, String> {
+    let doc_rows = session
+        .execute_script(
+            "MATCH (d:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+             RETURN id(d), dir.`src.path`, e.`md.edge_weight`
+             ORDER BY id(d), dir.`src.path`",
+            &BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .remove(0)
+        .rows;
+    let mut doc_directories: BTreeMap<i64, Vec<DirectoryEdge>> = BTreeMap::new();
+    for row in doc_rows {
+        doc_directories
+            .entry(int_at(&row, 0))
+            .or_default()
+            .push(DirectoryEdge {
+                path: string_at(&row, 1),
+                edge_weight: edge_weight_at(&row, 2),
+            });
+    }
+
+    let parent_rows = session
+        .execute_script(
+            "MATCH (child:MarkdownDirectory)-[e:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+             RETURN child.`src.path`, parent.`src.path`, e.`md.edge_weight`
+             ORDER BY child.`src.path`, parent.`src.path`",
+            &BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .remove(0)
+        .rows;
+    let mut directory_parents: BTreeMap<String, Vec<DirectoryEdge>> = BTreeMap::new();
+    for row in parent_rows {
+        directory_parents
+            .entry(string_at(&row, 0))
+            .or_default()
+            .push(DirectoryEdge {
+                path: string_at(&row, 1),
+                edge_weight: edge_weight_at(&row, 2),
+            });
+    }
+
+    Ok(StructuralIndex {
+        doc_directories,
+        directory_parents,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1202,6 +1437,16 @@ fn string_list_at(row: &[RuntimeValue], index: usize) -> Vec<String> {
 fn int_at(row: &[RuntimeValue], index: usize) -> i64 {
     match row.get(index) {
         Some(RuntimeValue::Int(value)) => *value,
+        _ => 0,
+    }
+}
+
+fn edge_weight_at(row: &[RuntimeValue], index: usize) -> usize {
+    match row.get(index) {
+        Some(RuntimeValue::Float(value)) if value.is_finite() && *value > 0.0 => {
+            (*value * 100.0).round() as usize
+        }
+        Some(RuntimeValue::Int(value)) if *value > 0 => *value as usize,
         _ => 0,
     }
 }
