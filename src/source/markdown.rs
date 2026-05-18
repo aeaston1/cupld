@@ -17,6 +17,7 @@ const LINK_EDGE_TYPE: &str = "MD_LINKS_TO";
 pub const MD_IN_DIRECTORY: &str = "MD_IN_DIRECTORY";
 pub const MD_PARENT_DIRECTORY: &str = "MD_PARENT_DIRECTORY";
 const STRUCTURAL_EDGE_TYPES: [&str; 2] = [MD_IN_DIRECTORY, MD_PARENT_DIRECTORY];
+const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "mdx"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkdownDocument {
@@ -662,6 +663,10 @@ fn document_properties(root: &str, document: &MarkdownDocument) -> PropertyMap {
         ("src.kind", Value::from("document")),
         ("src.root", Value::from(root.to_owned())),
         ("src.path", Value::from(path_to_string(&document.path))),
+        (
+            "src.ext",
+            Value::from(markdown_extension(&document.path).unwrap_or_default()),
+        ),
         ("src.hash", Value::from(document.source_hash.clone())),
         ("src.status", Value::from("current")),
         ("md.raw", Value::from(document.raw.clone())),
@@ -933,10 +938,7 @@ fn collect_markdown_files(
         if !path.is_file() {
             continue;
         }
-        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
-            continue;
-        };
-        if extension.eq_ignore_ascii_case("md") {
+        if is_supported_markdown_path(&path) {
             files.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
         }
     }
@@ -1932,7 +1934,10 @@ fn strip_query_and_fragment(target: &str) -> &str {
 
 fn index_document_parent_key(path: &Path) -> Option<String> {
     let file_name = path.file_name()?.to_str()?;
-    if !file_name.eq_ignore_ascii_case("index.md") {
+    if !MARKDOWN_EXTENSIONS
+        .iter()
+        .any(|extension| file_name.eq_ignore_ascii_case(&format!("index.{extension}")))
+    {
         return None;
     }
     let parent = path.parent()?;
@@ -2049,12 +2054,7 @@ fn resolve_relative_link(current_path: &Path, target: &Path) -> Option<PathBuf> 
 
 fn strip_markdown_extension(path: &str) -> String {
     let candidate = Path::new(path);
-    if candidate
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("md"))
-        .unwrap_or(false)
-    {
+    if is_supported_markdown_path(candidate) {
         candidate
             .with_extension("")
             .to_string_lossy()
@@ -2062,6 +2062,18 @@ fn strip_markdown_extension(path: &str) -> String {
     } else {
         path.to_owned()
     }
+}
+
+fn is_supported_markdown_path(path: &Path) -> bool {
+    markdown_extension(path).is_some()
+}
+
+fn markdown_extension(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?;
+    MARKDOWN_EXTENSIONS
+        .iter()
+        .find(|supported| extension.eq_ignore_ascii_case(supported))
+        .map(|supported| (*supported).to_owned())
 }
 
 fn find_config_node(engine: &CupldEngine) -> Option<NodeId> {
