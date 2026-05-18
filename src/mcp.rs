@@ -176,7 +176,7 @@ fn tool_definitions() -> Vec<JsonValue> {
         ("memory_list", "List DB-backed memory notes."),
         (
             "memory_search",
-            "Search DB-backed memory notes with capped lexical matching.",
+            "Deterministically search DB-backed memory notes with local lexical matching.",
         ),
         (
             "memory_sync",
@@ -344,21 +344,29 @@ fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
     let Some(query) = args.get("query").and_then(JsonValue::as_str) else {
         return error_payload("validation_error", "expected query");
     };
+    let query = query.trim();
+    if query.is_empty() {
+        return error_payload("validation_error", "expected non-empty query");
+    }
     let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
     let tags = arg_strings(args.get("tags"));
-    let query = query.to_ascii_lowercase();
+    let normalized_query = query.to_ascii_lowercase();
     match load_docs(config) {
         Ok(docs) => {
             let mut scored = filter_tags(docs, &tags)
                 .into_iter()
-                .filter_map(|doc| doc.search_score(&query).map(|score| (score, doc)))
+                .filter_map(|doc| {
+                    doc.search_match(&normalized_query)
+                        .map(|search_match| (search_match, doc))
+                })
                 .collect::<Vec<_>>();
-            scored.sort_by(|(left_score, left), (right_score, right)| {
-                left_score
-                    .cmp(right_score)
+            scored.sort_by(|(left_match, left), (right_match, right)| {
+                left_match
+                    .score
+                    .cmp(&right_match.score)
                     .then_with(|| left.path.cmp(&right.path))
             });
-            list_payload(scored.into_iter().map(|(_, doc)| doc).collect(), limit)
+            search_payload(query, scored, limit)
         }
         Err(error) => error_payload("db_query_failed", &error),
     }
@@ -375,6 +383,43 @@ fn list_payload(docs: Vec<MemoryDoc>, limit: usize) -> JsonValue {
                     .take(limit)
                     .map(|doc| doc.to_item_json(DEFAULT_SNIPPET_CHARS)),
             ),
+        ),
+        ("truncated", truncated.into()),
+        ("provenance", provenance()),
+    ])
+}
+
+fn search_payload(query: &str, docs: Vec<(SearchMatch, MemoryDoc)>, limit: usize) -> JsonValue {
+    let truncated = docs.len() > limit;
+    JsonValue::object([
+        ("ok", true.into()),
+        ("query", JsonValue::from(query.to_owned())),
+        (
+            "retrieval",
+            JsonValue::object([
+                ("mode", JsonValue::from("lexical")),
+                ("deterministic", true.into()),
+                ("semantic", false.into()),
+                ("index_used", false.into()),
+                (
+                    "ranking_policy",
+                    JsonValue::from("ascending lexical score tier, then ascending path for ties"),
+                ),
+                (
+                    "score_policy",
+                    JsonValue::from(
+                        "lower score is more relevant: exact title/path=0, partial title/path=1, tag/alias/heading=2, body=3",
+                    ),
+                ),
+            ]),
+        ),
+        (
+            "items",
+            JsonValue::array(docs.into_iter().take(limit).enumerate().map(
+                |(index, (search_match, doc))| {
+                    doc.to_search_item_json(&search_match, index + 1, DEFAULT_SNIPPET_CHARS)
+                },
+            )),
         ),
         ("truncated", truncated.into()),
         ("provenance", provenance()),
@@ -540,15 +585,61 @@ impl MemoryDoc {
     }
 
     fn to_item_json(&self, max_chars: usize) -> JsonValue {
-        let (snippet, _) = truncate(
+        let (snippet, _) = self.snippet(max_chars);
+        self.to_json_with_body(&snippet)
+    }
+
+    fn to_search_item_json(
+        &self,
+        search_match: &SearchMatch,
+        rank: usize,
+        max_chars: usize,
+    ) -> JsonValue {
+        let (snippet, truncated) = self.snippet(max_chars);
+        let snippet_source = if self.body.is_empty() { "raw" } else { "body" };
+        let mut fields = match self.to_json_with_body(&snippet) {
+            JsonValue::Object(fields) => fields,
+            _ => Vec::new(),
+        };
+        fields.push(("rank".to_owned(), JsonValue::from(rank)));
+        fields.push((
+            "score".to_owned(),
+            JsonValue::from(search_match.score as usize),
+        ));
+        fields.push((
+            "matched_fields".to_owned(),
+            JsonValue::array(
+                search_match
+                    .fields
+                    .iter()
+                    .map(|field| JsonValue::from(*field)),
+            ),
+        ));
+        fields.push((
+            "matched_category".to_owned(),
+            JsonValue::from(search_match.category),
+        ));
+        fields.push((
+            "snippet_metadata".to_owned(),
+            JsonValue::object([
+                ("source", JsonValue::from(snippet_source)),
+                ("max_chars", JsonValue::from(max_chars)),
+                ("truncated", truncated.into()),
+                ("empty_body_fallback", self.body.is_empty().into()),
+            ]),
+        ));
+        JsonValue::Object(fields)
+    }
+
+    fn snippet(&self, max_chars: usize) -> (String, bool) {
+        truncate(
             if self.body.is_empty() {
                 &self.raw
             } else {
                 &self.body
             },
             max_chars,
-        );
-        self.to_json_with_body(&snippet)
+        )
     }
 
     fn to_json_with_body(&self, body: &str) -> JsonValue {
@@ -569,26 +660,82 @@ impl MemoryDoc {
         ])
     }
 
-    fn search_score(&self, query: &str) -> Option<u8> {
+    fn search_match(&self, query: &str) -> Option<SearchMatch> {
         let title = self.title.to_ascii_lowercase();
         let path = self.path.to_ascii_lowercase();
         if title == query || path == query {
-            return Some(0);
+            return Some(SearchMatch::new(
+                0,
+                "exact_title_or_path",
+                matched_fields([("title", title == query), ("path", path == query)]),
+            ));
         }
         if title.contains(query) || path.contains(query) {
-            return Some(1);
+            return Some(SearchMatch::new(
+                1,
+                "partial_title_or_path",
+                matched_fields([
+                    ("title", title.contains(query)),
+                    ("path", path.contains(query)),
+                ]),
+            ));
         }
-        if self
-            .tags
-            .iter()
-            .chain(self.aliases.iter())
-            .chain(self.headings.iter())
-            .any(|value| value.to_ascii_lowercase().contains(query))
-        {
-            return Some(2);
+        let structured_fields = matched_fields([
+            (
+                "tags",
+                self.tags
+                    .iter()
+                    .any(|value| value.to_ascii_lowercase().contains(query)),
+            ),
+            (
+                "aliases",
+                self.aliases
+                    .iter()
+                    .any(|value| value.to_ascii_lowercase().contains(query)),
+            ),
+            (
+                "headings",
+                self.headings
+                    .iter()
+                    .any(|value| value.to_ascii_lowercase().contains(query)),
+            ),
+        ]);
+        if !structured_fields.is_empty() {
+            return Some(SearchMatch::new(
+                2,
+                "structured_metadata",
+                structured_fields,
+            ));
         }
-        self.body.to_ascii_lowercase().contains(query).then_some(3)
+        self.body
+            .to_ascii_lowercase()
+            .contains(query)
+            .then(|| SearchMatch::new(3, "body", vec!["body"]))
     }
+}
+
+#[derive(Clone, Debug)]
+struct SearchMatch {
+    score: u8,
+    category: &'static str,
+    fields: Vec<&'static str>,
+}
+
+impl SearchMatch {
+    fn new(score: u8, category: &'static str, fields: Vec<&'static str>) -> Self {
+        Self {
+            score,
+            category,
+            fields,
+        }
+    }
+}
+
+fn matched_fields<const N: usize>(fields: [(&'static str, bool); N]) -> Vec<&'static str> {
+    fields
+        .into_iter()
+        .filter_map(|(field, matched)| matched.then_some(field))
+        .collect()
 }
 
 fn filter_tags(docs: Vec<MemoryDoc>, tags: &[String]) -> Vec<MemoryDoc> {
@@ -766,7 +913,11 @@ fn path_to_string(path: &Path) -> String {
 }
 
 fn provenance() -> JsonValue {
-    JsonValue::object([("source", JsonValue::from("cupld_db"))])
+    JsonValue::object([
+        ("source", JsonValue::from("cupld_db")),
+        ("markdown_source", JsonValue::from("configured_local_root")),
+        ("network_used", JsonValue::from(false)),
+    ])
 }
 
 fn report_json(report: &MarkdownSyncReport) -> JsonValue {
