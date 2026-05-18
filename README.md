@@ -74,12 +74,12 @@ cupld query --db default --output json 'MATCH (n) RETURN n LIMIT 10'
 Build compact context rows for agent prompts:
 
 ```bash
-cupld context --db default --path notes/example.md --depth 2 --max-nodes 25
+cupld context --db default --path notes/example.md --depth 2 --max-nodes 25 --output table
 cupld context --db default --node 42 --depth 1 --output table
 cupld context --db default --path notes/example.md --depth 2 --output json
 ```
 
-`context` is seeded: pass one or more `--node <id>` or `--path <src.path>` seeds to get a bounded neighborhood table with seed, node, and edge rows. JSON and NDJSON remain the stable machine contracts for automation.
+`context` is seeded: pass one or more `--node <id>` or `--path <src.path>` seeds to get a bounded neighborhood around explicit graph nodes or synced markdown source paths. Use `--depth <n>`, `--direction <in|out|both>`, repeated `--edge-type <type>`, repeated `--label <label>`, `--max-nodes <n>`, and `--max-edges <n>` to control traversal. Table output is human-facing and contains `row`, `depth`, `id`, `labels/type`, `display`, `source`, and `target` columns. JSON and NDJSON remain the stable machine contracts for automation; JSON is the default output mode.
 
 Use `cupld query` for global node listings and ad hoc graph reads:
 
