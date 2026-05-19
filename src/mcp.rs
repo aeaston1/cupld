@@ -16,6 +16,7 @@ const MAX_LIMIT: usize = 50;
 const DEFAULT_LIMIT: usize = 10;
 const DEFAULT_SNIPPET_CHARS: usize = 500;
 const DEFAULT_BODY_CHARS: usize = 4000;
+const SYNC_VISIBILITY_MESSAGE: &str = "MCP reads are DB-backed; run memory_sync after markdown changes before memory_search or memory_get can see them.";
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -143,16 +144,69 @@ fn json_rpc_error(id: JsonValue, rpc_code: i64, code: &str, message: &str) -> Js
     ])
 }
 
+#[derive(Clone, Debug)]
+struct McpToolError {
+    code: String,
+    message: String,
+    details: Option<JsonValue>,
+}
+
+impl McpToolError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    fn with_details(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: JsonValue,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: Some(details),
+        }
+    }
+
+    fn validation(message: impl Into<String>) -> Self {
+        Self::new("validation_error", message)
+    }
+
+    fn payload(&self) -> JsonValue {
+        error_payload_with_details(&self.code, &self.message, self.details.clone())
+    }
+
+    fn error_object(&self) -> JsonValue {
+        let mut error = vec![
+            ("code".to_owned(), JsonValue::from(self.code.clone())),
+            ("message".to_owned(), JsonValue::from(self.message.clone())),
+        ];
+        if let Some(details) = &self.details {
+            error.push(("details".to_owned(), details.clone()));
+        }
+        JsonValue::Object(error)
+    }
+}
+
 fn error_payload(code: &str, message: &str) -> JsonValue {
+    error_payload_with_details(code, message, None)
+}
+
+fn error_payload_with_details(code: &str, message: &str, details: Option<JsonValue>) -> JsonValue {
+    let mut error = vec![
+        ("code".to_owned(), JsonValue::from(code)),
+        ("message".to_owned(), JsonValue::from(message)),
+    ];
+    if let Some(details) = details {
+        error.push(("details".to_owned(), details));
+    }
     JsonValue::object([
         ("ok", JsonValue::from(false)),
-        (
-            "error",
-            JsonValue::object([
-                ("code", JsonValue::from(code)),
-                ("message", JsonValue::from(message)),
-            ]),
-        ),
+        ("error", JsonValue::Object(error)),
     ])
 }
 
@@ -166,49 +220,381 @@ fn tool_content(payload: JsonValue) -> JsonValue {
     )])
 }
 
+#[derive(Clone, Copy)]
+struct ToolSpec {
+    name: &'static str,
+    description: &'static str,
+    input_schema: fn() -> JsonValue,
+}
+
+const TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "memory_health",
+        description: "Report cupld memory DB and markdown root status.",
+        input_schema: empty_schema,
+    },
+    ToolSpec {
+        name: "memory_get",
+        description: "Get one DB-backed memory note by URI, path, id, or title.",
+        input_schema: memory_get_schema,
+    },
+    ToolSpec {
+        name: "memory_list",
+        description: "List DB-backed memory notes.",
+        input_schema: memory_list_schema,
+    },
+    ToolSpec {
+        name: "memory_search",
+        description: "Deterministically search DB-backed memory notes with local lexical matching.",
+        input_schema: memory_search_schema,
+    },
+    ToolSpec {
+        name: "memory_context",
+        description: "Expand from memory search hits or explicit seeds into bounded DB-backed graph context.",
+        input_schema: memory_context_schema,
+    },
+    ToolSpec {
+        name: "memory_sync",
+        description: "Sync configured markdown memory into the cupld DB.",
+        input_schema: empty_schema,
+    },
+    ToolSpec {
+        name: "memory_add",
+        description: "Write a markdown memory note and sync it into the DB.",
+        input_schema: memory_add_schema,
+    },
+    ToolSpec {
+        name: "memory_doctor",
+        description: "Diagnose cupld memory harness readiness without mutating DB or markdown state.",
+        input_schema: memory_doctor_schema,
+    },
+];
+
 fn tool_definitions() -> Vec<JsonValue> {
-    [
-        (
-            "memory_health",
-            "Report cupld memory DB and markdown root status.",
-        ),
-        (
-            "memory_get",
-            "Get one DB-backed memory note by URI, path, id, or title.",
-        ),
-        ("memory_list", "List DB-backed memory notes."),
-        (
-            "memory_search",
-            "Deterministically search DB-backed memory notes with local lexical matching.",
-        ),
-        (
-            "memory_context",
-            "Expand from memory search hits or explicit seeds into bounded DB-backed graph context.",
-        ),
-        (
-            "memory_sync",
-            "Sync configured markdown memory into the cupld DB.",
-        ),
-        (
-            "memory_add",
-            "Write a markdown memory note and sync it into the DB.",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, description)| {
-        JsonValue::object([
-            ("name", JsonValue::from(name)),
-            ("description", JsonValue::from(description)),
+    TOOL_SPECS
+        .iter()
+        .map(|spec| {
+            JsonValue::object([
+                ("name", JsonValue::from(spec.name)),
+                ("description", JsonValue::from(spec.description)),
+                ("inputSchema", (spec.input_schema)()),
+            ])
+        })
+        .collect()
+}
+
+fn empty_schema() -> JsonValue {
+    object_schema([], [])
+}
+
+fn memory_doctor_schema() -> JsonValue {
+    object_schema([("deep", bool_schema())], [])
+}
+
+fn memory_get_schema() -> JsonValue {
+    object_schema(
+        [
+            ("id_or_uri", string_schema()),
+            ("max_chars", integer_schema(Some(1), Some(20_000))),
+        ],
+        ["id_or_uri"],
+    )
+}
+
+fn memory_list_schema() -> JsonValue {
+    object_schema(
+        [
+            ("limit", integer_schema(Some(1), Some(MAX_LIMIT))),
+            ("tags", string_array_schema()),
+        ],
+        [],
+    )
+}
+
+fn memory_search_schema() -> JsonValue {
+    let retrieval = enum_schema(["lexical", "semantic", "vector"]);
+    object_schema(
+        [
+            ("query", string_schema()),
+            ("limit", integer_schema(Some(1), Some(MAX_LIMIT))),
+            ("tags", string_array_schema()),
+            ("retrieval_mode", retrieval.clone()),
+            ("mode", retrieval.clone()),
+            ("retrieval", retrieval),
+        ],
+        ["query"],
+    )
+}
+
+fn memory_context_schema() -> JsonValue {
+    object_schema(
+        [
+            ("id_or_uri", string_schema()),
+            ("path", string_schema()),
+            ("paths", string_array_schema()),
+            ("node", integer_schema(Some(0), None)),
+            ("nodes", integer_array_schema(Some(0), None)),
             (
-                "inputSchema",
-                JsonValue::object([
-                    ("type", JsonValue::from("object")),
-                    ("additionalProperties", JsonValue::from(true)),
-                ]),
+                "depth",
+                integer_schema(Some(0), Some(crate::MAX_TRAVERSAL_DEPTH as usize)),
             ),
-        ])
-    })
-    .collect()
+            ("direction", enum_schema(["in", "out", "both"])),
+            ("edge_types", string_array_schema()),
+            ("labels", string_array_schema()),
+            ("max_nodes", integer_schema(Some(1), Some(250))),
+            ("max_edges", integer_schema(Some(1), Some(1_000))),
+        ],
+        [],
+    )
+}
+
+fn memory_add_schema() -> JsonValue {
+    object_schema(
+        [
+            ("content", string_schema()),
+            ("title", string_schema()),
+            ("tags", string_array_schema()),
+            ("path_hint", string_schema()),
+            ("source", string_schema()),
+        ],
+        ["content"],
+    )
+}
+
+fn object_schema<const P: usize, const R: usize>(
+    properties: [(&'static str, JsonValue); P],
+    required: [&'static str; R],
+) -> JsonValue {
+    JsonValue::object([
+        ("type", JsonValue::from("object")),
+        (
+            "properties",
+            JsonValue::object(
+                properties
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), value)),
+            ),
+        ),
+        (
+            "required",
+            JsonValue::array(required.into_iter().map(JsonValue::from)),
+        ),
+        ("additionalProperties", JsonValue::from(false)),
+    ])
+}
+
+fn string_schema() -> JsonValue {
+    JsonValue::object([("type", JsonValue::from("string"))])
+}
+
+fn bool_schema() -> JsonValue {
+    JsonValue::object([("type", JsonValue::from("boolean"))])
+}
+
+fn integer_schema(minimum: Option<usize>, maximum: Option<usize>) -> JsonValue {
+    let mut fields = vec![("type".to_owned(), JsonValue::from("integer"))];
+    if let Some(minimum) = minimum {
+        fields.push(("minimum".to_owned(), JsonValue::from(minimum)));
+    }
+    if let Some(maximum) = maximum {
+        fields.push(("maximum".to_owned(), JsonValue::from(maximum)));
+    }
+    JsonValue::Object(fields)
+}
+
+fn string_array_schema() -> JsonValue {
+    JsonValue::object([
+        ("type", JsonValue::from("array")),
+        ("items", string_schema()),
+    ])
+}
+
+fn integer_array_schema(minimum: Option<usize>, maximum: Option<usize>) -> JsonValue {
+    JsonValue::object([
+        ("type", JsonValue::from("array")),
+        ("items", integer_schema(minimum, maximum)),
+    ])
+}
+
+fn enum_schema<const N: usize>(values: [&'static str; N]) -> JsonValue {
+    JsonValue::object([
+        ("type", JsonValue::from("string")),
+        (
+            "enum",
+            JsonValue::array(values.into_iter().map(JsonValue::from)),
+        ),
+    ])
+}
+
+struct ToolArgs<'a> {
+    value: &'a JsonValue,
+}
+
+impl<'a> ToolArgs<'a> {
+    fn new(value: &'a JsonValue) -> Result<Self, McpToolError> {
+        match value {
+            JsonValue::Null | JsonValue::Object(_) => Ok(Self { value }),
+            _ => Err(McpToolError::validation("expected arguments object")),
+        }
+    }
+
+    fn reject_unknown(&self, allowed: &[&str]) -> Result<(), McpToolError> {
+        let Some(fields) = self.value.as_object() else {
+            return Ok(());
+        };
+        for (key, _) in fields {
+            if !allowed.contains(&key.as_str()) {
+                return Err(McpToolError::validation(format!(
+                    "unexpected argument {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn required_string(&self, key: &str) -> Result<String, McpToolError> {
+        self.optional_string(key)?
+            .ok_or_else(|| McpToolError::validation(format!("expected {key}")))
+    }
+
+    fn optional_string(&self, key: &str) -> Result<Option<String>, McpToolError> {
+        match self.value.get(key) {
+            None | Some(JsonValue::Null) => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(|value| Some(value.to_owned()))
+                .ok_or_else(|| McpToolError::validation(format!("expected {key}"))),
+        }
+    }
+
+    fn optional_string_alias(
+        &self,
+        keys: &[&str],
+        canonical: &str,
+    ) -> Result<Option<String>, McpToolError> {
+        for key in keys {
+            if self.value.get(key).is_some() {
+                return match self.value.get(key) {
+                    None | Some(JsonValue::Null) => Ok(None),
+                    Some(value) => value
+                        .as_str()
+                        .map(|value| Some(value.to_owned()))
+                        .ok_or_else(|| McpToolError::validation(format!("expected {canonical}"))),
+                };
+            }
+        }
+        Ok(None)
+    }
+
+    fn optional_bool(&self, key: &str) -> Result<Option<bool>, McpToolError> {
+        match self.value.get(key) {
+            None | Some(JsonValue::Null) => Ok(None),
+            Some(value) => value
+                .as_bool()
+                .map(Some)
+                .ok_or_else(|| McpToolError::validation(format!("expected {key}"))),
+        }
+    }
+
+    fn optional_i64(&self, key: &str) -> Result<Option<i64>, McpToolError> {
+        match self.value.get(key) {
+            None | Some(JsonValue::Null) => Ok(None),
+            Some(value) => integer_value(value)
+                .map(Some)
+                .ok_or_else(|| McpToolError::validation(format!("expected {key}"))),
+        }
+    }
+
+    fn optional_usize(&self, key: &str, default: usize, max: usize) -> Result<usize, McpToolError> {
+        let Some(value) = self.value.get(key) else {
+            return Ok(default);
+        };
+        if matches!(value, JsonValue::Null) {
+            return Ok(default);
+        }
+        let value = usize_value(value)
+            .ok_or_else(|| McpToolError::validation(format!("expected {key}")))?;
+        if value < 1 {
+            return Err(McpToolError::validation(format!(
+                "expected {key} between 1 and {max}"
+            )));
+        }
+        Ok(value.min(max))
+    }
+
+    fn optional_u8(&self, key: &str, default: u8, max: u8) -> Result<u8, McpToolError> {
+        let Some(value) = self.value.get(key) else {
+            return Ok(default);
+        };
+        if matches!(value, JsonValue::Null) {
+            return Ok(default);
+        }
+        let value = usize_value(value)
+            .ok_or_else(|| McpToolError::validation(format!("expected {key}")))?;
+        if value > max as usize {
+            return Err(McpToolError::validation(format!(
+                "expected {key} to be at most {max}"
+            )));
+        }
+        Ok(value as u8)
+    }
+
+    fn optional_string_array(&self, key: &str) -> Result<Vec<String>, McpToolError> {
+        let Some(value) = self.value.get(key) else {
+            return Ok(Vec::new());
+        };
+        if matches!(value, JsonValue::Null) {
+            return Ok(Vec::new());
+        }
+        let Some(values) = value.as_array() else {
+            return Err(McpToolError::validation(format!(
+                "expected {key} to be an array of strings"
+            )));
+        };
+        values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    McpToolError::validation(format!("expected {key} entries to be strings"))
+                })
+            })
+            .collect()
+    }
+
+    fn optional_i64_array(&self, key: &str) -> Result<Vec<i64>, McpToolError> {
+        let Some(value) = self.value.get(key) else {
+            return Ok(Vec::new());
+        };
+        if matches!(value, JsonValue::Null) {
+            return Ok(Vec::new());
+        }
+        let Some(values) = value.as_array() else {
+            return Err(McpToolError::validation(format!(
+                "expected {key} to be an array of integers"
+            )));
+        };
+        values
+            .iter()
+            .map(|value| {
+                integer_value(value).ok_or_else(|| {
+                    McpToolError::validation(format!("expected {key} entries to be integers"))
+                })
+            })
+            .collect()
+    }
+}
+
+fn integer_value(value: &JsonValue) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+}
+
+fn usize_value(value: &JsonValue) -> Option<usize> {
+    match integer_value(value)? {
+        value if value >= 0 => usize::try_from(value).ok(),
+        _ => None,
+    }
 }
 
 fn resource_definitions() -> Vec<JsonValue> {
@@ -230,18 +616,22 @@ fn resource_definitions() -> Vec<JsonValue> {
 
 fn call_tool(config: &McpConfig, params: &JsonValue) -> JsonValue {
     let Some(name) = params.get("name").and_then(JsonValue::as_str) else {
-        return error_payload("validation_error", "expected tool name");
+        return McpToolError::validation("expected tool name").payload();
     };
     let args = params.get("arguments").unwrap_or(&JsonValue::Null);
-    match name {
-        "memory_health" => memory_health(config),
+    match match name {
+        "memory_health" => memory_health(config, args),
+        "memory_doctor" => memory_doctor(config, args),
         "memory_get" => memory_get(config, args),
         "memory_list" => memory_list(config, args),
         "memory_search" => memory_search(config, args),
         "memory_context" => memory_context(config, args),
-        "memory_sync" => memory_sync(config),
+        "memory_sync" => memory_sync(config, args),
         "memory_add" => memory_add(config, args),
-        _ => error_payload("unknown_tool", "unknown memory tool"),
+        _ => Err(McpToolError::new("unknown_tool", "unknown memory tool")),
+    } {
+        Ok(payload) => payload,
+        Err(error) => error.payload(),
     }
 }
 
@@ -249,7 +639,7 @@ fn read_resource(config: &McpConfig, params: &JsonValue) -> JsonValue {
     let Some(uri) = params.get("uri").and_then(JsonValue::as_str) else {
         return resource_text(
             "memory://error",
-            error_payload("validation_error", "expected uri"),
+            McpToolError::validation("expected uri").payload(),
         );
     };
     let payload = if uri == "memory://index" || uri == "memory://recent" {
@@ -257,20 +647,23 @@ fn read_resource(config: &McpConfig, params: &JsonValue) -> JsonValue {
             config,
             &JsonValue::object([("limit", JsonValue::from(10usize))]),
         )
+        .unwrap_or_else(|error| error.payload())
     } else if uri == "memory://config" {
-        memory_health(config)
+        memory_health(config, &JsonValue::Null).unwrap_or_else(|error| error.payload())
     } else if let Some(path) = uri.strip_prefix("memory://note/") {
         memory_get(
             config,
             &JsonValue::object([("id_or_uri", JsonValue::from(path))]),
         )
+        .unwrap_or_else(|error| error.payload())
     } else if let Some(tag) = uri.strip_prefix("memory://tag/") {
         memory_list(
             config,
             &JsonValue::object([("tags", JsonValue::array([tag.into()]))]),
         )
+        .unwrap_or_else(|error| error.payload())
     } else {
-        error_payload("resource_not_found", "unknown memory resource")
+        McpToolError::new("resource_not_found", "unknown memory resource").payload()
     };
     resource_text(uri, payload)
 }
@@ -286,98 +679,344 @@ fn resource_text(uri: &str, payload: JsonValue) -> JsonValue {
     )])
 }
 
-fn memory_health(config: &McpConfig) -> JsonValue {
-    match open_session(config) {
-        Ok(session) => {
-            let root = resolve_markdown_root(config, Some(&session));
-            let root_exists = root.as_ref().is_some_and(|path| path.exists());
-            JsonValue::object([
-                ("ok", true.into()),
-                ("db_path", path_json(&config.db_path)),
-                ("db_exists", config.db_path.exists().into()),
-                (
-                    "markdown_root",
-                    root.as_ref().map(path_json).unwrap_or(JsonValue::Null),
-                ),
-                ("markdown_root_exists", root_exists.into()),
-                ("read_only", config.read_only.into()),
-                ("safe_for_writes", (!config.read_only && root_exists).into()),
-                (
-                    "write_status",
-                    JsonValue::from(if config.read_only {
-                        "read_only"
-                    } else if root_exists {
-                        "ready"
-                    } else {
-                        "markdown_root_missing"
-                    }),
-                ),
-                (
-                    "sync_visibility",
-                    JsonValue::from(
-                        "MCP reads are DB-backed; run memory_sync after markdown changes before memory_search or memory_get can see them.",
-                    ),
-                ),
-                (
-                    "db_last_tx_id",
-                    JsonValue::from(session.transaction_info().last_tx_id),
-                ),
-            ])
+#[derive(Clone, Debug)]
+struct HarnessDiagnostics {
+    deep: bool,
+    db_path: PathBuf,
+    db_exists: bool,
+    markdown_root: Option<PathBuf>,
+    markdown_root_exists: bool,
+    read_only: bool,
+    safe_for_writes: bool,
+    write_status: &'static str,
+    db_last_tx_id: Option<u64>,
+    db_open_error: Option<String>,
+    storage_recovered_tail: Option<bool>,
+}
+
+impl HarnessDiagnostics {
+    fn status(&self) -> &'static str {
+        if self.db_open_error.is_some() {
+            "fail"
+        } else if !self.markdown_root_exists || self.storage_recovered_tail == Some(true) {
+            "warn"
+        } else {
+            "pass"
         }
-        Err(error) => error_payload("db_open_failed", &error),
+    }
+
+    fn health_payload(&self) -> JsonValue {
+        JsonValue::object([
+            ("ok", true.into()),
+            ("db_path", path_json(&self.db_path)),
+            ("db_exists", self.db_exists.into()),
+            (
+                "markdown_root",
+                self.markdown_root
+                    .as_ref()
+                    .map(path_json)
+                    .unwrap_or(JsonValue::Null),
+            ),
+            ("markdown_root_exists", self.markdown_root_exists.into()),
+            ("read_only", self.read_only.into()),
+            ("safe_for_writes", self.safe_for_writes.into()),
+            ("write_status", JsonValue::from(self.write_status)),
+            ("sync_visibility", JsonValue::from(SYNC_VISIBILITY_MESSAGE)),
+            (
+                "db_last_tx_id",
+                self.db_last_tx_id
+                    .map(JsonValue::from)
+                    .unwrap_or(JsonValue::Null),
+            ),
+        ])
+    }
+
+    fn doctor_payload(&self) -> JsonValue {
+        let mut fields = vec![
+            ("ok", JsonValue::from(self.status() != "fail")),
+            ("tool", JsonValue::from("memory_doctor")),
+            ("status", JsonValue::from(self.status())),
+            (
+                "diagnostic_mode",
+                JsonValue::from(if self.deep { "deep" } else { "light" }),
+            ),
+            (
+                "db",
+                JsonValue::object([
+                    ("path", path_json(&self.db_path)),
+                    ("exists", self.db_exists.into()),
+                    (
+                        "last_tx_id",
+                        self.db_last_tx_id
+                            .map(JsonValue::from)
+                            .unwrap_or(JsonValue::Null),
+                    ),
+                ]),
+            ),
+            (
+                "markdown_root",
+                JsonValue::object([
+                    (
+                        "path",
+                        self.markdown_root
+                            .as_ref()
+                            .map(path_json)
+                            .unwrap_or(JsonValue::Null),
+                    ),
+                    ("exists", self.markdown_root_exists.into()),
+                ]),
+            ),
+            (
+                "server",
+                JsonValue::object([
+                    ("read_only", self.read_only.into()),
+                    ("safe_for_writes", self.safe_for_writes.into()),
+                    ("write_status", JsonValue::from(self.write_status)),
+                    ("sync_visibility", JsonValue::from(SYNC_VISIBILITY_MESSAGE)),
+                ]),
+            ),
+            ("checks", JsonValue::array(self.doctor_checks())),
+            ("next_actions", JsonValue::array(self.next_actions())),
+            ("provenance", provenance()),
+        ];
+        if let Some(recovered_tail) = self.storage_recovered_tail {
+            fields.push((
+                "storage",
+                JsonValue::object([("recovered_tail", recovered_tail.into())]),
+            ));
+        }
+        JsonValue::object(fields)
+    }
+
+    fn next_actions(&self) -> Vec<JsonValue> {
+        let mut actions = Vec::new();
+        if self.db_open_error.is_some() {
+            actions.push(JsonValue::from(
+                "verify --db points at a readable local cupld database",
+            ));
+        }
+        if !self.markdown_root_exists {
+            actions.push(JsonValue::from(
+                "create the markdown root, pass --root, or run cupld source set-root",
+            ));
+        }
+        if !self.safe_for_writes && !self.read_only {
+            actions.push(JsonValue::from(
+                "create the markdown root before calling memory_add or memory_sync",
+            ));
+        }
+        actions.push(JsonValue::from(
+            "run memory_sync after markdown changes before expecting DB-backed MCP reads to see them",
+        ));
+        if self.storage_recovered_tail == Some(true) {
+            actions.push(JsonValue::from(
+                "run cupld check --db and consider compacting the database",
+            ));
+        }
+        actions
+    }
+
+    fn doctor_checks(&self) -> Vec<JsonValue> {
+        let mut checks = Vec::new();
+        checks.push(doctor_check(
+            "db_open",
+            if self.db_open_error.is_some() {
+                "fail"
+            } else {
+                "pass"
+            },
+            self.db_open_error
+                .as_deref()
+                .unwrap_or("database opened successfully"),
+            self.db_open_error
+                .as_ref()
+                .map(|_| "verify --db points at a readable .cupld file"),
+        ));
+        checks.push(doctor_check(
+            "markdown_root_exists",
+            if self.markdown_root_exists {
+                "pass"
+            } else {
+                "warn"
+            },
+            if self.markdown_root_exists {
+                "configured markdown root exists"
+            } else {
+                "configured markdown root does not exist"
+            },
+            (!self.markdown_root_exists)
+                .then_some("create the root directory, pass --root, or run cupld source set-root"),
+        ));
+        checks.push(doctor_check(
+            "write_readiness",
+            if self.safe_for_writes || self.read_only {
+                "pass"
+            } else {
+                "warn"
+            },
+            match self.write_status {
+                "ready" => "memory_add and memory_sync are available",
+                "read_only" => "write tools are disabled by --read-only",
+                _ => "write tools need an existing markdown root",
+            },
+            (!self.safe_for_writes && !self.read_only)
+                .then_some("create the markdown root before calling memory_add or memory_sync"),
+        ));
+        checks.push(doctor_check(
+            "sync_visibility",
+            "pass",
+            SYNC_VISIBILITY_MESSAGE,
+            None,
+        ));
+        if let Some(recovered_tail) = self.storage_recovered_tail {
+            checks.push(doctor_check(
+                "storage_integrity",
+                if recovered_tail { "warn" } else { "pass" },
+                if recovered_tail {
+                    "database check recovered WAL tail records"
+                } else {
+                    "database storage check passed without recovery"
+                },
+                recovered_tail
+                    .then_some("run cupld check --db and consider compacting the database"),
+            ));
+        }
+        checks
     }
 }
 
-fn memory_context(config: &McpConfig, args: &JsonValue) -> JsonValue {
-    let mut seeds = Vec::new();
-    for node in arg_i64s(args.get("nodes")) {
-        if node < 0 {
-            return error_payload("validation_error", "expected non-negative node ids");
-        }
-        seeds.push(ContextSeedRequest::Node(node as usize));
+fn collect_harness_diagnostics(config: &McpConfig, deep: bool) -> HarnessDiagnostics {
+    let db_path = config.db_path.clone();
+    let db_exists = db_path.exists();
+    let session = open_session(config);
+    let (markdown_root, db_last_tx_id, db_open_error) = match session {
+        Ok(session) => (
+            resolve_markdown_root(config, Some(&session)),
+            Some(session.transaction_info().last_tx_id),
+            None,
+        ),
+        Err(error) => (resolve_markdown_root(config, None), None, Some(error)),
+    };
+    let markdown_root_exists = markdown_root.as_ref().is_some_and(|path| path.exists());
+    let safe_for_writes = !config.read_only && markdown_root_exists && db_open_error.is_none();
+    let write_status = if config.read_only {
+        "read_only"
+    } else if markdown_root_exists {
+        "ready"
+    } else {
+        "markdown_root_missing"
+    };
+    let storage_recovered_tail = if deep && db_open_error.is_none() {
+        Session::check(&db_path)
+            .ok()
+            .map(|report| report.recovered_tail)
+    } else {
+        None
+    };
+    HarnessDiagnostics {
+        deep,
+        db_path,
+        db_exists,
+        markdown_root,
+        markdown_root_exists,
+        read_only: config.read_only,
+        safe_for_writes,
+        write_status,
+        db_last_tx_id,
+        db_open_error,
+        storage_recovered_tail,
     }
-    for path in arg_strings(args.get("paths")) {
+}
+
+fn doctor_check(code: &str, status: &str, message: &str, remediation: Option<&str>) -> JsonValue {
+    let mut fields = vec![
+        ("code".to_owned(), JsonValue::from(code)),
+        ("status".to_owned(), JsonValue::from(status)),
+        ("message".to_owned(), JsonValue::from(message)),
+    ];
+    if let Some(remediation) = remediation {
+        fields.push(("remediation".to_owned(), JsonValue::from(remediation)));
+    }
+    JsonValue::Object(fields)
+}
+
+fn memory_health(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&[])?;
+    let diagnostics = collect_harness_diagnostics(config, false);
+    if let Some(error) = diagnostics.db_open_error.as_deref() {
+        return Err(McpToolError::new("db_open_failed", error));
+    }
+    Ok(diagnostics.health_payload())
+}
+
+fn memory_doctor(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&["deep"])?;
+    let deep = args.optional_bool("deep")?.unwrap_or(false);
+    Ok(collect_harness_diagnostics(config, deep).doctor_payload())
+}
+
+fn memory_context(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&[
+        "id_or_uri",
+        "path",
+        "paths",
+        "node",
+        "nodes",
+        "depth",
+        "direction",
+        "edge_types",
+        "labels",
+        "max_nodes",
+        "max_edges",
+    ])?;
+    let mut seeds = Vec::new();
+    for node in args.optional_i64_array("nodes")? {
+        seeds.push(ContextSeedRequest::Node(usize::try_from(node).map_err(
+            |_| McpToolError::validation("expected nodes entries to be non-negative integers"),
+        )?));
+    }
+    for path in args.optional_string_array("paths")? {
         seeds.push(ContextSeedRequest::Path(path));
     }
-    if let Some(node) = args.get("node").and_then(JsonValue::as_i64) {
-        if node < 0 {
-            return error_payload("validation_error", "expected non-negative node id");
-        }
-        seeds.push(ContextSeedRequest::Node(node as usize));
+    if let Some(node) = args.optional_i64("node")? {
+        seeds.push(ContextSeedRequest::Node(usize::try_from(node).map_err(
+            |_| McpToolError::validation("expected node to be a non-negative integer"),
+        )?));
     }
-    if let Some(path) = args.get("path").and_then(JsonValue::as_str) {
-        seeds.push(ContextSeedRequest::Path(path.to_owned()));
+    if let Some(path) = args.optional_string("path")? {
+        seeds.push(ContextSeedRequest::Path(path));
     }
-    if let Some(uri) = args.get("id_or_uri").and_then(JsonValue::as_str) {
-        seeds.push(ContextSeedRequest::Path(
-            uri.strip_prefix("memory://note/").unwrap_or(uri).to_owned(),
-        ));
+    if let Some(uri) = args.optional_string("id_or_uri")? {
+        let doc = find_one_doc(config, &uri).map_err(|error| match error.code.as_str() {
+            "not_found" => {
+                McpToolError::new("not_found", "expected exactly one matching memory note")
+            }
+            _ => error,
+        })?;
+        seeds.push(ContextSeedRequest::Path(doc.path));
     }
     if seeds.is_empty() {
-        return error_payload(
-            "validation_error",
+        return Err(McpToolError::validation(
             "expected node, nodes, path, paths, or id_or_uri",
-        );
+        ));
     }
 
-    let depth = match bounded_u8(args.get("depth"), 1, crate::MAX_TRAVERSAL_DEPTH) {
-        Ok(depth) => depth,
-        Err(error) => return error_payload("validation_error", &error),
-    };
+    let depth = args.optional_u8("depth", 1, crate::MAX_TRAVERSAL_DEPTH)?;
     let direction = match args
-        .get("direction")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("both")
+        .optional_string("direction")?
+        .unwrap_or_else(|| "both".to_owned())
         .trim()
     {
         "in" => ContextDirection::In,
         "out" => ContextDirection::Out,
         "both" | "" => ContextDirection::Both,
         _ => {
-            return error_payload(
-                "validation_error",
+            return Err(McpToolError::validation(
                 "expected direction to be in, out, or both",
-            );
+            ));
         }
     };
     let request = ContextRequest {
@@ -399,86 +1038,79 @@ fn memory_context(config: &McpConfig, args: &JsonValue) -> JsonValue {
         seeds,
         depth,
         direction,
-        edge_types: arg_strings(args.get("edge_types")),
-        labels: arg_strings(args.get("labels")),
-        max_nodes: bounded_usize(args.get("max_nodes"), 25, 250),
-        max_edges: bounded_usize(args.get("max_edges"), 100, 1_000),
+        edge_types: args.optional_string_array("edge_types")?,
+        labels: args.optional_string_array("labels")?,
+        max_nodes: args.optional_usize("max_nodes", 25, 250)?,
+        max_edges: args.optional_usize("max_edges", 100, 1_000)?,
     };
     match request.run() {
-        Ok(envelope) => json::parse(&context_as_json(&envelope)).unwrap_or_else(|error| {
-            error_payload("context_serialization_failed", &error.to_string())
-        }),
-        Err(error) => error_payload("context_failed", &error.to_string()),
+        Ok(envelope) => json::parse(&context_as_json(&envelope))
+            .map_err(|error| McpToolError::new("context_serialization_failed", error.to_string())),
+        Err(error) => Err(McpToolError::with_details(
+            error.code(),
+            error.message(),
+            JsonValue::object([("source", JsonValue::from("context"))]),
+        )),
     }
 }
 
-fn memory_get(config: &McpConfig, args: &JsonValue) -> JsonValue {
-    let Some(needle) = args.get("id_or_uri").and_then(JsonValue::as_str) else {
-        return error_payload("validation_error", "expected id_or_uri");
-    };
-    let max_chars = bounded_usize(args.get("max_chars"), DEFAULT_BODY_CHARS, 20_000);
+fn memory_get(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&["id_or_uri", "max_chars"])?;
+    let needle = args.required_string("id_or_uri")?;
+    let max_chars = args.optional_usize("max_chars", DEFAULT_BODY_CHARS, 20_000)?;
+    let doc = find_one_doc(config, &needle)?;
+    let (body, truncated) = truncate(&doc.body, max_chars);
+    Ok(JsonValue::object([
+        ("ok", true.into()),
+        ("item", doc.to_json_with_body(&body)),
+        ("truncated", truncated.into()),
+        ("provenance", provenance()),
+    ]))
+}
+
+fn memory_list(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&["limit", "tags"])?;
+    let limit = args.optional_usize("limit", DEFAULT_LIMIT, MAX_LIMIT)?;
+    let tags = args.optional_string_array("tags")?;
     match load_docs(config) {
-        Ok(docs) => {
-            let normalized = needle.strip_prefix("memory://note/").unwrap_or(needle);
-            let matches = docs
-                .into_iter()
-                .filter(|doc| {
-                    doc.id.to_string() == normalized
-                        || doc.path == normalized
-                        || doc.title.eq_ignore_ascii_case(normalized)
-                })
-                .collect::<Vec<_>>();
-            if matches.len() != 1 {
-                return error_payload("not_found", "expected exactly one matching memory note");
-            }
-            let (body, truncated) = truncate(&matches[0].body, max_chars);
-            JsonValue::object([
-                ("ok", true.into()),
-                ("item", matches[0].to_json_with_body(&body)),
-                ("truncated", truncated.into()),
-                ("provenance", provenance()),
-            ])
-        }
-        Err(error) => error_payload("db_query_failed", &error),
+        Ok(docs) => Ok(list_payload(filter_tags(docs, &tags), limit)),
+        Err(error) => Err(McpToolError::new("db_query_failed", error)),
     }
 }
 
-fn memory_list(config: &McpConfig, args: &JsonValue) -> JsonValue {
-    let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
-    let tags = arg_strings(args.get("tags"));
-    match load_docs(config) {
-        Ok(docs) => list_payload(filter_tags(docs, &tags), limit),
-        Err(error) => error_payload("db_query_failed", &error),
-    }
-}
-
-fn memory_search(config: &McpConfig, args: &JsonValue) -> JsonValue {
-    let Some(query) = args.get("query").and_then(JsonValue::as_str) else {
-        return error_payload("validation_error", "expected query");
-    };
+fn memory_search(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&[
+        "query",
+        "limit",
+        "tags",
+        "retrieval_mode",
+        "mode",
+        "retrieval",
+    ])?;
+    let query = args.required_string("query")?;
     let query = query.trim();
     if query.is_empty() {
-        return error_payload("validation_error", "expected non-empty query");
+        return Err(McpToolError::validation("expected non-empty query"));
     }
-    let limit = bounded_usize(args.get("limit"), DEFAULT_LIMIT, MAX_LIMIT);
-    let tags = arg_strings(args.get("tags"));
-    let retrieval_mode = match SearchRetrievalMode::from_args(args) {
-        Ok(mode) => mode,
-        Err(error) => return error_payload("validation_error", &error),
-    };
+    let limit = args.optional_usize("limit", DEFAULT_LIMIT, MAX_LIMIT)?;
+    let tags = args.optional_string_array("tags")?;
+    let retrieval_mode = SearchRetrievalMode::from_args(&args)?;
     if retrieval_mode.is_semantic() {
-        return SemanticSearchBackend::unconfigured().search(retrieval_mode, query, limit);
+        return Ok(SemanticSearchBackend::unconfigured().search(retrieval_mode, query, limit));
     }
     let search_query = SearchQuery::new(query);
     match load_search_docs(config, query, &tags) {
-        Ok((docs, structural_index, index_used)) => search_payload(
+        Ok((docs, structural_index, index_used)) => Ok(search_payload(
             query,
             score_search_docs(docs, &search_query, &tags, &structural_index),
             limit,
             index_used,
             structural_index.has_filesystem_graph_data(),
-        ),
-        Err(error) => error_payload("db_query_failed", &error),
+        )),
+        Err(error) => Err(McpToolError::new("db_query_failed", error)),
     }
 }
 
@@ -588,22 +1220,19 @@ enum SearchRetrievalMode {
 }
 
 impl SearchRetrievalMode {
-    fn from_args(args: &JsonValue) -> Result<Self, String> {
-        let Some(value) = args
-            .get("retrieval_mode")
-            .or_else(|| args.get("mode"))
-            .or_else(|| args.get("retrieval"))
+    fn from_args(args: &ToolArgs<'_>) -> Result<Self, McpToolError> {
+        let Some(mode) =
+            args.optional_string_alias(&["retrieval_mode", "mode", "retrieval"], "retrieval_mode")?
         else {
             return Ok(Self::Lexical);
-        };
-        let Some(mode) = value.as_str() else {
-            return Err("expected retrieval_mode to be lexical, semantic, or vector".to_owned());
         };
         match mode.trim().to_ascii_lowercase().as_str() {
             "" | "lexical" => Ok(Self::Lexical),
             "semantic" => Ok(Self::Semantic),
             "vector" => Ok(Self::Vector),
-            _ => Err("expected retrieval_mode to be lexical, semantic, or vector".to_owned()),
+            _ => Err(McpToolError::validation(
+                "expected retrieval_mode to be lexical, semantic, or vector",
+            )),
         }
     }
 
@@ -669,77 +1298,88 @@ fn semantic_unconfigured_payload(mode: SearchRetrievalMode, query: &str) -> Json
         ("provenance", provenance()),
         (
             "error",
-            JsonValue::object([
-                ("code", JsonValue::from("unconfigured")),
-                (
-                    "message",
-                    JsonValue::from(
-                        "semantic memory_search requires an explicitly configured local vector backend",
-                    ),
-                ),
-            ]),
+            McpToolError::new(
+                "unconfigured",
+                "semantic memory_search requires an explicitly configured local vector backend",
+            )
+            .error_object(),
         ),
     ])
 }
 
-fn memory_sync(config: &McpConfig) -> JsonValue {
+fn memory_sync(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&[])?;
     if config.read_only {
-        return error_payload("read_only", "memory_sync is disabled in read-only mode");
+        return Err(McpToolError::new(
+            "read_only",
+            "memory_sync is disabled in read-only mode",
+        ));
     }
     match sync_configured_root(config) {
-        Ok(report) => JsonValue::object([
+        Ok(report) => Ok(JsonValue::object([
             ("ok", true.into()),
             ("report", report_json(&report)),
             ("db_updated", true.into()),
-        ]),
-        Err(error) => error_payload("sync_failed", &error),
+        ])),
+        Err(error) => Err(McpToolError::new("sync_failed", error)),
     }
 }
 
-fn memory_add(config: &McpConfig, args: &JsonValue) -> JsonValue {
+fn memory_add(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
+    let args = ToolArgs::new(args)?;
+    args.reject_unknown(&["content", "title", "tags", "path_hint", "source"])?;
     if config.read_only {
-        return error_payload("read_only", "memory_add is disabled in read-only mode");
+        return Err(McpToolError::new(
+            "read_only",
+            "memory_add is disabled in read-only mode",
+        ));
     }
-    let Some(content) = args.get("content").and_then(JsonValue::as_str) else {
-        return error_payload("validation_error", "expected content");
-    };
+    let content = args.required_string("content")?;
     let session = match open_session(config) {
         Ok(session) => session,
-        Err(error) => return error_payload("db_open_failed", &error),
+        Err(error) => return Err(McpToolError::new("db_open_failed", error)),
     };
     let root = match resolve_markdown_root(config, Some(&session)) {
         Some(root) => root,
-        None => return error_payload("markdown_root_missing", "markdown root is not configured"),
+        None => {
+            return Err(McpToolError::new(
+                "markdown_root_missing",
+                "markdown root is not configured",
+            ));
+        }
     };
     let title = args
-        .get("title")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("Memory Note");
-    let path_hint = args.get("path_hint").and_then(JsonValue::as_str);
-    let relative_path = match safe_relative_path(title, path_hint) {
+        .optional_string("title")?
+        .unwrap_or_else(|| "Memory Note".to_owned());
+    let path_hint = args.optional_string("path_hint")?;
+    let relative_path = match safe_relative_path(&title, path_hint.as_deref()) {
         Ok(path) => path,
-        Err(error) => return error_payload("invalid_path", &error),
+        Err(error) => return Err(McpToolError::new("invalid_path", error)),
     };
     let note_path = root.join(&relative_path);
     if let Some(parent) = note_path.parent()
         && let Err(error) = fs::create_dir_all(parent)
     {
-        return error_payload("markdown_write_failed", &error.to_string());
+        return Err(McpToolError::new(
+            "markdown_write_failed",
+            error.to_string(),
+        ));
     }
     if let Err(error) = ensure_confined_write(&root, &note_path) {
-        return error_payload("invalid_path", &error);
+        return Err(McpToolError::new("invalid_path", error));
     }
-    let markdown = note_markdown(
-        content,
-        title,
-        &arg_strings(args.get("tags")),
-        args.get("source").and_then(JsonValue::as_str),
-    );
+    let tags = args.optional_string_array("tags")?;
+    let source = args.optional_string("source")?;
+    let markdown = note_markdown(&content, &title, &tags, source.as_deref());
     if let Err(error) = fs::write(&note_path, markdown) {
-        return error_payload("markdown_write_failed", &error.to_string());
+        return Err(McpToolError::new(
+            "markdown_write_failed",
+            error.to_string(),
+        ));
     }
     match sync_configured_root(config) {
-        Ok(report) => JsonValue::object([
+        Ok(report) => Ok(JsonValue::object([
             ("ok", true.into()),
             ("note_path", JsonValue::from(path_to_string(&relative_path))),
             (
@@ -749,20 +1389,17 @@ fn memory_add(config: &McpConfig, args: &JsonValue) -> JsonValue {
             ("sync_report", report_json(&report)),
             ("db_updated", true.into()),
             ("status", JsonValue::from("ok")),
-        ]),
-        Err(error) => JsonValue::object([
+        ])),
+        Err(error) => Ok(JsonValue::object([
             ("ok", false.into()),
             ("note_path", JsonValue::from(path_to_string(&relative_path))),
             ("db_updated", false.into()),
             ("status", JsonValue::from("markdown_written_sync_failed")),
             (
                 "error",
-                JsonValue::object([
-                    ("code", JsonValue::from("sync_failed")),
-                    ("message", JsonValue::from(error)),
-                ]),
+                McpToolError::new("sync_failed", error).error_object(),
             ),
-        ]),
+        ])),
     }
 }
 
@@ -805,6 +1442,95 @@ fn load_docs(config: &McpConfig) -> Result<Vec<MemoryDoc>, String> {
     load_docs_from_session(&mut session)
 }
 
+fn find_one_doc(config: &McpConfig, id_or_uri: &str) -> Result<MemoryDoc, McpToolError> {
+    let matches = find_docs_by_identity(config, id_or_uri)
+        .map_err(|error| McpToolError::new("db_query_failed", error))?;
+    if matches.len() == 1 {
+        Ok(matches.into_iter().next().expect("single match"))
+    } else {
+        Err(McpToolError::with_details(
+            "not_found",
+            "expected exactly one matching memory note",
+            JsonValue::object([
+                ("id_or_uri", JsonValue::from(id_or_uri.to_owned())),
+                ("matches", JsonValue::from(matches.len())),
+            ]),
+        ))
+    }
+}
+
+fn find_docs_by_identity(config: &McpConfig, id_or_uri: &str) -> Result<Vec<MemoryDoc>, String> {
+    let lookup = normalize_memory_lookup(id_or_uri);
+    let mut session = open_session(config)?;
+    let mut docs = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+
+    if let Ok(id) = lookup.parse::<i64>()
+        && id >= 0
+    {
+        extend_unique_docs(
+            &mut docs,
+            &mut seen_ids,
+            query_memory_docs(&mut session, &format!("WHERE id(d) = {id}"))?,
+        );
+    }
+
+    extend_unique_docs(
+        &mut docs,
+        &mut seen_ids,
+        query_memory_docs(
+            &mut session,
+            &format!("WHERE d.`src.path` = {}", cypher_string(&lookup)),
+        )?,
+    );
+    extend_unique_docs(
+        &mut docs,
+        &mut seen_ids,
+        query_memory_docs(
+            &mut session,
+            &format!("WHERE d.`md.title` = {}", cypher_string(&lookup)),
+        )?,
+    );
+
+    if !docs
+        .iter()
+        .any(|doc| doc.title.eq_ignore_ascii_case(&lookup))
+    {
+        let matching_title_ids = query_memory_doc_identities(&mut session)?
+            .into_iter()
+            .filter_map(|(id, title)| title.eq_ignore_ascii_case(&lookup).then_some(id))
+            .collect::<Vec<_>>();
+        for id in matching_title_ids {
+            extend_unique_docs(
+                &mut docs,
+                &mut seen_ids,
+                query_memory_docs(&mut session, &format!("WHERE id(d) = {id}"))?,
+            );
+        }
+    }
+
+    Ok(docs)
+}
+
+fn normalize_memory_lookup(id_or_uri: &str) -> String {
+    id_or_uri
+        .strip_prefix("memory://note/")
+        .unwrap_or(id_or_uri)
+        .to_owned()
+}
+
+fn extend_unique_docs(
+    docs: &mut Vec<MemoryDoc>,
+    seen_ids: &mut BTreeSet<i64>,
+    more: Vec<MemoryDoc>,
+) {
+    for doc in more {
+        if seen_ids.insert(doc.id) {
+            docs.push(doc);
+        }
+    }
+}
+
 fn load_search_docs(
     config: &McpConfig,
     query: &str,
@@ -840,6 +1566,39 @@ fn load_docs_from_session(session: &mut Session) -> Result<Vec<MemoryDoc>, Strin
         .map_err(|error| error.to_string())?
         .remove(0);
     Ok(result.rows.into_iter().map(MemoryDoc::from_row).collect())
+}
+
+fn query_memory_docs(session: &mut Session, where_clause: &str) -> Result<Vec<MemoryDoc>, String> {
+    let result = session
+        .execute_script(
+            &format!(
+                "MATCH (d:MarkdownDocument)
+                 {where_clause}
+                 RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
+                 ORDER BY d.`src.path`"
+            ),
+            &BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .remove(0);
+    Ok(result.rows.into_iter().map(MemoryDoc::from_row).collect())
+}
+
+fn query_memory_doc_identities(session: &mut Session) -> Result<Vec<(i64, String)>, String> {
+    let result = session
+        .execute_script(
+            "MATCH (d:MarkdownDocument)
+             RETURN id(d), d.`md.title`
+             ORDER BY d.`src.path`",
+            &BTreeMap::new(),
+        )
+        .map_err(|error| error.to_string())?
+        .remove(0);
+    Ok(result
+        .rows
+        .into_iter()
+        .map(|row| (int_at(&row, 0), string_at(&row, 1)))
+        .collect())
 }
 
 fn load_indexed_body_candidates(
@@ -1545,7 +2304,7 @@ fn safe_relative_path(title: &str, path_hint: Option<&str>) -> Result<PathBuf, S
         .unwrap_or_else(|| format!("{}.md", slug(title)));
     let path = PathBuf::from(raw);
     if path.is_absolute() {
-        return Err("absolute path_hint is not allowed".to_owned());
+        return Err("path_hint must stay under markdown root".to_owned());
     }
     if path.components().any(|component| {
         matches!(
@@ -1553,7 +2312,7 @@ fn safe_relative_path(title: &str, path_hint: Option<&str>) -> Result<PathBuf, S
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     }) {
-        return Err("path traversal is not allowed".to_owned());
+        return Err("path_hint must stay under markdown root".to_owned());
     }
     if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
         return Err("path_hint must end with .md".to_owned());
@@ -1571,7 +2330,7 @@ fn ensure_confined_write(root: &Path, note_path: &Path) -> Result<(), String> {
         .canonicalize()
         .map_err(|error| format!("cannot canonicalize note parent: {error}"))?;
     if !parent.starts_with(&root) {
-        return Err("path escapes markdown root".to_owned());
+        return Err("path_hint must stay under markdown root".to_owned());
     }
     Ok(())
 }
@@ -1635,45 +2394,6 @@ fn slug(input: &str) -> String {
     } else {
         output.to_owned()
     }
-}
-
-fn bounded_usize(value: Option<&JsonValue>, default: usize, max: usize) -> usize {
-    value
-        .and_then(JsonValue::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(default)
-        .min(max)
-}
-
-fn arg_strings(value: Option<&JsonValue>) -> Vec<String> {
-    value
-        .and_then(JsonValue::as_array)
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(JsonValue::as_str)
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn arg_i64s(value: Option<&JsonValue>) -> Vec<i64> {
-    match value {
-        Some(JsonValue::Array(values)) => values.iter().filter_map(JsonValue::as_i64).collect(),
-        Some(value) => value.as_i64().into_iter().collect(),
-        None => Vec::new(),
-    }
-}
-
-fn bounded_u8(value: Option<&JsonValue>, default: u8, max: u8) -> Result<u8, String> {
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    let Some(raw) = value.as_i64() else {
-        return Err("expected numeric value".to_owned());
-    };
-    if raw < 0 || raw > i64::from(max) {
-        return Err(format!("expected value between 0 and {max}"));
-    }
-    Ok(raw as u8)
 }
 
 fn truncate(input: &str, max_chars: usize) -> (String, bool) {

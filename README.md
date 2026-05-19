@@ -8,7 +8,7 @@ It provides MCP-first local memory tools for agents, plus interactive exploratio
 
 - Local-first graph database with file-backed `.cupld` stores
 - Pure Rust binary with no external runtime dependencies
-- MCP memory server with `memory_health`, `memory_search`, `memory_get`, `memory_context`, `memory_add`, and `memory_sync`
+- MCP memory server with `memory_health`, `memory_doctor`, `memory_search`, `memory_get`, `memory_context`, `memory_add`, and `memory_sync`
 - Interactive REPL plus scriptable `query`, `context`, `schema`, and `check` commands
 - Stable JSON and NDJSON envelopes for `query` and `context` automation
 - Markdown sync, optional watch mode, and bundled `cupld-md-memory` skill bootstrap
@@ -55,7 +55,7 @@ cupld install --mcp --target codex --scope cwd --dry-run --db default
 cupld mcp serve --db default
 ```
 
-Then call `memory_health`, use `memory_search`/`memory_get` for routine reads, `memory_context` to expand a search result into bounded graph context, `memory_add` when the user asks you to remember something, and `memory_sync` after direct markdown edits. MCP reads are DB-backed and do not run hidden markdown syncs.
+Then call `memory_health` and `memory_doctor`, use `memory_search`/`memory_get` for routine reads, `memory_context` to expand a search result into bounded graph context, `memory_add` when the user asks you to remember something, and `memory_sync` after direct markdown edits. MCP reads are DB-backed and do not run hidden markdown syncs. Harnesses should treat the `uri` returned by `memory_search` as the durable identity for follow-up `memory_get` and `memory_context` calls.
 
 Start an in-memory REPL for human exploration:
 

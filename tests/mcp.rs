@@ -34,6 +34,117 @@ fn protocol_lists_memory_tools_and_resources() {
 }
 
 #[test]
+fn protocol_lists_agent_harness_tool_set_including_memory_doctor() {
+    let db = TestDb::new("mcp_protocol_harness_tool_set");
+    let root = temp_dir("mcp_protocol_harness_tool_set");
+    fs::create_dir_all(&root).unwrap();
+    let config = config(db.path(), &root, false);
+
+    let tools = rpc(&config, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let tool_names = tools
+        .get("result")
+        .and_then(|result| result.get("tools"))
+        .and_then(JsonValue::as_array)
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool.get("name").and_then(JsonValue::as_str).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        tool_names,
+        vec![
+            "memory_health",
+            "memory_get",
+            "memory_list",
+            "memory_search",
+            "memory_context",
+            "memory_sync",
+            "memory_add",
+            "memory_doctor",
+        ],
+        "Agent Harness Reliability V2 expects memory_doctor to be advertised as the final harness diagnostic tool"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn protocol_lists_structured_input_schemas_for_agent_harness_tools() {
+    let db = TestDb::new("mcp_protocol_structured_schemas");
+    let root = temp_dir("mcp_protocol_structured_schemas");
+    fs::create_dir_all(&root).unwrap();
+    let config = config(db.path(), &root, false);
+
+    let tools = rpc(&config, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let schema_cases = [
+        ("memory_health", &[][..]),
+        ("memory_get", &["id_or_uri", "max_chars"][..]),
+        ("memory_list", &["limit", "tags"][..]),
+        (
+            "memory_search",
+            &[
+                "query",
+                "limit",
+                "tags",
+                "retrieval_mode",
+                "mode",
+                "retrieval",
+            ][..],
+        ),
+        (
+            "memory_context",
+            &[
+                "id_or_uri",
+                "path",
+                "paths",
+                "node",
+                "nodes",
+                "depth",
+                "direction",
+                "edge_types",
+                "labels",
+                "max_nodes",
+                "max_edges",
+            ][..],
+        ),
+        ("memory_sync", &[][..]),
+        (
+            "memory_add",
+            &["title", "tags", "path_hint", "content", "source"][..],
+        ),
+    ];
+
+    for (tool_name, expected_properties) in schema_cases {
+        let tool = tool_definition(&tools, tool_name);
+        let schema = tool.get("inputSchema").expect("inputSchema");
+        assert_eq!(
+            schema.get("type").and_then(JsonValue::as_str),
+            Some("object"),
+            "{tool_name} should advertise an object input schema"
+        );
+        let properties = schema
+            .get("properties")
+            .and_then(JsonValue::as_object)
+            .unwrap_or_else(|| panic!("{tool_name} should advertise structured properties"));
+        for property in expected_properties {
+            assert!(
+                properties.iter().any(|(name, _)| name == property),
+                "{tool_name} inputSchema is missing expected property {property}"
+            );
+        }
+        assert_eq!(
+            schema
+                .get("additionalProperties")
+                .and_then(JsonValue::as_bool),
+            Some(false),
+            "{tool_name} schema should reject misspelled harness arguments"
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_health_reports_harness_readiness() {
     let db = TestDb::new("mcp_health");
     let root = temp_dir("mcp_health");
@@ -69,7 +180,217 @@ fn memory_health_reports_harness_readiness() {
         Some("read_only")
     );
 
+    let config_resource = rpc(
+        &writable,
+        r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"memory://config"}}"#,
+    );
+    let config_payload = resource_payload(&config_resource);
+    assert_eq!(
+        config_payload
+            .get("write_status")
+            .and_then(JsonValue::as_str),
+        Some("ready")
+    );
+    assert_eq!(
+        config_payload
+            .get("sync_visibility")
+            .and_then(JsonValue::as_str),
+        Some(
+            "MCP reads are DB-backed; run memory_sync after markdown changes before memory_search or memory_get can see them."
+        )
+    );
+
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_doctor_reports_harness_readiness_and_remediation() {
+    let db = TestDb::new("mcp_memory_doctor");
+    let root = temp_dir("mcp_memory_doctor");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("synced.md"), "# Synced\n\nVisible").unwrap();
+    sync_root(db.path(), &root);
+    fs::write(root.join("unsynced.md"), "# Unsynced\n\nNot yet synced").unwrap();
+
+    let config = config(db.path(), &root, false);
+    let payload = tool_payload(&call(&config, "memory_doctor", "{}"));
+    let text = json_text(&payload);
+
+    assert_eq!(payload.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert!(
+        matches!(
+            payload.get("status").and_then(JsonValue::as_str),
+            Some("pass" | "warn")
+        ),
+        "memory_doctor should use pass/warn/fail status semantics: {text}"
+    );
+    assert!(
+        text.contains(r#""tool":"memory_doctor""#),
+        "memory_doctor should identify itself in the diagnostic payload: {text}"
+    );
+    assert!(
+        text.contains("MCP reads are DB-backed"),
+        "memory_doctor should explain the sync visibility rule: {text}"
+    );
+    assert!(
+        text.contains("memory_sync"),
+        "memory_doctor should point agents to memory_sync when markdown may be stale: {text}"
+    );
+    assert!(
+        payload
+            .get("checks")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|checks| !checks.is_empty()),
+        "memory_doctor should return structured checks: {text}"
+    );
+    assert!(
+        payload
+            .get("next_actions")
+            .and_then(JsonValue::as_array)
+            .is_some(),
+        "memory_doctor should return machine-readable next_actions: {text}"
+    );
+    assert_eq!(
+        payload.get("diagnostic_mode").and_then(JsonValue::as_str),
+        Some("light")
+    );
+    assert!(payload.get("storage").is_none());
+
+    let deep_payload = tool_payload(&call(&config, "memory_doctor", r#"{"deep":true}"#));
+    assert_eq!(
+        deep_payload
+            .get("diagnostic_mode")
+            .and_then(JsonValue::as_str),
+        Some("deep")
+    );
+    assert_eq!(
+        deep_payload
+            .get("storage")
+            .and_then(|storage| storage.get("recovered_tail"))
+            .and_then(JsonValue::as_bool),
+        Some(false)
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_doctor_reports_read_only_missing_root_fail_and_does_not_mutate() {
+    let db = TestDb::new("mcp_memory_doctor_states");
+    let root = temp_dir("mcp_memory_doctor_states");
+    fs::create_dir_all(&root).unwrap();
+
+    let read_only_payload = tool_payload(&call(
+        &config(db.path(), &root, true),
+        "memory_doctor",
+        "{}",
+    ));
+    assert_eq!(
+        read_only_payload.get("status").and_then(JsonValue::as_str),
+        Some("pass")
+    );
+    assert_eq!(
+        read_only_payload
+            .get("server")
+            .and_then(|server| server.get("read_only"))
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        read_only_payload
+            .get("server")
+            .and_then(|server| server.get("write_status"))
+            .and_then(JsonValue::as_str),
+        Some("read_only")
+    );
+
+    let missing_root = temp_dir("mcp_memory_doctor_missing_root");
+    let missing_root_payload = tool_payload(&call(
+        &config(db.path(), &missing_root, false),
+        "memory_doctor",
+        "{}",
+    ));
+    assert_eq!(
+        missing_root_payload
+            .get("status")
+            .and_then(JsonValue::as_str),
+        Some("warn")
+    );
+    assert_eq!(
+        missing_root_payload
+            .get("markdown_root")
+            .and_then(|root| root.get("exists"))
+            .and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        missing_root_payload
+            .get("server")
+            .and_then(|server| server.get("write_status"))
+            .and_then(JsonValue::as_str),
+        Some("markdown_root_missing")
+    );
+    assert!(
+        !missing_root.exists(),
+        "memory_doctor must not create a missing markdown root"
+    );
+
+    let unsynced_path = root.join("unsynced.md");
+    fs::write(&unsynced_path, "# Unsynced\n\nDoctor should not sync this.").unwrap();
+    let before = fs::metadata(db.path()).unwrap().modified().unwrap();
+    let doctor_payload = tool_payload(&call(
+        &config(db.path(), &root, false),
+        "memory_doctor",
+        "{}",
+    ));
+    assert_eq!(
+        doctor_payload.get("ok").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    let search_payload = tool_payload(&call(
+        &config(db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"Doctor should not sync this"}"#,
+    ));
+    assert_eq!(
+        search_payload
+            .get("items")
+            .and_then(JsonValue::as_array)
+            .expect("items")
+            .len(),
+        0,
+        "memory_doctor must not sync unsynced markdown into DB-backed reads"
+    );
+    assert_eq!(
+        fs::metadata(db.path()).unwrap().modified().unwrap(),
+        before,
+        "memory_doctor must not write the DB file"
+    );
+
+    let missing_db_root = temp_dir("mcp_memory_doctor_missing_db_root");
+    fs::create_dir_all(&missing_db_root).unwrap();
+    let missing_db = missing_db_root.join("missing.cupld");
+    let fail_config = McpConfig {
+        db_path: missing_db.clone(),
+        root_override: Some(root.clone()),
+        read_only: false,
+    };
+    let fail_payload = tool_payload(&call(&fail_config, "memory_doctor", "{}"));
+    assert_eq!(
+        fail_payload.get("ok").and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        fail_payload.get("status").and_then(JsonValue::as_str),
+        Some("fail")
+    );
+    assert!(
+        !missing_db.exists(),
+        "memory_doctor must not create a missing database"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(missing_db_root).unwrap();
 }
 
 #[test]
@@ -86,6 +407,143 @@ fn protocol_reports_malformed_json_and_unknown_methods() {
         r#"{"jsonrpc":"2.0","id":3,"method":"unknown/method"}"#,
     );
     assert!(json_text(&unknown).contains("method_not_found"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_tools_return_table_driven_validation_errors() {
+    let db = TestDb::new("mcp_validation_matrix");
+    let root = temp_dir("mcp_validation_matrix");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Needle\n\nBody").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let cases = [
+        ("memory_get", "{}", "validation_error", "expected id_or_uri"),
+        (
+            "memory_context",
+            "{}",
+            "validation_error",
+            "expected node, nodes, path, paths, or id_or_uri",
+        ),
+        (
+            "memory_context",
+            r#"{"path":"note.md","direction":"sideways"}"#,
+            "validation_error",
+            "expected direction to be in, out, or both",
+        ),
+        (
+            "memory_context",
+            r#"{"path":"missing.md"}"#,
+            "context_seed_path_not_found",
+            "path seed `missing.md` was not found",
+        ),
+        (
+            "memory_context",
+            r#"{"node":-1}"#,
+            "validation_error",
+            "expected node to be a non-negative integer",
+        ),
+        (
+            "memory_context",
+            r#"{"nodes":[1,"bad"]}"#,
+            "validation_error",
+            "expected nodes entries to be integers",
+        ),
+        (
+            "memory_context",
+            r#"{"path":"note.md","max_nodes":0}"#,
+            "validation_error",
+            "expected max_nodes between 1 and 250",
+        ),
+        ("memory_search", "{}", "validation_error", "expected query"),
+        (
+            "memory_search",
+            r#"{"query":123}"#,
+            "validation_error",
+            "expected query",
+        ),
+        (
+            "memory_search",
+            r#"{"query":"   "}"#,
+            "validation_error",
+            "expected non-empty query",
+        ),
+        (
+            "memory_search",
+            r#"{"query":"Needle","limit":0}"#,
+            "validation_error",
+            "expected limit between 1 and 50",
+        ),
+        (
+            "memory_search",
+            r#"{"query":"Needle","tags":"keep"}"#,
+            "validation_error",
+            "expected tags to be an array of strings",
+        ),
+        (
+            "memory_search",
+            r#"{"query":"Needle","tags":[1]}"#,
+            "validation_error",
+            "expected tags entries to be strings",
+        ),
+        (
+            "memory_search",
+            r#"{"query":"Needle","retrieval_mode":"remote"}"#,
+            "validation_error",
+            "expected retrieval_mode to be lexical, semantic, or vector",
+        ),
+        (
+            "memory_get",
+            r#"{"id_or_uri":"note.md","max_chars":"lots"}"#,
+            "validation_error",
+            "expected max_chars",
+        ),
+        (
+            "memory_doctor",
+            r#"{"deep":"yes"}"#,
+            "validation_error",
+            "expected deep",
+        ),
+        (
+            "memory_health",
+            r#"{"typo":true}"#,
+            "validation_error",
+            "unexpected argument typo",
+        ),
+        ("memory_add", "{}", "validation_error", "expected content"),
+        (
+            "memory_add",
+            r#"{"content":"Nope","path_hint":"../escape.md"}"#,
+            "invalid_path",
+            "must stay under markdown root",
+        ),
+    ];
+
+    for (tool, args, expected_code, expected_message) in cases {
+        let response = call(&config, tool, args);
+        let payload = tool_payload(&response);
+        assert_eq!(
+            payload
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(JsonValue::as_str),
+            Some(expected_code),
+            "{tool} with {args} should return {expected_code}: {}",
+            json_text(&payload)
+        );
+        assert!(
+            payload
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(JsonValue::as_str)
+                .is_some_and(|message| message.contains(expected_message)),
+            "{tool} with {args} should include message {expected_message}: {}",
+            json_text(&payload)
+        );
+    }
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -229,6 +687,223 @@ fn memory_context_expands_from_memory_uri_without_shelling_out() {
     );
     assert!(json_text(&payload).contains("notes/seed.md"));
     assert!(json_text(&payload).contains("notes/neighbor.md"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_result_uri_is_identity_for_get_and_context() {
+    let db = TestDb::new("mcp_search_context_identity");
+    let root = temp_dir("mcp_search_context_identity");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/seed.md"),
+        "# Needle Seed\n\nIdentity anchor links to [[neighbor]].",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/neighbor.md"),
+        "# Neighbor\n\nBounded context should include this note.",
+    )
+    .unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+    let search_payload = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Needle Seed","limit":1}"#,
+    ));
+    let first = search_payload
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .and_then(|items| items.first())
+        .expect("search item");
+    let uri = first
+        .get("uri")
+        .and_then(JsonValue::as_str)
+        .expect("search result uri");
+    assert_eq!(
+        first.get("path").and_then(JsonValue::as_str),
+        Some("notes/seed.md")
+    );
+    assert_eq!(uri, "memory://note/notes/seed.md");
+
+    let get_payload = tool_payload(&call(
+        &config,
+        "memory_get",
+        &format!(r#"{{"id_or_uri":"{uri}"}}"#),
+    ));
+    assert_eq!(
+        get_payload
+            .get("item")
+            .and_then(|item| item.get("path"))
+            .and_then(JsonValue::as_str),
+        Some("notes/seed.md")
+    );
+    assert!(
+        json_text(&get_payload).contains("Identity anchor"),
+        "{}",
+        json_text(&get_payload)
+    );
+
+    let context_payload = tool_payload(&call(
+        &config,
+        "memory_context",
+        &format!(r#"{{"id_or_uri":"{uri}","depth":1,"max_nodes":10,"max_edges":10}}"#),
+    ));
+    assert_eq!(
+        context_payload.get("ok").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    let context_text = json_text(&context_payload);
+    assert!(context_text.contains("notes/seed.md"), "{context_text}");
+    assert!(context_text.contains("notes/neighbor.md"), "{context_text}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_context_id_or_uri_uses_same_title_resolution_as_memory_get() {
+    let db = TestDb::new("mcp_context_title_identity");
+    let root = temp_dir("mcp_context_title_identity");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/seed.md"),
+        "# Shared Identity\n\nTitle lookup links to [[neighbor]].",
+    )
+    .unwrap();
+    fs::write(root.join("notes/neighbor.md"), "# Neighbor\n\nNearby").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, true);
+    let get_payload = tool_payload(&call(
+        &config,
+        "memory_get",
+        r#"{"id_or_uri":"shared identity"}"#,
+    ));
+    assert_eq!(
+        get_payload
+            .get("item")
+            .and_then(|item| item.get("path"))
+            .and_then(JsonValue::as_str),
+        Some("notes/seed.md")
+    );
+
+    let context_payload = tool_payload(&call(
+        &config,
+        "memory_context",
+        r#"{"id_or_uri":"shared identity","depth":1,"max_nodes":10,"max_edges":10}"#,
+    ));
+    assert_eq!(
+        context_payload.get("ok").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    let context_text = json_text(&context_payload);
+    assert!(context_text.contains("notes/seed.md"), "{context_text}");
+    assert!(context_text.contains("notes/neighbor.md"), "{context_text}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_harness_smoke_flow_uses_mcp_memory_end_to_end() {
+    let db = TestDb::new("mcp_agent_harness_smoke");
+    let root = temp_dir("mcp_agent_harness_smoke");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/source.md"),
+        "# Harbor Plan\n\n[[detail]] is the current implementation note.",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/detail.md"),
+        "# Detail\n\nHarness smoke retrieval target.",
+    )
+    .unwrap();
+
+    let config = config(db.path(), &root, false);
+    let health = tool_payload(&call(&config, "memory_health", "{}"));
+    assert_eq!(health.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        health.get("safe_for_writes").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+
+    let pre_sync_search = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Harness smoke retrieval target"}"#,
+    ));
+    assert_eq!(
+        pre_sync_search
+            .get("items")
+            .and_then(JsonValue::as_array)
+            .expect("items")
+            .len(),
+        0,
+        "MCP reads must stay DB-backed before explicit sync"
+    );
+
+    let sync = tool_payload(&call(&config, "memory_sync", "{}"));
+    assert_eq!(sync.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        sync.get("db_updated").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+
+    let search = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Harness smoke retrieval target","limit":5}"#,
+    ));
+    assert_eq!(result_paths(&search), vec!["notes/detail.md"]);
+    let uri = search
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("uri"))
+        .and_then(JsonValue::as_str)
+        .expect("search result uri")
+        .to_owned();
+
+    let get = tool_payload(&call(
+        &config,
+        "memory_get",
+        &format!(r#"{{"id_or_uri":"{uri}","max_chars":200}}"#),
+    ));
+    assert_eq!(
+        get.get("item")
+            .and_then(|item| item.get("path"))
+            .and_then(JsonValue::as_str),
+        Some("notes/detail.md")
+    );
+
+    let context = tool_payload(&call(
+        &config,
+        "memory_context",
+        r#"{"path":"notes/source.md","depth":1,"max_nodes":10,"max_edges":10}"#,
+    ));
+    let context_text = json_text(&context);
+    assert!(context_text.contains("notes/source.md"), "{context_text}");
+    assert!(context_text.contains("notes/detail.md"), "{context_text}");
+
+    let add = tool_payload(&call(
+        &config,
+        "memory_add",
+        r#"{"title":"Smoke Follow Up","tags":["harness"],"path_hint":"notes/follow-up.md","content":"Remember the harness smoke flow."}"#,
+    ));
+    assert_eq!(add.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        add.get("uri").and_then(JsonValue::as_str),
+        Some("memory://note/notes/follow-up.md")
+    );
+    let added = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"harness smoke flow","tags":["harness"],"limit":5}"#,
+    ));
+    assert_eq!(result_paths(&added), vec!["notes/follow-up.md"]);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -978,6 +1653,29 @@ fn tool_text(value: &JsonValue) -> String {
 
 fn tool_payload(value: &JsonValue) -> JsonValue {
     json::parse(&tool_text(value)).unwrap()
+}
+
+fn resource_payload(value: &JsonValue) -> JsonValue {
+    let text = value
+        .get("result")
+        .and_then(|result| result.get("contents"))
+        .and_then(JsonValue::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(JsonValue::as_str)
+        .unwrap();
+    json::parse(text).unwrap()
+}
+
+fn tool_definition<'a>(tools_response: &'a JsonValue, name: &str) -> &'a JsonValue {
+    tools_response
+        .get("result")
+        .and_then(|result| result.get("tools"))
+        .and_then(JsonValue::as_array)
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool.get("name").and_then(JsonValue::as_str) == Some(name))
+        .unwrap_or_else(|| panic!("missing tool definition for {name}"))
 }
 
 fn item_paths(payload: &JsonValue) -> Vec<&str> {
