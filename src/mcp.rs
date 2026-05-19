@@ -813,7 +813,8 @@ fn load_search_docs(
     let mut session = open_session(config)?;
     let indexes = markdown_search_indexes(&session);
     let structural_index = load_structural_index(&mut session)?;
-    if tags.is_empty() && indexes.body_fulltext {
+    let search_query = SearchQuery::new(query);
+    if tags.is_empty() && indexes.body_fulltext && search_query.terms.len() == 1 {
         let (docs, index_used) = load_indexed_body_candidates(&mut session, query)?;
         return Ok((docs, structural_index, index_used));
     }

@@ -367,6 +367,90 @@ fn memory_search_uses_markdown_indexes_without_changing_ranked_results() {
 }
 
 #[test]
+fn memory_search_multi_term_body_query_matches_with_or_without_indexes() {
+    let fallback_db = TestDb::new("mcp_search_multi_term_fallback_candidates");
+    let indexed_db = TestDb::new("mcp_search_multi_term_indexed_candidates");
+    let root = temp_dir("mcp_search_multi_term_indexed_candidates");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/body.md"),
+        "# Body Match\n\nBerth assignments are reviewed before the annual report.",
+    )
+    .unwrap();
+    fs::write(
+        root.join("notes/weak.md"),
+        "# Weak Match\n\nBerth assignments are reviewed weekly.",
+    )
+    .unwrap();
+    fs::write(root.join("notes/other.md"), "# Other\n\nNo match").unwrap();
+    sync_root(fallback_db.path(), &root);
+    sync_root(indexed_db.path(), &root);
+    create_markdown_search_indexes(indexed_db.path());
+
+    let fallback = tool_payload(&call(
+        &config(fallback_db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"berth annual","limit":10}"#,
+    ));
+    let indexed = tool_payload(&call(
+        &config(indexed_db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"berth annual","limit":10}"#,
+    ));
+
+    assert_eq!(
+        indexed
+            .get("retrieval")
+            .and_then(|retrieval| retrieval.get("index_used"))
+            .and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(result_paths(&fallback), result_paths(&indexed));
+    assert_eq!(result_scores(&fallback), result_scores(&indexed));
+    assert_eq!(
+        result_paths(&indexed),
+        vec!["notes/body.md".to_owned(), "notes/weak.md".to_owned(),]
+    );
+    assert_eq!(result_scores(&indexed), vec![300, 301]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_search_multi_term_cross_field_query_matches_with_or_without_indexes() {
+    let fallback_db = TestDb::new("mcp_search_cross_field_fallback_candidates");
+    let indexed_db = TestDb::new("mcp_search_cross_field_indexed_candidates");
+    let root = temp_dir("mcp_search_cross_field_indexed_candidates");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/berth.md"),
+        "# Berth Schedule\n\nThe annual report is ready.",
+    )
+    .unwrap();
+    fs::write(root.join("notes/other.md"), "# Other\n\nNo match").unwrap();
+    sync_root(fallback_db.path(), &root);
+    sync_root(indexed_db.path(), &root);
+    create_markdown_search_indexes(indexed_db.path());
+
+    let fallback = tool_payload(&call(
+        &config(fallback_db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"berth annual","limit":10}"#,
+    ));
+    let indexed = tool_payload(&call(
+        &config(indexed_db.path(), &root, false),
+        "memory_search",
+        r#"{"query":"berth annual","limit":10}"#,
+    ));
+
+    assert_eq!(result_paths(&fallback), result_paths(&indexed));
+    assert_eq!(result_scores(&fallback), result_scores(&indexed));
+    assert_eq!(result_paths(&indexed), vec!["notes/berth.md".to_owned()]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_search_rejects_missing_and_blank_queries() {
     let db = TestDb::new("mcp_search_validation");
     let root = temp_dir("mcp_search_validation");
