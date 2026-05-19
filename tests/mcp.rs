@@ -22,12 +22,52 @@ fn protocol_lists_memory_tools_and_resources() {
 
     let tools = rpc(&config, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
     assert!(json_text(&tools).contains("memory_search"));
+    assert!(json_text(&tools).contains("memory_context"));
 
     let resources = rpc(
         &config,
         r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#,
     );
     assert!(json_text(&resources).contains("memory://index"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_health_reports_harness_readiness() {
+    let db = TestDb::new("mcp_health");
+    let root = temp_dir("mcp_health");
+    fs::create_dir_all(&root).unwrap();
+    let writable = config(db.path(), &root, false);
+
+    let payload = tool_payload(&call(&writable, "memory_health", "{}"));
+    assert_eq!(payload.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        payload
+            .get("markdown_root_exists")
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.get("safe_for_writes").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.get("write_status").and_then(JsonValue::as_str),
+        Some("ready")
+    );
+    assert!(json_text(&payload).contains("MCP reads are DB-backed"));
+
+    let read_only = config(db.path(), &root, true);
+    let payload = tool_payload(&call(&read_only, "memory_health", "{}"));
+    assert_eq!(
+        payload.get("safe_for_writes").and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        payload.get("write_status").and_then(JsonValue::as_str),
+        Some("read_only")
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -158,6 +198,37 @@ fn memory_search_exposes_retrieval_contract_metadata() {
     assert!(json_text(second).contains(r#""truncated":true"#));
     assert!(json_text(second).contains(r#""max_chars":500"#));
     assert!(json_text(second).contains(r#""source":"body""#));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_context_expands_from_memory_uri_without_shelling_out() {
+    let db = TestDb::new("mcp_context");
+    let root = temp_dir("mcp_context");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    fs::write(
+        root.join("notes/seed.md"),
+        "# Seed\n\n[[neighbor]] linked context",
+    )
+    .unwrap();
+    fs::write(root.join("notes/neighbor.md"), "# Neighbor\n\nNearby").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, true);
+    let response = call(
+        &config,
+        "memory_context",
+        r#"{"id_or_uri":"memory://note/notes/seed.md","depth":1,"max_nodes":10,"max_edges":10}"#,
+    );
+    let payload = tool_payload(&response);
+    assert_eq!(payload.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(
+        payload.get("command").and_then(JsonValue::as_str),
+        Some("context")
+    );
+    assert!(json_text(&payload).contains("notes/seed.md"));
+    assert!(json_text(&payload).contains("notes/neighbor.md"));
 
     fs::remove_dir_all(root).unwrap();
 }

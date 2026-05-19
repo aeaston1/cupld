@@ -3030,6 +3030,35 @@ fn cli_db_command_stays_silent_when_latest_release_check_fails() {
     assert!(!stderr.contains("A newer cupld release is available"));
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_mcp_serve_skips_release_upgrade_check() {
+    let workspace = TempDir::new("cli_mcp_upgrade_hint_workspace");
+    seed_workspace_default_db(workspace.path());
+    let curl_dir = TempDir::new("cli_mcp_upgrade_hint_curl");
+    write_fake_curl(
+        curl_dir.path(),
+        r#"{"tag_name":"v99.0.0","html_url":"https://github.com/aeaston1/cupld/releases/tag/v99.0.0"}"#,
+        0,
+    );
+    let path = curl_dir.path().to_str().unwrap();
+
+    let output = run_cli_with_env_in_dir(
+        &["mcp", "serve", "--db", "default"],
+        "",
+        Some(workspace.path()),
+        &[("CUPLD_NO_UPGRADE_CHECK", "0"), ("PATH", path)],
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("A newer cupld release is available"));
+}
+
 #[test]
 fn cli_visualise_requires_interactive_terminal() {
     let db = TestDb::new("cli_visualise_tty");

@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::context::{ContextDirection, ContextRequest, ContextSeedRequest, context_as_json};
 use crate::json::{self, JsonValue};
 use crate::package::WorkspacePackage;
 use crate::runtime::{RuntimeValue, Session};
@@ -181,6 +182,10 @@ fn tool_definitions() -> Vec<JsonValue> {
             "Deterministically search DB-backed memory notes with local lexical matching.",
         ),
         (
+            "memory_context",
+            "Expand from memory search hits or explicit seeds into bounded DB-backed graph context.",
+        ),
+        (
             "memory_sync",
             "Sync configured markdown memory into the cupld DB.",
         ),
@@ -233,6 +238,7 @@ fn call_tool(config: &McpConfig, params: &JsonValue) -> JsonValue {
         "memory_get" => memory_get(config, args),
         "memory_list" => memory_list(config, args),
         "memory_search" => memory_search(config, args),
+        "memory_context" => memory_context(config, args),
         "memory_sync" => memory_sync(config),
         "memory_add" => memory_add(config, args),
         _ => error_payload("unknown_tool", "unknown memory tool"),
@@ -284,14 +290,34 @@ fn memory_health(config: &McpConfig) -> JsonValue {
     match open_session(config) {
         Ok(session) => {
             let root = resolve_markdown_root(config, Some(&session));
+            let root_exists = root.as_ref().is_some_and(|path| path.exists());
             JsonValue::object([
                 ("ok", true.into()),
                 ("db_path", path_json(&config.db_path)),
+                ("db_exists", config.db_path.exists().into()),
                 (
                     "markdown_root",
-                    root.map(path_json).unwrap_or(JsonValue::Null),
+                    root.as_ref().map(path_json).unwrap_or(JsonValue::Null),
                 ),
+                ("markdown_root_exists", root_exists.into()),
                 ("read_only", config.read_only.into()),
+                ("safe_for_writes", (!config.read_only && root_exists).into()),
+                (
+                    "write_status",
+                    JsonValue::from(if config.read_only {
+                        "read_only"
+                    } else if root_exists {
+                        "ready"
+                    } else {
+                        "markdown_root_missing"
+                    }),
+                ),
+                (
+                    "sync_visibility",
+                    JsonValue::from(
+                        "MCP reads are DB-backed; run memory_sync after markdown changes before memory_search or memory_get can see them.",
+                    ),
+                ),
                 (
                     "db_last_tx_id",
                     JsonValue::from(session.transaction_info().last_tx_id),
@@ -299,6 +325,90 @@ fn memory_health(config: &McpConfig) -> JsonValue {
             ])
         }
         Err(error) => error_payload("db_open_failed", &error),
+    }
+}
+
+fn memory_context(config: &McpConfig, args: &JsonValue) -> JsonValue {
+    let mut seeds = Vec::new();
+    for node in arg_i64s(args.get("nodes")) {
+        if node < 0 {
+            return error_payload("validation_error", "expected non-negative node ids");
+        }
+        seeds.push(ContextSeedRequest::Node(node as usize));
+    }
+    for path in arg_strings(args.get("paths")) {
+        seeds.push(ContextSeedRequest::Path(path));
+    }
+    if let Some(node) = args.get("node").and_then(JsonValue::as_i64) {
+        if node < 0 {
+            return error_payload("validation_error", "expected non-negative node id");
+        }
+        seeds.push(ContextSeedRequest::Node(node as usize));
+    }
+    if let Some(path) = args.get("path").and_then(JsonValue::as_str) {
+        seeds.push(ContextSeedRequest::Path(path.to_owned()));
+    }
+    if let Some(uri) = args.get("id_or_uri").and_then(JsonValue::as_str) {
+        seeds.push(ContextSeedRequest::Path(
+            uri.strip_prefix("memory://note/").unwrap_or(uri).to_owned(),
+        ));
+    }
+    if seeds.is_empty() {
+        return error_payload(
+            "validation_error",
+            "expected node, nodes, path, paths, or id_or_uri",
+        );
+    }
+
+    let depth = match bounded_u8(args.get("depth"), 1, crate::MAX_TRAVERSAL_DEPTH) {
+        Ok(depth) => depth,
+        Err(error) => return error_payload("validation_error", &error),
+    };
+    let direction = match args
+        .get("direction")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("both")
+        .trim()
+    {
+        "in" => ContextDirection::In,
+        "out" => ContextDirection::Out,
+        "both" | "" => ContextDirection::Both,
+        _ => {
+            return error_payload(
+                "validation_error",
+                "expected direction to be in, out, or both",
+            );
+        }
+    };
+    let request = ContextRequest {
+        db_path: config.db_path.clone(),
+        nodes: seeds
+            .iter()
+            .filter_map(|seed| match seed {
+                ContextSeedRequest::Node(node) => Some(*node),
+                ContextSeedRequest::Path(_) => None,
+            })
+            .collect(),
+        paths: seeds
+            .iter()
+            .filter_map(|seed| match seed {
+                ContextSeedRequest::Node(_) => None,
+                ContextSeedRequest::Path(path) => Some(path.clone()),
+            })
+            .collect(),
+        seeds,
+        depth,
+        direction,
+        edge_types: arg_strings(args.get("edge_types")),
+        labels: arg_strings(args.get("labels")),
+        max_nodes: bounded_usize(args.get("max_nodes"), 25, 250),
+        max_edges: bounded_usize(args.get("max_edges"), 100, 1_000),
+    };
+    match request.run() {
+        Ok(envelope) => json::parse(&context_as_json(&envelope)).unwrap_or_else(|error| {
+            error_payload("context_serialization_failed", &error.to_string())
+        }),
+        Err(error) => error_payload("context_failed", &error.to_string()),
     }
 }
 
@@ -1542,6 +1652,27 @@ fn arg_strings(value: Option<&JsonValue>) -> Vec<String> {
         .filter_map(JsonValue::as_str)
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn arg_i64s(value: Option<&JsonValue>) -> Vec<i64> {
+    match value {
+        Some(JsonValue::Array(values)) => values.iter().filter_map(JsonValue::as_i64).collect(),
+        Some(value) => value.as_i64().into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+fn bounded_u8(value: Option<&JsonValue>, default: u8, max: u8) -> Result<u8, String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let Some(raw) = value.as_i64() else {
+        return Err("expected numeric value".to_owned());
+    };
+    if raw < 0 || raw > i64::from(max) {
+        return Err(format!("expected value between 0 and {max}"));
+    }
+    Ok(raw as u8)
 }
 
 fn truncate(input: &str, max_chars: usize) -> (String, bool) {
