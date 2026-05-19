@@ -1781,8 +1781,8 @@ impl CliCommand {
             | Self::Check { db_path: path }
             | Self::Upgrade { db_path: path }
             | Self::SyncMarkdown { db_path: path, .. }
-            | Self::SourceSetRoot { db_path: path, .. }
-            | Self::McpServe { db_path: path, .. } => Some(path),
+            | Self::SourceSetRoot { db_path: path, .. } => Some(path),
+            Self::McpServe { .. } => None,
             Self::Context { request, .. } => Some(&request.db_path),
             Self::Memory(command) => command.db_path_for_upgrade_hint(),
             Self::Help

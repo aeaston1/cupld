@@ -2,12 +2,13 @@
 
 `cupld` is a local graph database CLI and REPL with first-class support for markdown-backed memory workflows.
 
-It provides interactive exploration, one-shot queries, compact context output for agents, markdown sync, and a visual graph viewer over file-backed `.cupld` stores. It is built in Rust as a single binary with no external runtime dependencies.
+It provides MCP-first local memory tools for agents, plus interactive exploration, one-shot queries, compact context output, markdown sync, and a visual graph viewer over file-backed `.cupld` stores. It is built in Rust as a single binary with no external runtime dependencies.
 
 ## Highlights
 
 - Local-first graph database with file-backed `.cupld` stores
 - Pure Rust binary with no external runtime dependencies
+- MCP memory server with `memory_health`, `memory_search`, `memory_get`, `memory_context`, `memory_add`, and `memory_sync`
 - Interactive REPL plus scriptable `query`, `context`, `schema`, and `check` commands
 - Stable JSON and NDJSON envelopes for `query` and `context` automation
 - Markdown sync, optional watch mode, and bundled `cupld-md-memory` skill bootstrap
@@ -47,7 +48,16 @@ cargo install --path .
 
 ## Quickstart
 
-Start an in-memory REPL:
+For agent harnesses, start with MCP-backed memory:
+
+```bash
+cupld install --mcp --target codex --scope cwd --dry-run --db default
+cupld mcp serve --db default
+```
+
+Then call `memory_health`, use `memory_search`/`memory_get` for routine reads, `memory_context` to expand a search result into bounded graph context, `memory_add` when the user asks you to remember something, and `memory_sync` after direct markdown edits. MCP reads are DB-backed and do not run hidden markdown syncs.
+
+Start an in-memory REPL for human exploration:
 
 ```bash
 cupld
@@ -71,7 +81,7 @@ Run the same query with the machine envelope:
 cupld query --db default --output json 'MATCH (n) RETURN n LIMIT 10'
 ```
 
-Build compact context rows for agent prompts:
+Build compact context rows from explicit seeds when MCP is unavailable or you need a CLI export:
 
 ```bash
 cupld context --db default --path notes/example.md --depth 2 --max-nodes 25 --output table
@@ -81,7 +91,7 @@ cupld context --db default --path notes/example.md --depth 2 --output json
 
 `context` is seeded: pass one or more `--node <id>` or `--path <src.path>` seeds to get a bounded neighborhood around explicit graph nodes or synced markdown source paths. Use `--depth <n>`, `--direction <in|out|both>`, repeated `--edge-type <type>`, repeated `--label <label>`, `--max-nodes <n>`, and `--max-edges <n>` to control traversal. Table output is human-facing and contains `row`, `depth`, `id`, `labels/type`, `display`, `source`, and `target` columns. JSON and NDJSON remain the stable machine contracts for automation; JSON is the default output mode.
 
-Use `cupld query` for global node listings and ad hoc graph reads:
+Use `cupld query` for advanced graph inspection, global node listings, and ad hoc graph reads:
 
 ```bash
 cupld query --db default 'MATCH (n) RETURN id(n), labels(n), n.name, n.`src.path` ORDER BY id(n) LIMIT 25'

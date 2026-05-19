@@ -6,19 +6,30 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 
 ## Start Here
 
-- Use `cupld` to start an in-memory REPL.
-- Use `cupld <path.cupld>` or `cupld --db <path.cupld|default>` to open or create a file-backed REPL.
-- Use `cupld install` to install or refresh the bundled `cupld-md-memory` skill and bootstrap local memory. The default DB path is `./.cupld/default.cupld` and the default markdown root is `./.cupld/data/`.
+- For agent harnesses, use the MCP path first: configure `cupld mcp serve --db default`, call `memory_health`, then use `memory_search`, `memory_get`, `memory_context`, `memory_add`, or `memory_sync`.
+- Use `cupld install --mcp --target <codex|claude|opencode> --scope <cwd|home> --db default` to generate or inspect harness config. Add `--dry-run` before writing files.
+- `memory_health` reports DB path, markdown root, root existence, read-only mode, write readiness, last transaction id, and the DB-backed sync visibility rule.
+- MCP reads are DB-backed. After direct markdown edits, call `memory_sync` before expecting `memory_search`, `memory_get`, or `memory_context` to see the new content.
+- Use CLI `query` and `context` only as advanced fallbacks for exact graph inspection, custom automation, or exported seeded context when MCP cannot cover the workflow.
+- Keep REPL, visualise, watch-mode tuning, `eval memory`, and broad query exploration as human/operator or developer workflows, not first-page agent steps.
 - Use `--db default` to target `./.cupld/default.cupld`.
-- Use `cupld query --db <path.cupld|default> ...` for one-shot automation and `cupld context --db <path.cupld|default> --node <id>|--path <src.path> ...` for seeded context rows.
-- Use `cupld query` for global node listings. `cupld context` no longer supports legacy global top-k retrieval; it requires explicit node ID or markdown path seeds.
-- Use `cupld mcp serve --db <path.cupld|default>` for MCP-capable harnesses that can call local memory tools over stdio.
-- Use `cupld query --db ... --with-md` for transient markdown overlay reads.
-- Use `cupld sync markdown --db ...` to persist markdown and `cupld sync markdown --db ... --watch` to keep syncing after the initial run.
-- Use `cupld schema --db ...` and `cupld check --db ...` before making automation assumptions about a database.
-- Opening or checking a database from an older `cupld` release may upgrade the `.cupld` file in place. Treat on-disk databases as forward-only during beta if rollback matters.
 - Use `--output json` or `--output ndjson` for machine consumption where supported.
+- Opening or checking a database from an older `cupld` release may upgrade the `.cupld` file in place. Treat on-disk databases as forward-only during beta if rollback matters.
 - Interactive REPL startup can prompt to install when no skill install is tracked, or to refresh when tracked bundle metadata is stale.
+
+## Agent Surface Audit
+
+| Surface | Classification | Agent guidance |
+| --- | --- | --- |
+| `install --mcp`, manual MCP config, `mcp serve --db default` | primary agent path | Preferred harness entrypoint. MCP startup is local and quiet by default. |
+| MCP `memory_health`, `memory_search`, `memory_get`, `memory_list`, `memory_context`, `memory_add`, `memory_sync` | primary agent path | Use for routine memory health, retrieval, bounded context expansion, writes, and explicit sync. |
+| `query`, `context` JSON/NDJSON | advanced agent fallback | Use for exact graph inspection or seeded context export when MCP tools are unavailable or insufficient. |
+| `query --with-md` | advanced agent fallback | Transient overlay only; prefer persisted sync plus DB-backed MCP reads for normal memory. |
+| `schema`, `check`, `compact`, `source set-root`, `sync markdown` one-shot | advanced agent fallback | Useful for setup, validation, and explicit persisted sync. |
+| REPL, dot-commands, visualise, `sync markdown --watch` timing knobs | human/operator only | Keep out of normal harness flows. |
+| `eval memory` | developer/CI only | Deterministic local validation, not runtime memory access. |
+| `memory repair`, `memory citation-audit` | deferred | Parsed only as unsupported deferred commands; agents should not call them. |
+| `context --top-k` | compatibility/error contract | Removed behavior retained only as stable rejection code `context_legacy_top_k_removed`. |
 
 ## CLI Shape
 
@@ -134,6 +145,7 @@ MCP tools:
 - `memory_get`
 - `memory_list`
 - `memory_search`
+- `memory_context`
 - `memory_sync`
 - `memory_add`
 
@@ -146,6 +158,8 @@ MCP resources:
 - `memory://config`
 
 MCP reads are DB-backed only and never run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1.
+
+`memory_context` expands from a search result URI/path or explicit node/path seeds into the same bounded context envelope as `cupld context --output json`. Accepted arguments include `id_or_uri`, `path`, `paths`, `node`, `nodes`, `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`. This lets MCP-capable harnesses move from `memory_search` to prompt context without shelling out.
 
 ### `memory_search` Contract
 
@@ -202,12 +216,12 @@ cupld query --db default "EXPLAIN MATCH (d:MarkdownDocument) WHERE d.\`md.body\`
 
 For safe automation, prefer this order:
 
-1. `cupld check --db default`
-2. `cupld schema --db default`
-3. `cupld query --db default --output json 'MATCH (n) RETURN n ORDER BY id(n) LIMIT 10'`
-4. `cupld context --db default --path notes/example.md --max-nodes 25 --output json` when prompt assembly needs a seeded context window
-5. `cupld query --db default --with-md ...` when you want markdown overlaid without persisting it
-6. `cupld sync markdown --db default` or `cupld sync markdown --db default --watch ...` when later plain queries should see persisted markdown state
+1. Configure MCP with `cupld install --mcp --target <target> --scope <cwd|home> --db default --dry-run`, then rerun without `--dry-run` when the config looks right.
+2. Call `memory_health` and check `ok`, `db_path`, `markdown_root`, `markdown_root_exists`, `read_only`, `safe_for_writes`, and `write_status`.
+3. Use `memory_search` for retrieval, then `memory_get` for full note text or `memory_context` with the result `uri` when prompt assembly needs bounded graph context.
+4. Use `memory_add` when the user asks you to remember something. Use `memory_sync` after direct markdown edits.
+5. Fall back to `cupld query --db default --output json ...` or `cupld context --db default --path notes/example.md --output json` only when MCP cannot express the graph operation.
+6. Use `cupld query --db default --with-md ...` only for advanced transient reads where persisting sync state is intentionally not desired.
 
 Use explicit transactions for multi-statement batches. Outside a transaction, mutating statements commit immediately.
 

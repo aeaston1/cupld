@@ -1,6 +1,6 @@
 ---
 name: cupld-md-memory
-description: "Use when an agent has the `cupld` binary and needs local graph memory through the cupld MCP server, or needs to treat a markdown vault as memory with `cupld query --with-md` and `cupld sync markdown`."
+description: "Use when an agent has the `cupld` binary and needs local graph memory through the cupld MCP server, with CLI query/context as advanced fallback paths."
 ---
 
 # cupld-md-memory
@@ -21,7 +21,8 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 - MCP `--read-only` disables `memory_sync` and `memory_add`.
 - `cupld install` and `source set-root` keep repo-local defaults in `.cupld/config.toml`.
 - The skill install location (`.agents/skills`, `.claude/skills`, or a custom path) is separate from the DB path and markdown root. Installing the skill elsewhere does not move `./.cupld/default.cupld` or `./.cupld/data/`.
-- `cupld query --with-md` overlays markdown into a temporary query session and does not persist the imported notes.
+- MCP `memory_context` expands a search result URI/path or explicit node/path seed into bounded graph context without shelling out.
+- `cupld query --with-md` overlays markdown into a temporary query session and does not persist the imported notes. Treat it as an advanced fallback, not the normal memory path.
 - `cupld sync markdown` persists markdown documents and authored markdown link edges into the `.cupld` database.
 - `cupld sync markdown --db default --include-fs-graph` opts in to persisted filesystem structure with `MarkdownDirectory`, `MD_IN_DIRECTORY`, and `MD_PARENT_DIRECTORY`.
 - Use `cupld memory check`, `find-stale`, `find-orphans`, and `reindex` to inspect markdown-derived DB state. Use `cupld sync markdown` to refresh markdown-derived state after note edits.
@@ -30,7 +31,7 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 - `cupld memory repair` and `cupld memory citation-audit` are intentionally deferred in this round.
 - `MD_LINKS_TO` remains authored-only; filesystem structure uses filesystem edge types and never pairwise `MD_SIBLING_OF` edges.
 - Filesystem edges persist `md.edge_weight` for downstream context and retrieval work. Core ranking does not consume it in this workflow.
-- `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes with `--poll-ms`, `--debounce-ms`, `--batch-ms`, `--idle-ms`, and `--max-runs`.
+- `cupld sync markdown --watch` is operator-oriented. It performs the initial persisted sync, then keeps polling for changes with timing knobs.
 - `cupld query --db ...` requires an existing database file. If the DB is missing, create it first with `cupld <path.cupld>`.
 - `cupld query` and `cupld context` support `--output table|json|ndjson` without using the REPL.
 - In JSON or NDJSON mode, `query` and `context` emit stable machine envelopes instead of raw table text.
@@ -39,11 +40,11 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 
 ## Recommended Workflow
 
-1. Bootstrap the local memory DB and skill.
+1. Bootstrap the local memory DB and MCP config. Use `--dry-run` first when writing harness config.
    ```bash
-   cupld install
+   cupld install --mcp --target codex --scope cwd --dry-run --db default
    ```
-2. For MCP-capable harnesses, configure this server manually.
+2. For manual MCP-capable harness config, point the server at the local DB.
    ```toml
    [mcp_servers.cupld-memory]
    command = "cupld"
@@ -58,41 +59,42 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
    When the user explicitly asks you to remember something, call `memory_add`.
    Do not store secrets, credentials, tokens, private keys, or transient command output.
    ```
-4. If MCP tools are available, start with `memory_health`, use `memory_search`/`memory_get` for reads, call `memory_sync` after direct markdown edits, and call `memory_add` when the user asks you to remember something.
-5. If the markdown root should stay stable across working directories, persist or update it once.
+4. Start with `memory_health`. Check `db_path`, `markdown_root`, `markdown_root_exists`, `read_only`, `safe_for_writes`, `write_status`, and `db_last_tx_id`.
+5. Use `memory_search` for retrieval, `memory_get` for exact note reads, and `memory_context` with a result `uri` when prompt assembly needs bounded graph context.
+6. Call `memory_add` when the user asks you to remember something. Call `memory_sync` after direct markdown edits.
+7. If the markdown root should stay stable across working directories, persist or update it once.
    ```bash
    cupld source set-root --db default /absolute/path/to/notes
    ```
-6. For a one-off CLI root override, pass `--root` directly.
+8. Use CLI query/context only as advanced fallbacks when MCP is unavailable or the graph operation cannot be expressed by the MCP tools.
+   ```bash
+   cupld context --db default --path notes/example.md --depth 1 --max-nodes 25 --output json
+   ```
+9. For a one-off transient CLI root override, pass `--root` with `--with-md`.
    ```bash
    cupld query --db default --with-md --root /absolute/path/to/notes \
      "MATCH (d:MarkdownDocument) RETURN d.\`src.path\`, d.\`md.title\` ORDER BY d.\`src.path\`"
    ```
-7. After editing notes without MCP, use overlay queries for transient reads.
-   ```bash
-   cupld query --db default --with-md \
-     "MATCH (d:MarkdownDocument) RETURN d.\`src.path\`, d.\`md.title\` ORDER BY d.\`src.path\`"
-   ```
-8. Persist markdown when you want later plain queries or MCP reads to see it.
+10. Persist markdown when you want later plain queries or MCP reads to see it.
    ```bash
    cupld sync markdown --db default
    ```
-9. Persist filesystem structure when directory traversal matters.
+11. Persist filesystem structure when directory traversal matters.
    ```bash
    cupld sync markdown --db default --include-fs-graph
    ```
-10. For bounded continuous persisted sync, use watch mode after the initial sync.
+12. For bounded continuous persisted sync, use watch mode as an operator workflow after the initial sync.
    ```bash
    cupld sync markdown --db default --watch --idle-ms 500 --max-runs 2
    ```
-11. Use maintenance commands before making assumptions about a DB.
+13. Use maintenance commands before making assumptions about a DB.
    ```bash
    cupld memory check --db default
    cupld memory find-stale --db default --output table
    cupld memory find-orphans --db default --output ndjson
    cupld memory reindex --db default --output json
    ```
-12. If maintenance reports stale markdown, refresh persisted state.
+14. If maintenance reports stale markdown, refresh persisted state.
    ```bash
    cupld sync markdown --db default
    ```
