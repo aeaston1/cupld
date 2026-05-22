@@ -62,6 +62,19 @@ codex:
   thread_sandbox: danger-full-access
   turn_sandbox_policy:
     type: dangerFullAccess
+review_judge:
+  enabled: true
+  source_state: Human Review
+  review_state: Human Review
+  proceed_state: Merging
+  model: gpt-5.5
+  reasoning_effort: high
+  service_tier: fast
+  policy: standard
+  minimum_skip_confidence: medium
+  hard_require_human_review:
+    paths: []
+    labels: []
 ---
 
 You are working on Linear ticket `{{ issue.identifier }}` for the `cupld` repository.
