@@ -68,7 +68,7 @@ review_judge:
   review_state: Human Review
   proceed_state: Merging
   model: gpt-5.5
-  reasoning_effort: high
+  reasoning_effort: xhigh
   service_tier: fast
   policy: standard
   minimum_skip_confidence: medium
