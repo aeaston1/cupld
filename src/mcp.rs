@@ -16,7 +16,7 @@ const MAX_LIMIT: usize = 50;
 const DEFAULT_LIMIT: usize = 10;
 const DEFAULT_SNIPPET_CHARS: usize = 500;
 const DEFAULT_BODY_CHARS: usize = 4000;
-const SYNC_VISIBILITY_MESSAGE: &str = "MCP reads are DB-backed; run memory_sync after markdown changes before memory_search or memory_get can see them.";
+const SYNC_VISIBILITY_MESSAGE: &str = "MCP reads are DB-backed only: memory_search, memory_get, and memory_context never scan markdown files or auto-sync; run memory_sync after direct markdown changes before expecting reads to see them.";
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -220,6 +220,23 @@ fn tool_content(payload: JsonValue) -> JsonValue {
     )])
 }
 
+fn with_warnings(payload: JsonValue, warnings: Vec<JsonValue>) -> JsonValue {
+    if warnings.is_empty() {
+        return payload;
+    }
+    match payload {
+        JsonValue::Object(mut fields) => {
+            fields.push(("warnings".to_owned(), JsonValue::array(warnings)));
+            JsonValue::Object(fields)
+        }
+        other => JsonValue::object([
+            ("ok", JsonValue::from(true)),
+            ("value", other),
+            ("warnings", JsonValue::array(warnings)),
+        ]),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ToolSpec {
     name: &'static str,
@@ -231,7 +248,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "memory_health",
         description: "Report cupld memory DB and markdown root status.",
-        input_schema: empty_schema,
+        input_schema: empty_read_schema,
     },
     ToolSpec {
         name: "memory_get",
@@ -287,12 +304,16 @@ fn empty_schema() -> JsonValue {
     object_schema([], [])
 }
 
+fn empty_read_schema() -> JsonValue {
+    read_object_schema([], [])
+}
+
 fn memory_doctor_schema() -> JsonValue {
-    object_schema([("deep", bool_schema())], [])
+    read_object_schema([("deep", bool_schema())], [])
 }
 
 fn memory_get_schema() -> JsonValue {
-    object_schema(
+    read_object_schema(
         [
             ("id_or_uri", string_schema()),
             ("max_chars", integer_schema(Some(1), Some(20_000))),
@@ -302,7 +323,7 @@ fn memory_get_schema() -> JsonValue {
 }
 
 fn memory_list_schema() -> JsonValue {
-    object_schema(
+    read_object_schema(
         [
             ("limit", integer_schema(Some(1), Some(MAX_LIMIT))),
             ("tags", string_array_schema()),
@@ -313,7 +334,7 @@ fn memory_list_schema() -> JsonValue {
 
 fn memory_search_schema() -> JsonValue {
     let retrieval = enum_schema(["lexical", "semantic", "vector"]);
-    object_schema(
+    read_object_schema(
         [
             ("query", string_schema()),
             ("limit", integer_schema(Some(1), Some(MAX_LIMIT))),
@@ -327,7 +348,7 @@ fn memory_search_schema() -> JsonValue {
 }
 
 fn memory_context_schema() -> JsonValue {
-    object_schema(
+    read_object_schema(
         [
             ("id_or_uri", string_schema()),
             ("path", string_schema()),
@@ -365,6 +386,21 @@ fn object_schema<const P: usize, const R: usize>(
     properties: [(&'static str, JsonValue); P],
     required: [&'static str; R],
 ) -> JsonValue {
+    object_schema_with_additional(properties, required, false)
+}
+
+fn read_object_schema<const P: usize, const R: usize>(
+    properties: [(&'static str, JsonValue); P],
+    required: [&'static str; R],
+) -> JsonValue {
+    object_schema_with_additional(properties, required, true)
+}
+
+fn object_schema_with_additional<const P: usize, const R: usize>(
+    properties: [(&'static str, JsonValue); P],
+    required: [&'static str; R],
+    additional_properties: bool,
+) -> JsonValue {
     JsonValue::object([
         ("type", JsonValue::from("object")),
         (
@@ -379,7 +415,10 @@ fn object_schema<const P: usize, const R: usize>(
             "required",
             JsonValue::array(required.into_iter().map(JsonValue::from)),
         ),
-        ("additionalProperties", JsonValue::from(false)),
+        (
+            "additionalProperties",
+            JsonValue::from(additional_properties),
+        ),
     ])
 }
 
@@ -439,17 +478,38 @@ impl<'a> ToolArgs<'a> {
     }
 
     fn reject_unknown(&self, allowed: &[&str]) -> Result<(), McpToolError> {
-        let Some(fields) = self.value.as_object() else {
-            return Ok(());
-        };
-        for (key, _) in fields {
-            if !allowed.contains(&key.as_str()) {
-                return Err(McpToolError::validation(format!(
-                    "unexpected argument {key}"
-                )));
-            }
+        if let Some(key) = self.unknown_arguments(allowed).first() {
+            return Err(McpToolError::validation(format!(
+                "unexpected argument {key}"
+            )));
         }
         Ok(())
+    }
+
+    fn unknown_arguments(&self, allowed: &[&str]) -> Vec<String> {
+        let Some(fields) = self.value.as_object() else {
+            return Vec::new();
+        };
+        fields
+            .iter()
+            .filter_map(|(key, _)| (!allowed.contains(&key.as_str())).then(|| key.to_owned()))
+            .collect()
+    }
+
+    fn ignored_argument_warnings(&self, allowed: &[&str]) -> Vec<JsonValue> {
+        self.unknown_arguments(allowed)
+            .into_iter()
+            .map(|argument| {
+                JsonValue::object([
+                    ("code", JsonValue::from("unknown_argument_ignored")),
+                    ("argument", JsonValue::from(argument.clone())),
+                    (
+                        "message",
+                        JsonValue::from(format!("ignored unknown read-tool argument {argument}")),
+                    ),
+                ])
+            })
+            .collect()
     }
 
     fn required_string(&self, key: &str) -> Result<String, McpToolError> {
@@ -942,24 +1002,27 @@ fn doctor_check(code: &str, status: &str, message: &str, remediation: Option<&st
 
 fn memory_health(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
     let args = ToolArgs::new(args)?;
-    args.reject_unknown(&[])?;
+    let warnings = args.ignored_argument_warnings(&[]);
     let diagnostics = collect_harness_diagnostics(config, false);
     if let Some(error) = diagnostics.db_open_error.as_deref() {
         return Err(McpToolError::new("db_open_failed", error));
     }
-    Ok(diagnostics.health_payload())
+    Ok(with_warnings(diagnostics.health_payload(), warnings))
 }
 
 fn memory_doctor(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
     let args = ToolArgs::new(args)?;
-    args.reject_unknown(&["deep"])?;
+    let warnings = args.ignored_argument_warnings(&["deep"]);
     let deep = args.optional_bool("deep")?.unwrap_or(false);
-    Ok(collect_harness_diagnostics(config, deep).doctor_payload())
+    Ok(with_warnings(
+        collect_harness_diagnostics(config, deep).doctor_payload(),
+        warnings,
+    ))
 }
 
 fn memory_context(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
     let args = ToolArgs::new(args)?;
-    args.reject_unknown(&[
+    let warnings = args.ignored_argument_warnings(&[
         "id_or_uri",
         "path",
         "paths",
@@ -971,7 +1034,7 @@ fn memory_context(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, Mcp
         "labels",
         "max_nodes",
         "max_edges",
-    ])?;
+    ]);
     let mut seeds = Vec::new();
     for node in args.optional_i64_array("nodes")? {
         seeds.push(ContextSeedRequest::Node(usize::try_from(node).map_err(
@@ -1045,6 +1108,7 @@ fn memory_context(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, Mcp
     };
     match request.run() {
         Ok(envelope) => json::parse(&context_as_json(&envelope))
+            .map(|payload| with_warnings(payload, warnings))
             .map_err(|error| McpToolError::new("context_serialization_failed", error.to_string())),
         Err(error) => Err(McpToolError::with_details(
             error.code(),
@@ -1056,40 +1120,46 @@ fn memory_context(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, Mcp
 
 fn memory_get(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
     let args = ToolArgs::new(args)?;
-    args.reject_unknown(&["id_or_uri", "max_chars"])?;
+    let warnings = args.ignored_argument_warnings(&["id_or_uri", "max_chars"]);
     let needle = args.required_string("id_or_uri")?;
     let max_chars = args.optional_usize("max_chars", DEFAULT_BODY_CHARS, 20_000)?;
     let doc = find_one_doc(config, &needle)?;
     let (body, truncated) = truncate(&doc.body, max_chars);
-    Ok(JsonValue::object([
-        ("ok", true.into()),
-        ("item", doc.to_json_with_body(&body)),
-        ("truncated", truncated.into()),
-        ("provenance", provenance()),
-    ]))
+    Ok(with_warnings(
+        JsonValue::object([
+            ("ok", true.into()),
+            ("item", doc.to_json_with_body(&body)),
+            ("truncated", truncated.into()),
+            ("provenance", provenance()),
+        ]),
+        warnings,
+    ))
 }
 
 fn memory_list(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
     let args = ToolArgs::new(args)?;
-    args.reject_unknown(&["limit", "tags"])?;
+    let warnings = args.ignored_argument_warnings(&["limit", "tags"]);
     let limit = args.optional_usize("limit", DEFAULT_LIMIT, MAX_LIMIT)?;
     let tags = args.optional_string_array("tags")?;
     match load_docs(config) {
-        Ok(docs) => Ok(list_payload(filter_tags(docs, &tags), limit)),
+        Ok(docs) => Ok(with_warnings(
+            list_payload(filter_tags(docs, &tags), limit),
+            warnings,
+        )),
         Err(error) => Err(McpToolError::new("db_query_failed", error)),
     }
 }
 
 fn memory_search(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpToolError> {
     let args = ToolArgs::new(args)?;
-    args.reject_unknown(&[
+    let warnings = args.ignored_argument_warnings(&[
         "query",
         "limit",
         "tags",
         "retrieval_mode",
         "mode",
         "retrieval",
-    ])?;
+    ]);
     let query = args.required_string("query")?;
     let query = query.trim();
     if query.is_empty() {
@@ -1099,16 +1169,22 @@ fn memory_search(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpT
     let tags = args.optional_string_array("tags")?;
     let retrieval_mode = SearchRetrievalMode::from_args(&args)?;
     if retrieval_mode.is_semantic() {
-        return Ok(SemanticSearchBackend::unconfigured().search(retrieval_mode, query, limit));
+        return Ok(with_warnings(
+            SemanticSearchBackend::unconfigured().search(retrieval_mode, query, limit),
+            warnings,
+        ));
     }
     let search_query = SearchQuery::new(query);
     match load_search_docs(config, query, &tags) {
-        Ok((docs, structural_index, index_used)) => Ok(search_payload(
-            query,
-            score_search_docs(docs, &search_query, &tags, &structural_index),
-            limit,
-            index_used,
-            structural_index.has_filesystem_graph_data(),
+        Ok((docs, structural_index, index_used)) => Ok(with_warnings(
+            search_payload(
+                query,
+                score_search_docs(docs, &search_query, &tags, &structural_index),
+                limit,
+                index_used,
+                structural_index.has_filesystem_graph_data(),
+            ),
+            warnings,
         )),
         Err(error) => Err(McpToolError::new("db_query_failed", error)),
     }
@@ -2456,6 +2532,7 @@ fn provenance() -> JsonValue {
     JsonValue::object([
         ("source", JsonValue::from("cupld_db")),
         ("markdown_source", JsonValue::from("configured_local_root")),
+        ("sync_visibility", JsonValue::from(SYNC_VISIBILITY_MESSAGE)),
         ("network_used", JsonValue::from(false)),
     ])
 }

@@ -16,9 +16,9 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 - `cupld install` bootstraps `./.cupld/default.cupld` by default for local markdown memory work.
 - `--db default` is an alias for `./.cupld/default.cupld`.
 - `cupld mcp serve --db default` starts the local stdio MCP memory server.
-- MCP reads are DB-backed only and do not run hidden markdown syncs.
+- MCP reads are DB-backed only. `memory_search`, `memory_get`, and `memory_context` never scan markdown files or run hidden syncs; call `memory_sync` after direct markdown edits before expecting reads to see them.
 - Call MCP `memory_health` and `memory_doctor` before relying on memory state. `memory_doctor` should return pass/warn/fail status, structured checks, and machine-readable next actions for harness remediation.
-- Inspect `tools/list` input schemas when available and send only documented arguments. Harness schemas should reject misspelled fields instead of silently accepting arbitrary properties.
+- Inspect `tools/list` input schemas when available and send only documented arguments. Read tools ignore unknown fields with `warnings` for compatibility; write tools reject unknown fields before mutating state.
 - MCP `memory_sync` persists markdown into the DB. MCP `memory_add` writes markdown under the configured root and syncs it before success.
 - MCP `--read-only` disables `memory_sync` and `memory_add`.
 - `cupld install` and `source set-root` keep repo-local defaults in `.cupld/config.toml`.
@@ -223,6 +223,7 @@ Do not assume:
 
 - automatic markdown write-back
 - MCP reads can see unsynced raw markdown
+- read tools will apply undocumented arguments; ignored read-tool arguments are reported in `warnings`
 - external concurrent DB writers are supported
 
 For persisted markdown-heavy workloads, the same schema surface supports optional list and full-text indexes. Follow current shipped DDL syntax from the agent guide instead of inventing custom markdown-only conventions.

@@ -10,7 +10,7 @@ This is the canonical agent guide for current shipped behavior. Use the [`docs` 
 - Use `cupld install --mcp --target <codex|claude|opencode> --scope <cwd|home> --db default` to generate or inspect harness config. Add `--dry-run` before writing files.
 - `memory_health` reports DB path, markdown root, root existence, read-only mode, write readiness, last transaction id, and the DB-backed sync visibility rule.
 - `memory_doctor` is the harness diagnostic check: it should report pass/warn/fail status, structured checks, and machine-readable next actions before an agent relies on memory state.
-- MCP reads are DB-backed. After direct markdown edits, call `memory_sync` before expecting `memory_search`, `memory_get`, or `memory_context` to see the new content.
+- MCP reads are DB-backed only. `memory_search`, `memory_get`, and `memory_context` never scan markdown files or auto-sync; after direct markdown edits, call `memory_sync` before expecting those tools to see the new content.
 - Use CLI `query` and `context` only as advanced fallbacks for exact graph inspection, custom automation, or exported seeded context when MCP cannot cover the workflow.
 - Keep REPL, visualise, watch-mode tuning, `eval memory`, and broad query exploration as human/operator or developer workflows, not first-page agent steps.
 - Use `--db default` to target `./.cupld/default.cupld`.
@@ -159,7 +159,7 @@ MCP resources:
 - `memory://tag/{tag}`
 - `memory://config`
 
-MCP reads are DB-backed only and never run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1. Agent harnesses should inspect `tools/list` input schemas and send only documented arguments; misspelled fields should be rejected by structured schemas rather than silently ignored.
+MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
 
 `memory_context` expands from a search result URI/path or explicit node/path seeds into the same bounded context envelope as `cupld context --output json`. Accepted arguments include `id_or_uri`, `path`, `paths`, `node`, `nodes`, `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`. This lets MCP-capable harnesses move from `memory_search` to prompt context without shelling out.
 

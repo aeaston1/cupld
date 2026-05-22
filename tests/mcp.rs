@@ -77,9 +77,9 @@ fn protocol_lists_structured_input_schemas_for_agent_harness_tools() {
 
     let tools = rpc(&config, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
     let schema_cases = [
-        ("memory_health", &[][..]),
-        ("memory_get", &["id_or_uri", "max_chars"][..]),
-        ("memory_list", &["limit", "tags"][..]),
+        ("memory_health", &[][..], true),
+        ("memory_get", &["id_or_uri", "max_chars"][..], true),
+        ("memory_list", &["limit", "tags"][..], true),
         (
             "memory_search",
             &[
@@ -90,6 +90,7 @@ fn protocol_lists_structured_input_schemas_for_agent_harness_tools() {
                 "mode",
                 "retrieval",
             ][..],
+            true,
         ),
         (
             "memory_context",
@@ -106,15 +107,17 @@ fn protocol_lists_structured_input_schemas_for_agent_harness_tools() {
                 "max_nodes",
                 "max_edges",
             ][..],
+            true,
         ),
-        ("memory_sync", &[][..]),
+        ("memory_sync", &[][..], false),
         (
             "memory_add",
             &["title", "tags", "path_hint", "content", "source"][..],
+            false,
         ),
     ];
 
-    for (tool_name, expected_properties) in schema_cases {
+    for (tool_name, expected_properties, additional_properties) in schema_cases {
         let tool = tool_definition(&tools, tool_name);
         let schema = tool.get("inputSchema").expect("inputSchema");
         assert_eq!(
@@ -136,8 +139,8 @@ fn protocol_lists_structured_input_schemas_for_agent_harness_tools() {
             schema
                 .get("additionalProperties")
                 .and_then(JsonValue::as_bool),
-            Some(false),
-            "{tool_name} schema should reject misspelled harness arguments"
+            Some(additional_properties),
+            "{tool_name} schema should advertise the expected unknown-argument policy"
         );
     }
 
@@ -191,13 +194,13 @@ fn memory_health_reports_harness_readiness() {
             .and_then(JsonValue::as_str),
         Some("ready")
     );
-    assert_eq!(
+    assert!(
         config_payload
             .get("sync_visibility")
-            .and_then(JsonValue::as_str),
-        Some(
-            "MCP reads are DB-backed; run memory_sync after markdown changes before memory_search or memory_get can see them."
-        )
+            .and_then(JsonValue::as_str)
+            .is_some_and(|message| message.contains("never scan markdown files")),
+        "{}",
+        json_text(&config_payload)
     );
 
     fs::remove_dir_all(root).unwrap();
@@ -508,12 +511,18 @@ fn memory_tools_return_table_driven_validation_errors() {
             "expected deep",
         ),
         (
-            "memory_health",
+            "memory_sync",
             r#"{"typo":true}"#,
             "validation_error",
             "unexpected argument typo",
         ),
         ("memory_add", "{}", "validation_error", "expected content"),
+        (
+            "memory_add",
+            r#"{"content":"Nope","typo":true}"#,
+            "validation_error",
+            "unexpected argument typo",
+        ),
         (
             "memory_add",
             r#"{"content":"Nope","path_hint":"../escape.md"}"#,
@@ -656,6 +665,89 @@ fn memory_search_exposes_retrieval_contract_metadata() {
     assert!(json_text(second).contains(r#""truncated":true"#));
     assert!(json_text(second).contains(r#""max_chars":500"#));
     assert!(json_text(second).contains(r#""source":"body""#));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn read_tools_warn_and_ignore_unknown_arguments() {
+    let db = TestDb::new("mcp_read_tool_unknown_argument_warnings");
+    let root = temp_dir("mcp_read_tool_unknown_argument_warnings");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("note.md"), "# Needle\n\nVisible via synced DB.").unwrap();
+    sync_root(db.path(), &root);
+
+    let config = config(db.path(), &root, false);
+
+    let health = tool_payload(&call(&config, "memory_health", r#"{"client_trace":"h1"}"#));
+    assert_eq!(health.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_ignored_argument_warning(&health, "client_trace");
+    assert!(
+        health
+            .get("sync_visibility")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|message| message.contains("never scan markdown files")),
+        "{}",
+        json_text(&health)
+    );
+
+    let doctor = tool_payload(&call(
+        &config,
+        "memory_doctor",
+        r#"{"deep":false,"client_trace":"d1"}"#,
+    ));
+    assert_eq!(
+        doctor.get("status").and_then(JsonValue::as_str),
+        Some("pass")
+    );
+    assert_ignored_argument_warning(&doctor, "client_trace");
+
+    let list = tool_payload(&call(
+        &config,
+        "memory_list",
+        r#"{"limit":10,"client_trace":"l1"}"#,
+    ));
+    assert_eq!(result_paths(&list), vec!["note.md"]);
+    assert_ignored_argument_warning(&list, "client_trace");
+
+    let search = tool_payload(&call(
+        &config,
+        "memory_search",
+        r#"{"query":"Needle","client_trace":"s1"}"#,
+    ));
+    assert_eq!(result_paths(&search), vec!["note.md"]);
+    assert_ignored_argument_warning(&search, "client_trace");
+    assert!(
+        search
+            .get("provenance")
+            .and_then(|provenance| provenance.get("sync_visibility"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|message| message.contains("DB-backed only")),
+        "{}",
+        json_text(&search)
+    );
+
+    let get = tool_payload(&call(
+        &config,
+        "memory_get",
+        r#"{"id_or_uri":"note.md","client_trace":"g1"}"#,
+    ));
+    assert_eq!(
+        get.get("item")
+            .and_then(|item| item.get("path"))
+            .and_then(JsonValue::as_str),
+        Some("note.md")
+    );
+    assert_ignored_argument_warning(&get, "client_trace");
+
+    let context = tool_payload(&call(
+        &config,
+        "memory_context",
+        r#"{"path":"note.md","client_trace":"c1"}"#,
+    ));
+    assert_eq!(context.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert!(json_text(&context).contains("note.md"));
+    assert_ignored_argument_warning(&context, "client_trace");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -829,6 +921,29 @@ fn agent_harness_smoke_flow_uses_mcp_memory_end_to_end() {
         health.get("safe_for_writes").and_then(JsonValue::as_bool),
         Some(true)
     );
+    assert!(
+        health
+            .get("sync_visibility")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|message| message.contains("never scan markdown files")),
+        "{}",
+        json_text(&health)
+    );
+
+    let doctor = tool_payload(&call(&config, "memory_doctor", r#"{"deep":true}"#));
+    assert_eq!(
+        doctor.get("status").and_then(JsonValue::as_str),
+        Some("pass")
+    );
+    assert!(
+        doctor
+            .get("next_actions")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|actions| !actions.is_empty())
+            && json_text(&doctor).contains("memory_sync"),
+        "{}",
+        json_text(&doctor)
+    );
 
     let pre_sync_search = tool_payload(&call(
         &config,
@@ -855,9 +970,10 @@ fn agent_harness_smoke_flow_uses_mcp_memory_end_to_end() {
     let search = tool_payload(&call(
         &config,
         "memory_search",
-        r#"{"query":"Harness smoke retrieval target","limit":5}"#,
+        r#"{"query":"Harness smoke retrieval target","limit":5,"client_trace":"smoke-search"}"#,
     ));
     assert_eq!(result_paths(&search), vec!["notes/detail.md"]);
+    assert_ignored_argument_warning(&search, "client_trace");
     let uri = search
         .get("items")
         .and_then(JsonValue::as_array)
@@ -870,7 +986,7 @@ fn agent_harness_smoke_flow_uses_mcp_memory_end_to_end() {
     let get = tool_payload(&call(
         &config,
         "memory_get",
-        &format!(r#"{{"id_or_uri":"{uri}","max_chars":200}}"#),
+        &format!(r#"{{"id_or_uri":"{uri}","max_chars":200,"client_trace":"smoke-get"}}"#),
     ));
     assert_eq!(
         get.get("item")
@@ -878,15 +994,19 @@ fn agent_harness_smoke_flow_uses_mcp_memory_end_to_end() {
             .and_then(JsonValue::as_str),
         Some("notes/detail.md")
     );
+    assert_ignored_argument_warning(&get, "client_trace");
 
     let context = tool_payload(&call(
         &config,
         "memory_context",
-        r#"{"path":"notes/source.md","depth":1,"max_nodes":10,"max_edges":10}"#,
+        &format!(
+            r#"{{"id_or_uri":"{uri}","depth":1,"max_nodes":10,"max_edges":10,"client_trace":"smoke-context"}}"#
+        ),
     ));
     let context_text = json_text(&context);
     assert!(context_text.contains("notes/source.md"), "{context_text}");
     assert!(context_text.contains("notes/detail.md"), "{context_text}");
+    assert_ignored_argument_warning(&context, "client_trace");
 
     let add = tool_payload(&call(
         &config,
@@ -1686,6 +1806,21 @@ fn item_paths(payload: &JsonValue) -> Vec<&str> {
         .iter()
         .map(|item| item.get("path").and_then(JsonValue::as_str).unwrap())
         .collect()
+}
+
+fn assert_ignored_argument_warning(payload: &JsonValue, argument: &str) {
+    let warnings = payload
+        .get("warnings")
+        .and_then(JsonValue::as_array)
+        .unwrap_or_else(|| panic!("expected warnings in {}", json_text(payload)));
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.get("code").and_then(JsonValue::as_str) == Some("unknown_argument_ignored")
+                && warning.get("argument").and_then(JsonValue::as_str) == Some(argument)
+        }),
+        "expected ignored-argument warning for {argument}: {}",
+        json_text(payload)
+    );
 }
 
 fn sync_root(db_path: &Path, root: &Path) {
