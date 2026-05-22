@@ -168,7 +168,22 @@ impl Session {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecutionError> {
         let path = path.as_ref().to_path_buf();
         let (engine, report) = storage::load(&path).map_err(ExecutionError::from)?;
-        Ok(Self {
+        Ok(Self::from_loaded_path(path, engine, report))
+    }
+
+    pub(crate) fn open_without_migration(path: impl AsRef<Path>) -> Result<Self, ExecutionError> {
+        let path = path.as_ref().to_path_buf();
+        let (engine, report) =
+            storage::load_without_migration(&path).map_err(ExecutionError::from)?;
+        Ok(Self::from_loaded_path(path, engine, report))
+    }
+
+    fn from_loaded_path(
+        path: PathBuf,
+        engine: CupldEngine,
+        report: storage::IntegrityReport,
+    ) -> Self {
+        Self {
             engine,
             transaction_base: None,
             savepoints: Vec::new(),
@@ -176,7 +191,7 @@ impl Session {
             path: Some(path),
             db_uuid: Some(report.db_uuid),
             dirty: false,
-        })
+        }
     }
 
     pub fn engine(&self) -> &CupldEngine {
@@ -235,6 +250,12 @@ impl Session {
 
     pub fn check(path: impl AsRef<Path>) -> Result<storage::IntegrityReport, ExecutionError> {
         storage::check(path.as_ref()).map_err(ExecutionError::from)
+    }
+
+    pub(crate) fn check_without_migration(
+        path: impl AsRef<Path>,
+    ) -> Result<storage::IntegrityReport, ExecutionError> {
+        storage::check_without_migration(path.as_ref()).map_err(ExecutionError::from)
     }
 
     pub fn transaction_info(&self) -> TransactionInfo {

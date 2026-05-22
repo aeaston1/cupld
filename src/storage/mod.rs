@@ -28,6 +28,12 @@ pub struct IntegrityReport {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationPolicy {
+    MigrateInPlace,
+    ReadOnlyProbe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StorageFormatVersion {
     version: u32,
     compat: u32,
@@ -188,9 +194,22 @@ pub fn append_commit(
 }
 
 pub fn load(path: &Path) -> Result<(CupldEngine, IntegrityReport), StorageError> {
+    load_with_migration_policy(path, MigrationPolicy::MigrateInPlace)
+}
+
+pub(crate) fn load_without_migration(
+    path: &Path,
+) -> Result<(CupldEngine, IntegrityReport), StorageError> {
+    load_with_migration_policy(path, MigrationPolicy::ReadOnlyProbe)
+}
+
+fn load_with_migration_policy(
+    path: &Path,
+    migration_policy: MigrationPolicy,
+) -> Result<(CupldEngine, IntegrityReport), StorageError> {
     let bytes = fs::read(path)?;
     let parsed = parse_file(&bytes)?;
-    maybe_migrate_file(path, parsed.format)?;
+    apply_migration_policy(path, parsed.format, migration_policy)?;
     let mut state = decode_state(&parsed.snapshot_bytes, parsed.format)?;
     for record in &parsed.wal_records {
         state = decode_state(&record.payload, parsed.format)?;
@@ -224,9 +243,20 @@ pub fn compact(path: &Path, engine: &CupldEngine, db_uuid: [u8; 16]) -> Result<(
 }
 
 pub fn check(path: &Path) -> Result<IntegrityReport, StorageError> {
+    check_with_migration_policy(path, MigrationPolicy::MigrateInPlace)
+}
+
+pub(crate) fn check_without_migration(path: &Path) -> Result<IntegrityReport, StorageError> {
+    check_with_migration_policy(path, MigrationPolicy::ReadOnlyProbe)
+}
+
+fn check_with_migration_policy(
+    path: &Path,
+    migration_policy: MigrationPolicy,
+) -> Result<IntegrityReport, StorageError> {
     let bytes = fs::read(path)?;
     let parsed = parse_file(&bytes)?;
-    maybe_migrate_file(path, parsed.format)?;
+    apply_migration_policy(path, parsed.format, migration_policy)?;
     Ok(IntegrityReport {
         db_uuid: parsed.header.db_uuid,
         last_tx_id: parsed.header.last_tx_id,
@@ -468,6 +498,17 @@ fn maybe_migrate_file(path: &Path, format: StorageFormatVersion) -> Result<(), S
     header_only[8..12].copy_from_slice(&migration.target.version.to_le_bytes());
     header_only[12..16].copy_from_slice(&migration.target.compat.to_le_bytes());
     write_durable(path, &header_only)
+}
+
+fn apply_migration_policy(
+    path: &Path,
+    format: StorageFormatVersion,
+    migration_policy: MigrationPolicy,
+) -> Result<(), StorageError> {
+    match migration_policy {
+        MigrationPolicy::MigrateInPlace => maybe_migrate_file(path, format),
+        MigrationPolicy::ReadOnlyProbe => plan_migration(format).map(|_| ()),
+    }
 }
 
 fn encode_wal_record(seq_no: u64, tx_id: u64, payload: &[u8]) -> Vec<u8> {
@@ -1063,15 +1104,29 @@ mod tests {
 
     use super::{
         COMPAT_VERSION, FORMAT_VERSION, FileHeader, HEADER_SIZE, IndexStatus, StorageError,
-        append_commit, assemble_file, check, checksum, compact, encode_property_map, file_uuid,
-        load, push_bool, push_optional_string, push_property_type, push_schema_target, push_string,
-        push_strings, push_u8, push_u32, push_u64, save_compacted,
+        append_commit, assemble_file, check, check_without_migration, checksum, compact,
+        encode_property_map, file_uuid, load, load_without_migration, push_bool,
+        push_optional_string, push_property_type, push_schema_target, push_string, push_strings,
+        push_u8, push_u32, push_u64, save_compacted,
     };
     use crate::engine::{EngineState, IndexKind};
     use crate::runtime::Session;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{}_{}.cupld", name, std::process::id()))
+    }
+
+    fn copy_fixture(name: &str) -> PathBuf {
+        let path = temp_path(&format!("cupld_storage_fixture_{name}"));
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join(name),
+            &path,
+        )
+        .unwrap();
+        path
     }
 
     fn encode_state_v2(state: &EngineState) -> Result<Vec<u8>, StorageError> {
@@ -1212,6 +1267,24 @@ mod tests {
             u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
             COMPAT_VERSION
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn no_migration_load_and_check_preserve_legacy_fixture_bytes() {
+        let path = copy_fixture("person_v0_1_0.cupld");
+        let original = fs::read(&path).unwrap();
+        assert_eq!(u32::from_le_bytes(original[8..12].try_into().unwrap()), 1);
+
+        let (engine, report) = load_without_migration(&path).unwrap();
+        assert_eq!(engine.stats().node_count, 4);
+        assert_eq!(report.wal_records, 8);
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        let report = check_without_migration(&path).unwrap();
+        assert_eq!(report.wal_records, 8);
+        assert_eq!(fs::read(&path).unwrap(), original);
 
         let _ = fs::remove_file(path);
     }

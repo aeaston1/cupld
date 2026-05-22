@@ -948,7 +948,7 @@ impl HarnessDiagnostics {
 fn collect_harness_diagnostics(config: &McpConfig, deep: bool) -> HarnessDiagnostics {
     let db_path = config.db_path.clone();
     let db_exists = db_path.exists();
-    let session = open_session(config);
+    let session = open_session_without_migration(config);
     let (markdown_root, db_last_tx_id, db_open_error) = match session {
         Ok(session) => (
             resolve_markdown_root(config, Some(&session)),
@@ -967,7 +967,7 @@ fn collect_harness_diagnostics(config: &McpConfig, deep: bool) -> HarnessDiagnos
         "markdown_root_missing"
     };
     let storage_recovered_tail = if deep && db_open_error.is_none() {
-        Session::check(&db_path)
+        Session::check_without_migration(&db_path)
             .ok()
             .map(|report| report.recovered_tail)
     } else {
@@ -1495,6 +1495,10 @@ fn sync_configured_root(config: &McpConfig) -> Result<MarkdownSyncReport, String
 
 fn open_session(config: &McpConfig) -> Result<Session, String> {
     Session::open(&config.db_path).map_err(|error| error.to_string())
+}
+
+fn open_session_without_migration(config: &McpConfig) -> Result<Session, String> {
+    Session::open_without_migration(&config.db_path).map_err(|error| error.to_string())
 }
 
 fn resolve_markdown_root(config: &McpConfig, session: Option<&Session>) -> Option<PathBuf> {

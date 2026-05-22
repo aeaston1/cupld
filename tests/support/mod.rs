@@ -84,6 +84,34 @@ pub fn run_with_params(
     results.remove(0)
 }
 
+pub fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
+
+pub fn copy_fixture(name: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let suffix = NEXT_TEST_DB_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "cupld_fixture_{name}_{}_{}_{}.cupld",
+        std::process::id(),
+        timestamp,
+        suffix
+    ));
+    fs::copy(fixture_path(name), &path).unwrap();
+    path
+}
+
+pub fn header_version(path: &Path) -> u32 {
+    let bytes = fs::read(path).unwrap();
+    u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+}
+
 #[allow(dead_code)]
 pub fn sorted_debug_rows(result: &QueryResult) -> Vec<String> {
     let mut rows = result

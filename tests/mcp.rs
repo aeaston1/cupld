@@ -9,7 +9,7 @@ use cupld::json::{self, JsonValue};
 use cupld::mcp::{self, McpConfig};
 use cupld::{MarkdownSyncOptions, Session, sync_markdown_root, sync_markdown_root_with_options};
 
-use support::TestDb;
+use support::{TestDb, copy_fixture, header_version};
 
 static NEXT_TEMP_DIR_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -394,6 +394,51 @@ fn memory_doctor_reports_read_only_missing_root_fail_and_does_not_mutate() {
 
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(missing_db_root).unwrap();
+}
+
+#[test]
+fn mcp_diagnostics_do_not_migrate_legacy_databases() {
+    let db_path = copy_fixture("person_v0_1_0.cupld");
+    let root = temp_dir("mcp_legacy_diagnostics");
+    fs::create_dir_all(&root).unwrap();
+    assert_eq!(header_version(&db_path), 1);
+    let original = fs::read(&db_path).unwrap();
+    let config = config(&db_path, &root, false);
+
+    let health = tool_payload(&call(&config, "memory_health", "{}"));
+    assert_eq!(health.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(fs::read(&db_path).unwrap(), original);
+
+    let doctor = tool_payload(&call(&config, "memory_doctor", "{}"));
+    assert_eq!(doctor.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert_eq!(fs::read(&db_path).unwrap(), original);
+
+    let deep_doctor = tool_payload(&call(&config, "memory_doctor", r#"{"deep":true}"#));
+    assert_eq!(
+        deep_doctor.get("ok").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        deep_doctor
+            .get("storage")
+            .and_then(|storage| storage.get("recovered_tail"))
+            .and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), original);
+
+    let config_resource = resource_payload(&rpc(
+        &config,
+        r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"memory://config"}}"#,
+    ));
+    assert_eq!(
+        config_resource.get("ok").and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), original);
+
+    fs::remove_file(db_path).unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
