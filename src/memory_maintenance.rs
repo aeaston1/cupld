@@ -80,10 +80,9 @@ pub(crate) fn build_memory_check_report(
     let mut session = Session::open(db_path)
         .map_err(AutomationError::from)
         .map_err(|error| format_command_error(output, &error))?;
-    let root =
-        resolve_markdown_root(root_override.as_deref(), Some(&session)).map_err(|message| {
-            format_command_error(output, &AutomationError::new("memory_root", message))
-        })?;
+    let root = resolve_markdown_root(root_override, Some(&session)).map_err(|message| {
+        format_command_error(output, &AutomationError::new("memory_root", message))
+    })?;
     let stale = memory_stale_items(&mut session, &root)
         .map_err(|error| format_command_error(output, &error))?;
     let orphans =
@@ -512,6 +511,7 @@ fn stable_hash_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_stale_item(
     rows: &mut Vec<Vec<RuntimeValue>>,
     kind: &str,

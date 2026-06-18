@@ -486,16 +486,16 @@ fn handle_mcp_command<W: Write>(
         )
     })?;
 
-    if let Some(config_outcome) = config_outcome.as_ref() {
-        if let Some(path) = config_outcome.path.as_deref() {
-            writeln!(
-                output,
-                "mcp_config {} {}",
-                config_outcome.action.label(),
-                path.display()
-            )
-            .map_err(io_error)?;
-        }
+    if let Some(config_outcome) = config_outcome.as_ref()
+        && let Some(path) = config_outcome.path.as_deref()
+    {
+        writeln!(
+            output,
+            "mcp_config {} {}",
+            config_outcome.action.label(),
+            path.display()
+        )
+        .map_err(io_error)?;
     }
     writeln!(output, "installed_skill {}", outcome.skill_path.display()).map_err(io_error)?;
     writeln!(output, "installed_db {}", outcome.db_path.display()).map_err(io_error)?;
@@ -870,6 +870,7 @@ fn refresh_install_request(state: &PromptState) -> Result<InstallRequest, String
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prompt_for_install_request<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
@@ -986,7 +987,7 @@ fn install_request(request: &InstallRequest, interactive: bool) -> Result<Instal
     let skill_dir = skill_path
         .parent()
         .ok_or(format!("invalid skill path {}", skill_path.display()))?;
-    fs::create_dir_all(&skill_dir).map_err(io_error)?;
+    fs::create_dir_all(skill_dir).map_err(io_error)?;
 
     let status = if skill_path.exists() {
         let existing = fs::read_to_string(&skill_path).map_err(io_error)?;

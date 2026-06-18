@@ -31,6 +31,7 @@ struct PathTrace {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::enum_variant_names)]
 enum MatchAccessPath {
     NodeScan {
         detail: String,
@@ -1353,6 +1354,7 @@ impl Session {
         Ok(rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn match_segments(
         &self,
         row: &Row,
@@ -1421,6 +1423,7 @@ impl Session {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn match_variable_hops(
         &self,
         row: &Row,

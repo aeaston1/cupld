@@ -492,7 +492,8 @@ impl<'a> ToolArgs<'a> {
         };
         fields
             .iter()
-            .filter_map(|(key, _)| (!allowed.contains(&key.as_str())).then(|| key.to_owned()))
+            .filter(|(key, _)| !allowed.contains(&key.as_str()))
+            .map(|(key, _)| key.to_owned())
             .collect()
     }
 
@@ -1843,13 +1844,10 @@ impl MemoryDoc {
             _ => Vec::new(),
         };
         fields.push(("rank".to_owned(), JsonValue::from(rank)));
-        fields.push((
-            "score".to_owned(),
-            JsonValue::from(search_match.score as usize),
-        ));
+        fields.push(("score".to_owned(), JsonValue::from(search_match.score)));
         fields.push((
             "lexical_score".to_owned(),
-            JsonValue::from(search_match.score as usize),
+            JsonValue::from(search_match.score),
         ));
         fields.push(("semantic_score".to_owned(), JsonValue::Null));
         fields.push(("blended_score".to_owned(), JsonValue::Null));

@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: cargo test and memory evals
+    name: cargo fmt, clippy, test, and memory evals
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -21,10 +21,18 @@ jobs:
           rustup toolchain install 1.95 --profile minimal
           rustup default 1.95
 
+      - name: Cargo fmt
+        run: cargo fmt --check
+
       - name: Cargo test
         env:
           CARGO_NET_OFFLINE: "true"
         run: cargo test --locked
+
+      - name: Cargo clippy
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Default memory evals
         env:

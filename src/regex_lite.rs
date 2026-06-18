@@ -18,11 +18,11 @@ impl RegexLite {
 
         let mut anchored_end = false;
         let mut end = pattern.len();
-        if let Some(index) = trailing_anchor_index(pattern) {
-            if index >= start {
-                anchored_end = true;
-                end = index;
-            }
+        if let Some(index) = trailing_anchor_index(pattern)
+            && index >= start
+        {
+            anchored_end = true;
+            end = index;
         }
 
         let body = &pattern[start..end];
