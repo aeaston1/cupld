@@ -18,7 +18,7 @@ jobs:
       - name: Install Rust 1.95
         shell: bash
         run: |
-          rustup toolchain install 1.95 --profile minimal
+          rustup toolchain install 1.95 --profile minimal --component rustfmt --component clippy
           rustup default 1.95
 
       - name: Cargo fmt
