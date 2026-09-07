@@ -163,6 +163,10 @@ MCP reads are DB-backed only and never scan markdown files or run hidden markdow
 
 `memory_context` expands from a search result URI/path or explicit node/path seeds into the same bounded context envelope as `cupld context --output json`. Accepted arguments include `id_or_uri`, `path`, `paths`, `node`, `nodes`, `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`. This lets MCP-capable harnesses move from `memory_search` to prompt context without shelling out.
 
+After `memory_sync` records a deletion (`src.status = missing`), ordinary MCP reads exclude that note: `memory_search` (including indexed candidates), `memory_get`, `memory_list`, and note/index/recent/tag resources. Deleted notes do not consume result limits or affect structural ranking. A deleted note lookup returns `not_found`; recreating its file and syncing makes the same note identity readable again. Reads continue to reflect the last sync, so deleting a file alone does not immediately hide it.
+
+`memory_context` also excludes tombstoned `MarkdownDocument` and `MarkdownDirectory` nodes and their incident edges before resolving seeds and traversing the graph. Deleted node/path seeds return the existing `context_seed_not_found`/`context_seed_path_not_found` errors; deleted URI/title seeds return `not_found`. Tombstones cannot bridge traversal or consume retrieval budgets. For compatibility, notes with no `src.status` and native graph nodes remain readable. The native `cupld context` command and explicit graph queries retain their existing historical access, including tombstones and stale-source warnings.
+
 `memory_doctor` returns the agent-facing memory readiness report. It should identify itself with `tool: "memory_doctor"`, use the same `pass` / `warn` / `fail` status vocabulary as memory maintenance reports, include a non-empty `checks` array, explain DB-backed sync visibility, and provide `next_actions` such as calling `memory_sync` when markdown edits may not be reflected in DB-backed reads.
 
 ### `memory_search` Contract
