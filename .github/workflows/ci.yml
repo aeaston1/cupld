@@ -38,3 +38,27 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
         run: cargo run --locked -- eval memory --ci
+
+  storage-platforms:
+    name: Storage persistence (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_NET_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95
+        shell: bash
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95
+      - name: Storage failure and recovery tests
+        run: cargo test --locked --lib storage::tests
+      - name: Session writer integration tests
+        run: cargo test --locked --test storage_writers

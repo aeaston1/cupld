@@ -68,6 +68,64 @@ Important constraints:
 - If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
 - `mcp serve` is a single-threaded stdio server. It emits MCP JSON-RPC on stdout only and writes diagnostics to stderr.
 
+## Database Persistence
+
+Every database commit, save, compaction, and format migration writes a uniquely
+created temporary file in the database directory, flushes it, and replaces the
+database with one rename. Failures before the rename preserve the original
+committed bytes. Incomplete or checksum-invalid WAL tails are discarded back to
+the last complete record before another commit is appended. Migration validates
+the decoded graph before replacing any bytes; a failed migration never relabels
+legacy data as a newer format.
+
+Writes acquire an exclusive OS lock on a persistent `<database>.lock` sidecar
+and compare the database revision read by the session before replacing it. Keep
+the sidecar empty and in place; do not delete or replace it while cupld may be
+running. Symbolic links, nonempty files, and nonregular files are rejected as
+sidecars; Unix also rejects hard-linked sidecars and databases. Each session binds
+to its canonical database path when opened, so later symlink retargeting does
+not redirect its writes. Hard-linked database paths are unsupported on all
+platforms; use a single canonical path. Locking coordinates cooperating cupld
+writers, not external programs that modify database or sidecar files directly.
+Opening/checking current-format databases and MCP diagnostic probes do not
+create sidecars; an explicit legacy migration does acquire a write lock.
+
+- `database_busy`: another writer owns the lock. Retry after it finishes; a
+  session that became stale must then reopen.
+- `database_changed`: the database bytes changed or the file disappeared after
+  this session read it. Reopen before writing; cupld does not merge stale edits.
+- `database_exists`: `SAVE AS` names a different existing file. Open that file
+  explicitly or choose a new destination. `SAVE AS` to the current canonical
+  path performs a guarded save and preserves the database identity.
+- `persistence_uncertain`: the rename succeeded but the directory flush failed.
+  The replacement is visible, and its durability is uncertain. Reopen the
+  destination and inspect the result before retrying; the session rejects
+  further writes and transaction control, including rollback, until reopened.
+
+Existing database permission bits are preserved, and files marked read-only or
+not writable by the process cannot be replaced. New Unix database files start
+with owner-only permissions. `SAVE`, `SAVE AS`, and compaction reject active
+transactions; commit or roll back first. An ordinary pre-rename write failure
+restores an autocommit statement's previous in-memory state. A failed explicit
+`COMMIT` retains its pending transaction and original transaction ID for retry
+or rollback. A failed save retains the session's unsaved graph.
+
+On Unix, cupld also flushes the parent directory after renaming when the
+filesystem supports directory sync. Windows uses the standard library's file
+flush and replacement operations; Rust's standard library provides no portable
+directory flush there. Power-loss durability therefore depends on platform,
+filesystem, and hardware guarantees. A killed process may leave an unused
+`.DATABASE.PID-COUNTER.tmp` file; such files are never treated as databases or
+recovery records and may be removed when no writer is running.
+
+Rust library callers now receive an opaque `StorageRevision` from
+`storage::save_compacted`, `storage::append_commit`, and `storage::compact`.
+`append_commit` and `compact` require the last revision, available from
+`IntegrityReport::revision`, and return the revision for the next write.
+`save_compacted` creates a new destination only. The revision is an optimistic
+concurrency token, not a cryptographic integrity guarantee. Existing CLI/MCP
+success payloads keep their current shapes.
+
 ## Query, Search, And Context
 
 Use `cupld query` when you need exact graph reads, global listings, schema-driven inspection, or deterministic node discovery:
@@ -159,7 +217,7 @@ MCP resources:
 - `memory://tag/{tag}`
 - `memory://config`
 
-MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
+MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. Cooperating cupld writers are serialized at persistence. Underlying persistence failures report `database_busy` for overlapping writes or `database_changed` for stale sessions; MCP write tools retain their existing `sync_failed` response wrappers and include the persistence reason in the message. Reopen after a stale-session error. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
 
 `memory_context` expands from a search result URI/path or explicit node/path seeds into the same bounded context envelope as `cupld context --output json`. Accepted arguments include `id_or_uri`, `path`, `paths`, `node`, `nodes`, `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`. This lets MCP-capable harnesses move from `memory_search` to prompt context without shelling out.
 

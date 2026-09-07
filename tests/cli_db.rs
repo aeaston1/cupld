@@ -2762,7 +2762,7 @@ fn cli_memory_reindex_handles_empty_db_without_indexes() {
 #[test]
 fn cli_memory_reindex_reports_existing_schema_indexes() {
     let db = TestDb::new("cli_memory_reindex_schema_indexes");
-    let mut session = Session::new_in_memory();
+    let mut session = db.open();
     run(&mut session, "CREATE LABEL Person");
     run(
         &mut session,
@@ -2776,7 +2776,6 @@ fn cli_memory_reindex_reports_existing_schema_indexes() {
         &mut session,
         "ALTER INDEX idx_person_age SET STATUS INVALID",
     );
-    session.save_as(db.path()).unwrap();
 
     let output = run_cli(&[
         "memory",
@@ -2838,13 +2837,12 @@ fn cli_memory_reindex_reports_existing_schema_indexes() {
 #[test]
 fn cli_memory_reindex_supports_table_and_ndjson_output() {
     let db = TestDb::new("cli_memory_reindex_outputs");
-    let mut session = Session::new_in_memory();
+    let mut session = db.open();
     run(&mut session, "CREATE LABEL Doc");
     run(
         &mut session,
         "CREATE INDEX idx_doc_tags ON :Doc(tags) KIND LIST",
     );
-    session.save_as(db.path()).unwrap();
 
     let table = run_cli(&[
         "memory",
