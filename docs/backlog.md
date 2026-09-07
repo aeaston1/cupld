@@ -6,10 +6,13 @@ They are recorded for later and are outside the implementation scope of PR #50.
 
 ## 1. Prevent accidental memory overwrites
 
+- Implemented on `codex/prevent-memory-overwrites`; awaiting review and merge.
 - Reproduced: two `memory_add` calls containing only `content` both succeed at
   `memory-note.md`; the second replaces the first note.
-- Introduce collision-safe creation and explicit update semantics. Validate the
-  final file target as well as its parent so a symlink cannot escape the root.
+- Added atomic creation with unique implicit filenames and `already_exists` for
+  explicit path collisions. Final file symlinks are never followed, and parent
+  confinement is checked before creating nested directories. Updates use direct
+  markdown editing followed by `memory_sync`.
 - Starting points: `src/mcp.rs` (`memory_add`, `safe_relative_path`,
   `ensure_confined_write`) and `tests/mcp.rs`.
 

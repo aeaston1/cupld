@@ -11,7 +11,7 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 
 ## Defaults
 
-- Edit markdown with normal filesystem tools. `cupld` reads and syncs markdown; it does not write notes back for you.
+- Edit existing markdown with normal filesystem tools, then call `memory_sync`. MCP `memory_add` creates new notes; it does not update existing notes.
 - Root resolution order is: explicit `--root`, then `.cupld/config.toml`, then the DB root set by `cupld source set-root`, then `./.cupld/data/` under the current working directory.
 - `cupld install` bootstraps `./.cupld/default.cupld` by default for local markdown memory work.
 - `--db default` is an alias for `./.cupld/default.cupld`.
@@ -20,6 +20,7 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 - Call MCP `memory_health` and `memory_doctor` before relying on memory state. `memory_doctor` should return pass/warn/fail status, structured checks, and machine-readable next actions for harness remediation.
 - Inspect `tools/list` input schemas when available and send only documented arguments. Read tools ignore unknown fields with `warnings` for compatibility; write tools reject unknown fields before mutating state.
 - MCP `memory_sync` persists markdown into the DB. MCP `memory_add` writes markdown under the configured root and syncs it before success.
+- `memory_add` never replaces an existing file. Without `path_hint`, colliding title slugs receive numeric suffixes (`memory-note.md`, `memory-note-2.md`, and so on); use the returned `note_path` and `uri`. An explicit occupied `path_hint` returns `already_exists` without changing the note or DB. Existing file symlinks, including dangling links, are occupied paths and are never followed for note creation.
 - MCP `--read-only` disables `memory_sync` and `memory_add`.
 - `cupld install` and `source set-root` keep repo-local defaults in `.cupld/config.toml`.
 - The skill install location (`.agents/skills`, `.claude/skills`, or a custom path) is separate from the DB path and markdown root. Installing the skill elsewhere does not move `./.cupld/default.cupld` or `./.cupld/data/`.
@@ -64,7 +65,7 @@ Prefer the cupld MCP tools when the harness exposes them. Use CLI commands as th
 4. Start with `memory_health`. Check `db_path`, `markdown_root`, `markdown_root_exists`, `read_only`, `safe_for_writes`, `write_status`, and `db_last_tx_id`.
 5. Run `memory_doctor`. Check `status`, `checks`, and `next_actions`; follow any `memory_sync` remediation before assuming direct markdown edits are visible to reads.
 6. Use `memory_search` for retrieval, `memory_get` for exact note reads, and `memory_context` with a result `uri` when prompt assembly needs bounded graph context.
-7. Call `memory_add` when the user asks you to remember something. Call `memory_sync` after direct markdown edits.
+7. Call `memory_add` when the user asks you to remember something new. To update an existing note, edit its markdown file and call `memory_sync`; retrying `memory_add` does not update it.
 8. If the markdown root should stay stable across working directories, persist or update it once.
    ```bash
    cupld source set-root --db default /absolute/path/to/notes
