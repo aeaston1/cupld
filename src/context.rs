@@ -368,6 +368,7 @@ fn build_context_response(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn context_envelope(
     db_path: &Path,
     request: &ContextRequest,
@@ -634,10 +635,7 @@ fn traverse_context(
         }
     }
 
-    let mut ordered_nodes = node_depths
-        .into_iter()
-        .map(|(node_id, depth)| (node_id, depth))
-        .collect::<Vec<_>>();
+    let mut ordered_nodes = node_depths.into_iter().collect::<Vec<_>>();
     ordered_nodes.sort_by_key(|(node_id, depth)| (*depth, *node_id));
     selected_edges.sort_by_key(|edge| (edge.depth, edge.edge_id));
     (ordered_nodes, selected_edges, truncated)
@@ -652,18 +650,16 @@ fn incident_edge_ids(
     if matches!(
         request.direction,
         ContextDirection::Out | ContextDirection::Both
-    ) {
-        if let Some(outgoing) = graph.outgoing.get(&node_id) {
-            edge_ids.extend(outgoing.iter().copied().map(|edge_id| (edge_id, "out")));
-        }
+    ) && let Some(outgoing) = graph.outgoing.get(&node_id)
+    {
+        edge_ids.extend(outgoing.iter().copied().map(|edge_id| (edge_id, "out")));
     }
     if matches!(
         request.direction,
         ContextDirection::In | ContextDirection::Both
-    ) {
-        if let Some(incoming) = graph.incoming.get(&node_id) {
-            edge_ids.extend(incoming.iter().copied().map(|edge_id| (edge_id, "in")));
-        }
+    ) && let Some(incoming) = graph.incoming.get(&node_id)
+    {
+        edge_ids.extend(incoming.iter().copied().map(|edge_id| (edge_id, "in")));
     }
     edge_ids
 }

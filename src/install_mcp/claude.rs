@@ -154,9 +154,7 @@ fn merge_document(
 
             if let Some(server_index) = servers.iter().position(|(key, _)| key == server_name) {
                 let existing = servers[server_index].1.clone();
-                if existing == managed_entry {
-                    servers[server_index].1 = managed_entry;
-                } else if is_cupld_managed(&existing) {
+                if existing == managed_entry || is_cupld_managed(&existing) {
                     servers[server_index].1 = managed_entry;
                 } else {
                     return Ok(blocked_document(

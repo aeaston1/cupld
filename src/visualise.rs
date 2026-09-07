@@ -178,11 +178,10 @@ impl SeedSubgraph {
         for row in &result.rows {
             for value in row {
                 match value {
-                    RuntimeValue::Node(node_id) => {
-                        if graph.nodes.contains_key(node_id) {
-                            seed.node_ids.insert(*node_id);
-                        }
+                    RuntimeValue::Node(node_id) if graph.nodes.contains_key(node_id) => {
+                        seed.node_ids.insert(*node_id);
                     }
+                    RuntimeValue::Node(_) => {}
                     RuntimeValue::Edge(edge_id) => {
                         let Some(edge) = graph.edges.get(edge_id) else {
                             continue;

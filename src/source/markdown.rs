@@ -949,7 +949,10 @@ fn scan_markdown_root(root: &Path) -> Result<Vec<MarkdownDocument>, SourceError>
 
     let mut documents = Vec::new();
     for path in paths {
-        documents.push(read_markdown_document(&root, &path)?);
+        let Some(document) = read_markdown_document_if_present(&root, &path)? else {
+            continue;
+        };
+        documents.push(document);
     }
     Ok(documents)
 }
@@ -959,11 +962,15 @@ fn collect_markdown_files(
     current: &Path,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), SourceError> {
-    let mut entries = fs::read_dir(current)?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
+    let mut entries = match fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .map(|entry| entry.path())
+    .collect::<Vec<_>>();
     entries.sort();
 
     for path in entries {
@@ -998,7 +1005,9 @@ fn snapshot_markdown_root(root: &Path) -> Result<MarkdownRootSnapshot, SourceErr
     let mut entries = BTreeMap::new();
     for relative in files {
         let absolute = root.join(&relative);
-        let metadata = fs::metadata(&absolute)?;
+        let Some(metadata) = file_metadata_if_present(&absolute)? else {
+            continue;
+        };
         let modified = metadata
             .modified()
             .ok()
@@ -1043,9 +1052,35 @@ impl WatchBatcher {
     }
 }
 
+#[cfg(test)]
 fn read_markdown_document(root: &Path, relative: &Path) -> Result<MarkdownDocument, SourceError> {
     let absolute = root.join(relative);
     let raw = fs::read_to_string(&absolute)?;
+    Ok(markdown_document_from_raw(relative, raw))
+}
+
+fn read_markdown_document_if_present(
+    root: &Path,
+    relative: &Path,
+) -> Result<Option<MarkdownDocument>, SourceError> {
+    let absolute = root.join(relative);
+    let raw = match fs::read_to_string(&absolute) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(markdown_document_from_raw(relative, raw)))
+}
+
+fn file_metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>, SourceError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn markdown_document_from_raw(relative: &Path, raw: String) -> MarkdownDocument {
     let (frontmatter, body, has_frontmatter) = parse_frontmatter(&raw);
     let headings = extract_headings(&body);
     let mut tags = extract_frontmatter_strings(frontmatter.as_ref(), &["tags", "tag"]);
@@ -1061,7 +1096,7 @@ fn read_markdown_document(root: &Path, relative: &Path) -> Result<MarkdownDocume
         .or_else(|| headings.first().cloned())
         .unwrap_or_else(|| filename_title(relative));
 
-    Ok(MarkdownDocument {
+    MarkdownDocument {
         path: normalize_relative_path(relative).unwrap_or_else(|| relative.to_path_buf()),
         raw: raw.clone(),
         body,
@@ -1073,7 +1108,7 @@ fn read_markdown_document(root: &Path, relative: &Path) -> Result<MarkdownDocume
         headings,
         source_hash: stable_hash_hex(raw.as_bytes()),
         has_frontmatter,
-    })
+    }
 }
 
 fn markdown_directories(documents: &[MarkdownDocument]) -> BTreeSet<PathBuf> {
@@ -2188,8 +2223,9 @@ mod tests {
         MARKDOWN_DOCUMENT_LABEL, MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, MarkdownAliasAmbiguity,
         MarkdownAliasDiagnostics, MarkdownDocument, MarkdownLinkRef, MarkdownLinkSource,
         MarkdownSyncOptions, build_resolution_index, configured_markdown_root,
-        extract_document_link_refs, markdown_alias_diagnostics, read_markdown_document,
-        resolve_link_path, set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
+        extract_document_link_refs, file_metadata_if_present, markdown_alias_diagnostics,
+        read_markdown_document, read_markdown_document_if_present, resolve_link_path,
+        set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
     };
     use crate::engine::{CupldEngine, PropertyMap, Value};
 
@@ -2269,6 +2305,28 @@ Body with [[other]] and [deep](docs/page.md#intro) and #tagged
         assert!(!bad.has_frontmatter);
         assert!(bad.frontmatter.is_none());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_markdown_files_are_skipped_during_racy_reads() {
+        let root = temp_dir("missing_markdown");
+        fs::create_dir_all(&root).unwrap();
+
+        let document = read_markdown_document_if_present(&root, Path::new("vanished.md")).unwrap();
+
+        assert_eq!(document, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_markdown_metadata_is_skipped_during_racy_snapshots() {
+        let root = temp_dir("missing_metadata");
+        fs::create_dir_all(&root).unwrap();
+
+        let metadata = file_metadata_if_present(&root.join("vanished.md")).unwrap();
+
+        assert!(metadata.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

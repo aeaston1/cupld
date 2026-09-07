@@ -2148,6 +2148,7 @@ fn print_memory_report(report: &MemoryMaintenanceReport, output: OutputFormat) {
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn run_sync_markdown(
     db_path: PathBuf,
     root_override: Option<PathBuf>,

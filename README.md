@@ -191,15 +191,12 @@ Use `[markdown] include_fs_graph = true` to enable filesystem graph sync for `cu
 
 ## Development
 
-Run the Rust test suite from a checkout:
+Run the local hygiene gate from a checkout:
 
 ```bash
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-```
-
-Run the default deterministic memory eval suite against committed fixtures and snapshots:
-
-```bash
 cargo run --locked -- eval memory --ci
 ```
 
