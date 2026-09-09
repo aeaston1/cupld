@@ -1,36 +1,59 @@
-# cupld
+# cupld Agent Guide
 
-`cupld` is a local graph database CLI and REPL.
+`cupld` is an in-process graph database. Use its CLI to let your existing agent inspect, query, and update your graphs, or embed its dependency-free Rust library in an application.
 
-This is the canonical agent guide for current shipped behavior. Use the [`docs` index](../README.md) for the public docs map and treat `internal/` roadmap and design notes as historical planning material.
+This is the canonical guide for shipped CLI behavior. The [docs index](../README.md) links the core audit and resource benchmarks. [Markdown memory](../memory.md) remains a supported specialized workflow; its detailed contracts appear later in this guide.
 
 ## Start Here
 
-- For agent harnesses, use the MCP path first: configure `cupld mcp serve --db default`, call `memory_health` and `memory_doctor`, then use `memory_search`, `memory_get`, `memory_context`, `memory_add`, or `memory_sync`.
-- Use `cupld install --mcp --target <codex|claude|opencode> --scope <cwd|home> --db default` to generate or inspect harness config. Add `--dry-run` before writing files.
-- `memory_health` reports DB path, markdown root, root existence, read-only mode, write readiness, last transaction id, and the DB-backed sync visibility rule.
-- `memory_doctor` is the harness diagnostic check: it should report pass/warn/fail status, structured checks, and machine-readable next actions before an agent relies on memory state.
-- MCP reads are DB-backed only. `memory_search`, `memory_get`, and `memory_context` never scan markdown files or auto-sync; after direct markdown edits, call `memory_sync` before expecting those tools to see the new content.
-- Use CLI `query` and `context` only as advanced fallbacks for exact graph inspection, custom automation, or exported seeded context when MCP cannot cover the workflow.
-- Keep REPL, visualise, watch-mode tuning, `eval memory`, and broad query exploration as human/operator or developer workflows, not first-page agent steps.
-- Use `--db default` to target `./.cupld/default.cupld`.
-- Use `--output json` or `--output ndjson` for machine consumption where supported.
-- Opening or checking a database from an older `cupld` release may upgrade the `.cupld` file in place. Treat on-disk databases as forward-only during beta if rollback matters.
-- Interactive REPL startup can prompt to install when no skill install is tracked, or to refresh when tracked bundle metadata is stale.
+- Use `cupld query --db <path.cupld> --output json ...` as the primary agent interface for graph reads and writes.
+- Inspect the database with `SHOW SCHEMA`, `SHOW INDEXES`, `SHOW CONSTRAINTS`, and `SHOW STATS` through `query`. Use named parameters for values supplied by the user.
+- Use `cupld context --node <id> ...` for a bounded neighborhood around a known graph node. Discover IDs with a query first.
+- Use `cupld check --db <path.cupld>` for storage integrity. `check` prints text; `schema` prints a table. Neither accepts `--output`.
+- Queries are read/write by default. There is no generic `query --read-only` option; use explicit transactions for multi-statement batches.
+- Follow the [quickstart](../../README.md#quickstart) to create a database through REPL stdin. One-shot queries require an existing file.
+- Use `--db default` only when you intend the workspace's `./.cupld/default.cupld` database.
+- Opening or checking an older database may migrate it in place; see [Database Persistence](#database-persistence).
 
-## Agent Surface Audit
+## Agent Workflow
 
-| Surface | Classification | Agent guidance |
-| --- | --- | --- |
-| `install --mcp`, manual MCP config, `mcp serve --db default` | primary agent path | Preferred harness entrypoint. MCP startup is local and quiet by default. |
-| MCP `memory_health`, `memory_doctor`, `memory_search`, `memory_get`, `memory_list`, `memory_context`, `memory_add`, `memory_sync` | primary agent path | Use for routine memory health, diagnostics, retrieval, bounded context expansion, writes, and explicit sync. |
-| `query`, `context` JSON/NDJSON | advanced agent fallback | Use for exact graph inspection or seeded context export when MCP tools are unavailable or insufficient. |
-| `query --with-md` | advanced agent fallback | Transient overlay only; prefer persisted sync plus DB-backed MCP reads for normal memory. |
-| `schema`, `check`, `compact`, `source set-root`, `sync markdown` one-shot | advanced agent fallback | Useful for setup, validation, and explicit persisted sync. |
-| REPL, dot-commands, visualise, `sync markdown --watch` timing knobs | human/operator only | Keep out of normal harness flows. |
-| `eval memory` | developer/CI only | Deterministic local validation, not runtime memory access. |
-| `memory repair`, `memory citation-audit` | deferred | Parsed only as unsupported deferred commands; agents should not call them. |
-| `context --top-k` | compatibility/error contract | Removed behavior retained only as stable rejection code `context_legacy_top_k_removed`. |
+For a generic graph task:
+
+1. Select the database file explicitly and run `cupld check --db graph.cupld`.
+2. Inspect its schema using `cupld query --db graph.cupld --output json 'SHOW SCHEMA'` and the relevant index/constraint catalogs.
+3. Run a parameterized query with explicit `ORDER BY` and `LIMIT` where result order and size matter.
+4. Use returned node IDs with `context` when a neighborhood answers the next question.
+5. Make requested changes through `CREATE`, `MERGE`, `SET`, `REMOVE`, or `DELETE`. Verify the resulting graph with another query.
+
+For example, following the root quickstart, update and read back one person in an explicit transaction:
+
+```bash
+cupld query --db graph.cupld --output json --params-json '{"name":"Ada","role":"engineer"}' <<'EOF'
+BEGIN;
+MATCH (p:Person {name: $name}) SET p.role = $role;
+MATCH (p:Person {name: $name}) RETURN p.name AS name, p.role AS role;
+COMMIT;
+EOF
+```
+
+Your agent supplies the query; cupld executes graph operations and returns data. No model configuration or memory bootstrap is needed for this workflow. Give the agent the [query surface](#query-surface) and [schema reference](#schema-and-index-surface) so it uses the supported syntax.
+
+For repeatable shell automation, set `CUPLD_NO_INSTALL_PROMPT=1` and `CUPLD_NO_UPGRADE_CHECK=1` to suppress optional setup prompts and release checks.
+
+## Agent Surfaces
+
+| Surface | Use |
+| --- | --- |
+| `query` JSON/NDJSON | Primary interface for schema inspection, graph reads, and requested writes. |
+| `context` JSON/NDJSON | Seeded graph neighborhoods with traversal and response budgets. |
+| `schema`, `check`, `compact` | Table/text inspection, integrity validation, and explicit maintenance. |
+| REPL and dot-commands | Interactive exploration; stdin also supports initial database creation. |
+| `--visualise` | Graph viewer requiring an interactive terminal. |
+| `install --mcp`, `mcp serve`, `memory_*` tools | Supported specialized markdown memory workflow; see [MCP Memory](#mcp-memory). |
+| `query --with-md`, `sync markdown`, `source set-root` | Markdown overlay, persisted ingestion, and source configuration. |
+| `eval memory` | Developer/CI validation of the memory workflow. |
+
+`memory repair` and `memory citation-audit` are deferred. Legacy `context --top-k` is rejected with `context_legacy_top_k_removed`. Generic create/import/export and machine-readable capability commands are not shipped; see the [core audit](../core-audit.md).
 
 ## CLI Shape
 
@@ -139,10 +162,10 @@ success payloads keep their current shapes.
 
 ## Query, Search, And Context
 
-Use `cupld query` when you need exact graph reads, global listings, schema-driven inspection, or deterministic node discovery:
+Use `cupld query` for graph reads, requested writes, schema-driven inspection, and deterministic node discovery:
 
 ```bash
-cupld query --db default 'MATCH (n) RETURN id(n), labels(n), n.name, n.`src.path` ORDER BY id(n) LIMIT 25'
+cupld query --db default 'MATCH (n) RETURN id(n) AS node_id, labels(n) AS labels, n.name AS name ORDER BY id(n) LIMIT 25'
 ```
 
 Use `cupld context` after you already know the seed node ID or synced markdown path. Table output is compact and human-facing, with rows for seeds, nodes, and edges:
@@ -165,145 +188,9 @@ JSON output contains top-level `ok`, `command`, `mode`, `policy`, `retrieval_usa
 
 NDJSON output writes one `context_meta` line, then all `context_seed` lines in request order, then deterministic `context_node` lines, then deterministic `context_edge` lines. `context_meta` carries `ok`, `command`, `policy`, `retrieval_usage`, `provenance`, and `warnings`; seed/node/edge lines carry `seed`, `node_index` plus `node`, or `edge_index` plus `edge`.
 
-The hard cutover from legacy global top-k context is complete. `cupld context --top-k ...` is rejected with `context_legacy_top_k_removed`, and `cupld context` without `--node` or `--path` is rejected with `context_seed_required`.
+Global top-k context is no longer supported. `cupld context --top-k ...` is rejected with `context_legacy_top_k_removed`, and `cupld context` without `--node` or `--path` is rejected with `context_seed_required`.
 
 `search` is not a shipped CLI command yet. Snippets, semantic search, and query-aware scoring are future work, so agents should not rely on `context` as a semantic retriever.
-
-## MCP Memory
-
-Start the local memory MCP server manually:
-
-```bash
-cupld mcp serve --db default
-```
-
-Codex config example:
-
-```toml
-[mcp_servers.cupld-memory]
-command = "cupld"
-args = ["mcp", "serve", "--db", "default"]
-```
-
-Claude config example:
-
-```json
-{
-  "mcpServers": {
-    "cupld-memory": {
-      "command": "cupld",
-      "args": ["mcp", "serve", "--db", "default"]
-    }
-  }
-}
-```
-
-Recommended persistent instruction snippet:
-
-```md
-## Memory
-Use the cupld MCP server for durable local memory.
-Before non-trivial tasks, search memory when prior preferences, project decisions,
-architecture choices, recurring workflows, or local notes may matter.
-When the user explicitly asks you to remember something, call `memory_add`.
-Do not store secrets, credentials, tokens, private keys, or transient command output.
-```
-
-MCP tools:
-
-- `memory_health`
-- `memory_doctor`
-- `memory_get`
-- `memory_list`
-- `memory_search`
-- `memory_context`
-- `memory_sync`
-- `memory_add`
-
-MCP resources:
-
-- `memory://index`
-- `memory://recent`
-- `memory://note/{path}`
-- `memory://tag/{tag}`
-- `memory://config`
-
-MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. Cooperating cupld writers are serialized at persistence. Underlying persistence failures report `database_busy` for overlapping writes or `database_changed` for stale sessions; MCP write tools retain their existing `sync_failed` response wrappers and include the persistence reason in the message. Reopen after a stale-session error. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
-
-`memory_add` creates a new note and never replaces an existing file. Without `path_hint`, it uses the title slug and adds a numeric suffix when needed: `project-detail.md`, `project-detail-2.md`, and so on. An omitted title starts at `memory-note.md`. Use the returned `note_path` and `uri` for the actual allocated identity. With an explicit `path_hint`, an occupied path returns `ok: false` with `error.code: "already_exists"`, preserving the existing file and DB state. Existing file symlinks, including dangling links, count as occupied paths and are never followed when creating a note. Parent directories must resolve inside the configured markdown root; an escaping parent symlink returns `invalid_path` before creating anything beneath it. To update a note, edit its markdown file with normal filesystem tools, then call `memory_sync`. A response with `status: "markdown_written_sync_failed"` means the note is already written at `note_path`; call `memory_sync` to ingest it instead of calling `memory_add` again, which would create a duplicate note.
-
-`memory_context` expands from a search result URI/path or explicit node/path seeds into the same bounded context envelope as `cupld context --output json`. Accepted arguments include `id_or_uri`, `path`, `paths`, `node`, `nodes`, `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`. This lets MCP-capable harnesses move from `memory_search` to prompt context without shelling out.
-
-After `memory_sync` records a deletion (`src.status = missing`), ordinary MCP reads exclude that note: `memory_search` (including indexed candidates), `memory_get`, `memory_list`, and note/index/recent/tag resources. Deleted notes do not consume result limits or affect structural ranking. A deleted note lookup returns `not_found`; recreating its file and syncing makes the same note identity readable again. Reads continue to reflect the last sync, so deleting a file alone does not immediately hide it.
-
-`memory_context` also excludes tombstoned `MarkdownDocument` and `MarkdownDirectory` nodes and their incident edges before resolving seeds and traversing the graph. Directory tombstones are recorded only by filesystem-graph syncs: `memory_sync` (and the sync inside `memory_add`) honors the `[markdown] include_fs_graph` setting of the workspace `mcp serve` runs in, so with that setting enabled an MCP sync marks a deleted directory missing just like `cupld sync markdown --include-fs-graph`; without it, `memory_sync` tombstones the deleted documents but leaves directory nodes untouched. Deleted node/path seeds return the existing `context_seed_not_found`/`context_seed_path_not_found` errors; deleted URI/title seeds return `not_found`. Tombstones cannot bridge traversal or consume retrieval budgets. For compatibility, notes with no `src.status` and native graph nodes remain readable. The native `cupld context` command and explicit graph queries retain their existing historical access, including tombstones and stale-source warnings.
-
-`memory_doctor` returns the agent-facing memory readiness report. It should identify itself with `tool: "memory_doctor"`, use the same `pass` / `warn` / `fail` status vocabulary as memory maintenance reports, include a non-empty `checks` array, explain DB-backed sync visibility, and provide `next_actions` such as calling `memory_sync` when markdown edits may not be reflected in DB-backed reads.
-
-### `memory_search` Contract
-
-`memory_search` is a local, deterministic lexical retriever over synced `MarkdownDocument` rows in the configured cupld DB by default. It does not call networks, embedding services, model APIs, vector indexes, or other external services. Semantic or vector retrieval is an explicit opt-in boundary only; cupld does not generate embeddings, download models, contact providers, or silently fall back to lexical results when semantic retrieval is requested but unconfigured.
-
-Input arguments:
-
-- `query` string, required. The server trims surrounding whitespace before matching. Missing, empty, or whitespace-only queries return `{"ok":false,"error":{"code":"validation_error",...}}` and never match every document.
-- `limit` unsigned integer, optional. Defaults to `10` and is capped at `50`.
-- `tags` array of strings, optional. Every requested tag must be present on a document before lexical scoring is applied.
-- `retrieval_mode` string, optional. Omitted or `lexical` uses deterministic local lexical search. `semantic` or `vector` requests the semantic backend boundary. With no configured local vector backend, semantic/vector mode returns `{"ok":false,"error":{"code":"unconfigured",...}}`, `items: []`, `retrieval.network_used: false`, and never runs lexical fallback. `mode` and `retrieval` are accepted aliases for compatibility with callers that already reserve those names.
-
-Successful output is a JSON object in the MCP text content:
-
-- `ok`: `true`.
-- `query`: the trimmed query string used for matching.
-- `retrieval`: machine-readable retrieval contract metadata. Default values are `mode: "lexical"`, `deterministic: true`, `semantic: false`, and `index_used`, plus string descriptions of the ranking and score policies. `index_used` is `true` only when existing ready MarkdownDocument indexes were used to generate candidates; ranking and result shape remain the same as deterministic fallback.
-- `items`: ordered result items.
-- `truncated`: `true` when more matched rows existed than the returned `limit`.
-- `provenance`: local DB provenance, including `source: "cupld_db"` and `network_used: false`.
-
-Each `items[]` entry preserves the existing compatibility fields `id`, `uri`, `path`, `title`, `tags`, `snippet`, and `updated_at`. Search also adds:
-
-- `rank`: 1-based position after deterministic sorting.
-- `score`: lexical score tier. Lower is more relevant.
-- `lexical_score`: the lexical score tier, matching `score` for compatibility.
-- `semantic_score`: `null` for lexical results.
-- `blended_score`: `null` for lexical results.
-- `matched_fields`: one or more fields explaining why the row matched, such as `title`, `path`, `tags`, `aliases`, `headings`, or `body`.
-- `matched_category`: the score category: `exact_title_or_path`, `partial_title_or_path`, `structured_metadata`, or `body`.
-- `snippet_metadata`: `source`, `max_chars`, `truncated`, and `empty_body_fallback`.
-
-Ranking policy is intentionally simple and stable: exact title/path matches score `0`, partial title/path matches score `1`, tag/alias/heading matches score `2`, and body matches score `3`. Results sort by ascending `score`, then ascending `path` for ties. The score is a deterministic tier, not a semantic relevance probability.
-
-Snippets are capped at 500 Unicode scalar values. When `md.body` is present, the snippet comes from `md.body`; when `md.body` is empty, it falls back to `md.raw` and sets `empty_body_fallback: true`. `snippet_metadata.truncated` reports whether the selected snippet source exceeded the cap.
-
-Recommended optional MarkdownDocument search indexes are explicit operator actions using existing query syntax:
-
-```bash
-cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.body\`) KIND FULLTEXT"
-cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.tags\`) KIND LIST"
-```
-
-Inspect the configured indexes and planner path with:
-
-```bash
-cupld query --db default "SHOW INDEXES ON :MarkdownDocument"
-cupld query --db default "EXPLAIN MATCH (d:MarkdownDocument) WHERE d.\`md.body\` CONTAINS 'term' RETURN d.\`src.path\`"
-```
-
-`memory_search` never creates these indexes during read-only MCP search. `memory reindex` continues to inspect and report existing schema index definitions without creating new indexes.
-
-## Agent Workflow
-
-For safe automation, prefer this order:
-
-1. Configure MCP with `cupld install --mcp --target <target> --scope <cwd|home> --db default --dry-run`, then rerun without `--dry-run` when the config looks right.
-2. Call `memory_health` and check `ok`, `db_path`, `markdown_root`, `markdown_root_exists`, `read_only`, `safe_for_writes`, and `write_status`.
-3. Call `memory_doctor` and check `status`, `checks`, and `next_actions` before relying on memory state.
-4. Use `memory_search` for retrieval, then `memory_get` for full note text or `memory_context` with the result `uri` when prompt assembly needs bounded graph context. Treat the search result `uri` as the identity for both follow-up calls.
-5. Use `memory_add` when the user asks you to remember something. Use `memory_sync` after direct markdown edits.
-6. Fall back to `cupld query --db default --output json ...` or `cupld context --db default --path notes/example.md --output json` only when MCP cannot express the graph operation.
-7. Use `cupld query --db default --with-md ...` only for advanced transient reads where persisting sync state is intentionally not desired.
-
-Use explicit transactions for multi-statement batches. Outside a transaction, mutating statements commit immediately.
 
 ## Common Commands
 
@@ -481,18 +368,183 @@ Examples:
 
 ```bash
 cupld query --db default --params-json '{"label":"Person","property":"age"}' \
-  "CREATE OR REPLACE INDEX idx_person_lookup ON :$label($property)"
+  'CREATE OR REPLACE INDEX idx_person_lookup ON :$label($property)'
 cupld query --db default "ALTER INDEX idx_person_lookup SET STATUS INVALID"
 ```
 
 ```bash
 cupld query --db default "
+BEGIN;
+CREATE LABEL Article;
 CREATE INDEX ON :Article(published) KIND RANGE;
 CREATE INDEX ON :Article(tags) KIND LIST;
 CREATE INDEX ON :Article(body) KIND FULLTEXT;
-SHOW INDEXES ON :Article
+SHOW INDEXES ON :Article;
+COMMIT;
 "
 ```
+
+## Automation Contracts
+
+`query` and `context` expose machine contracts when `--output json` or `--output ndjson` is selected.
+
+- `cupld query --output json` writes one JSON envelope to stdout with `ok`, `command`, `policy`, and `results`.
+- `cupld query --output ndjson` writes one `query_meta` line, one `query_result` line per result set, and one `query_row` line per returned row.
+- `cupld context --output json` writes one seeded JSON envelope to stdout with `ok`, `command`, `mode`, `policy`, `retrieval_usage`, `provenance`, `request`, `seeds`, `nodes`, `edges`, and `warnings`.
+- `cupld context --output ndjson` writes one `context_meta` line followed by deterministic `context_seed`, `context_node`, and `context_edge` lines.
+- `cupld schema --db ...` prints a table and `cupld check --db ...` prints a text integrity summary; neither accepts `--output`. Use `cupld query --db graph.cupld --output json 'SHOW SCHEMA'` for machine-readable schema data. `cupld memory check --output json` is the separate markdown maintenance report.
+- `cupld memory check|find-stale|find-orphans|reindex --output json` writes one JSON envelope to stdout with `ok`, `command`, `status`, resolved `db_path`, resolved `root` where applicable, `summary`, `checks`, and `items`.
+- `cupld memory ... --output ndjson` writes one `memory_meta` line, one `memory_check` line per check, and one `memory_item` line per item.
+- `cupld memory ... --output table` is the default human-readable sectioned table format.
+- Memory maintenance `status` values are stable: `pass`, `warn`, and `fail`.
+- Query parameter, database-open, and execution failures in JSON or NDJSON mode write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`. Query CLI argument errors and missing query text currently remain plain text. Context-specific parse and execution errors use machine envelopes. Check the process exit status as well as output; general command failures exit with code 1.
+- Memory maintenance failures in JSON or NDJSON mode also write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
+
+Current automation controls:
+
+- `CUPLD_QUERY_MAX_ROWS` sets the default `query --max-rows` cap (otherwise 1,000 rows per result set). This cap truncates output after execution; JSON/NDJSON result metadata reports `truncated`.
+- `CUPLD_NO_INSTALL_PROMPT=1` disables optional install and refresh prompts on REPL startup.
+- `CUPLD_NO_UPGRADE_CHECK=1` disables optional release checks.
+- Prefer explicit `ORDER BY` plus explicit `LIMIT` for deterministic context windows.
+- Use named parameters with `--params-json` or `--params-file`.
+
+Query results and NDJSON lines are currently materialized in memory before output. `--max-rows`, query `LIMIT`, and context response budgets do not establish a working-memory cap. Context payloads have a 64 KiB budget, but building the neighborhood still loads the graph. Larger-than-RAM storage and execution are roadmap work, not current guarantees.
+
+## MCP Memory
+
+The MCP server provides the supported specialized memory workflow. For arbitrary graph queries, use the CLI described above. Follow the [memory setup guide](../memory.md) to bootstrap the database, then start the server manually:
+
+```bash
+cupld mcp serve --db default
+```
+
+Codex config example:
+
+```toml
+[mcp_servers.cupld-memory]
+command = "cupld"
+args = ["mcp", "serve", "--db", "default"]
+```
+
+Claude config example:
+
+```json
+{
+  "mcpServers": {
+    "cupld-memory": {
+      "command": "cupld",
+      "args": ["mcp", "serve", "--db", "default"]
+    }
+  }
+}
+```
+
+Recommended persistent instruction snippet:
+
+```md
+## Memory
+Use the cupld MCP server for durable local memory.
+Before non-trivial tasks, search memory when prior preferences, project decisions,
+architecture choices, recurring workflows, or local notes may matter.
+When the user explicitly asks you to remember something, call `memory_add`.
+Do not store secrets, credentials, tokens, private keys, or transient command output.
+```
+
+MCP tools:
+
+- `memory_health`
+- `memory_doctor`
+- `memory_get`
+- `memory_list`
+- `memory_search`
+- `memory_context`
+- `memory_sync`
+- `memory_add`
+
+MCP resources:
+
+- `memory://index`
+- `memory://recent`
+- `memory://note/{path}`
+- `memory://tag/{tag}`
+- `memory://config`
+
+MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. Cooperating cupld writers are serialized at persistence. Underlying persistence failures report `database_busy` for overlapping writes or `database_changed` for stale sessions; MCP write tools retain their existing `sync_failed` response wrappers and include the persistence reason in the message. Reopen after a stale-session error. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
+
+`memory_add` creates a new note and never replaces an existing file. Without `path_hint`, it uses the title slug and adds a numeric suffix when needed: `project-detail.md`, `project-detail-2.md`, and so on. An omitted title starts at `memory-note.md`. Use the returned `note_path` and `uri` for the actual allocated identity. With an explicit `path_hint`, an occupied path returns `ok: false` with `error.code: "already_exists"`, preserving the existing file and DB state. Existing file symlinks, including dangling links, count as occupied paths and are never followed when creating a note. Parent directories must resolve inside the configured markdown root; an escaping parent symlink returns `invalid_path` before creating anything beneath it. To update a note, edit its markdown file with normal filesystem tools, then call `memory_sync`. A response with `status: "markdown_written_sync_failed"` means the note is already written at `note_path`; call `memory_sync` to ingest it instead of calling `memory_add` again, which would create a duplicate note.
+
+`memory_context` expands from a search result URI/path or explicit node/path seeds into the same bounded context envelope as `cupld context --output json`. Accepted arguments include `id_or_uri`, `path`, `paths`, `node`, `nodes`, `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`. This lets MCP-capable harnesses move from `memory_search` to prompt context without shelling out.
+
+After `memory_sync` records a deletion (`src.status = missing`), ordinary MCP reads exclude that note: `memory_search` (including indexed candidates), `memory_get`, `memory_list`, and note/index/recent/tag resources. Deleted notes do not consume result limits or affect structural ranking. A deleted note lookup returns `not_found`; recreating its file and syncing makes the same note identity readable again. Reads continue to reflect the last sync, so deleting a file alone does not immediately hide it.
+
+`memory_context` also excludes tombstoned `MarkdownDocument` and `MarkdownDirectory` nodes and their incident edges before resolving seeds and traversing the graph. Directory tombstones are recorded only by filesystem-graph syncs: `memory_sync` (and the sync inside `memory_add`) honors the `[markdown] include_fs_graph` setting of the workspace `mcp serve` runs in, so with that setting enabled an MCP sync marks a deleted directory missing just like `cupld sync markdown --include-fs-graph`; without it, `memory_sync` tombstones the deleted documents but leaves directory nodes untouched. Deleted node/path seeds return the existing `context_seed_not_found`/`context_seed_path_not_found` errors; deleted URI/title seeds return `not_found`. Tombstones cannot bridge traversal or consume retrieval budgets. For compatibility, notes with no `src.status` and native graph nodes remain readable. The native `cupld context` command and explicit graph queries retain their existing historical access, including tombstones and stale-source warnings.
+
+`memory_doctor` returns the agent-facing memory readiness report. It should identify itself with `tool: "memory_doctor"`, use the same `pass` / `warn` / `fail` status vocabulary as memory maintenance reports, include a non-empty `checks` array, explain DB-backed sync visibility, and provide `next_actions` such as calling `memory_sync` when markdown edits may not be reflected in DB-backed reads.
+
+### `memory_search` Contract
+
+`memory_search` is a local, deterministic lexical retriever over synced `MarkdownDocument` rows in the configured cupld DB by default. It does not call networks, embedding services, model APIs, vector indexes, or other external services. Semantic or vector retrieval is an explicit opt-in boundary only; cupld does not generate embeddings, download models, contact providers, or silently fall back to lexical results when semantic retrieval is requested but unconfigured.
+
+Input arguments:
+
+- `query` string, required. The server trims surrounding whitespace before matching. Missing, empty, or whitespace-only queries return `{"ok":false,"error":{"code":"validation_error",...}}` and never match every document.
+- `limit` unsigned integer, optional. Defaults to `10` and is capped at `50`.
+- `tags` array of strings, optional. Every requested tag must be present on a document before lexical scoring is applied.
+- `retrieval_mode` string, optional. Omitted or `lexical` uses deterministic local lexical search. `semantic` or `vector` requests the semantic backend boundary. With no configured local vector backend, semantic/vector mode returns `{"ok":false,"error":{"code":"unconfigured",...}}`, `items: []`, `retrieval.network_used: false`, and never runs lexical fallback. `mode` and `retrieval` are accepted aliases for compatibility with callers that already reserve those names.
+
+Successful output is a JSON object in the MCP text content:
+
+- `ok`: `true`.
+- `query`: the trimmed query string used for matching.
+- `retrieval`: machine-readable retrieval contract metadata. Default values are `mode: "lexical"`, `deterministic: true`, `semantic: false`, and `index_used`, plus string descriptions of the ranking and score policies. `index_used` is `true` only when existing ready MarkdownDocument indexes were used to generate candidates; ranking and result shape remain the same as deterministic fallback.
+- `items`: ordered result items.
+- `truncated`: `true` when more matched rows existed than the returned `limit`.
+- `provenance`: local DB provenance, including `source: "cupld_db"` and `network_used: false`.
+
+Each `items[]` entry preserves the existing compatibility fields `id`, `uri`, `path`, `title`, `tags`, `snippet`, and `updated_at`. Search also adds:
+
+- `rank`: 1-based position after deterministic sorting.
+- `score`: lexical score tier. Lower is more relevant.
+- `lexical_score`: the lexical score tier, matching `score` for compatibility.
+- `semantic_score`: `null` for lexical results.
+- `blended_score`: `null` for lexical results.
+- `matched_fields`: one or more fields explaining why the row matched, such as `title`, `path`, `tags`, `aliases`, `headings`, or `body`.
+- `matched_category`: the score category: `exact_title_or_path`, `partial_title_or_path`, `structured_metadata`, or `body`.
+- `snippet_metadata`: `source`, `max_chars`, `truncated`, and `empty_body_fallback`.
+
+Ranking policy is intentionally simple and stable: exact title/path matches score `0`, partial title/path matches score `1`, tag/alias/heading matches score `2`, and body matches score `3`. Results sort by ascending `score`, then ascending `path` for ties. The score is a deterministic tier, not a semantic relevance probability.
+
+Snippets are capped at 500 Unicode scalar values. When `md.body` is present, the snippet comes from `md.body`; when `md.body` is empty, it falls back to `md.raw` and sets `empty_body_fallback: true`. `snippet_metadata.truncated` reports whether the selected snippet source exceeded the cap.
+
+Recommended optional MarkdownDocument search indexes are explicit operator actions using existing query syntax:
+
+```bash
+cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.body\`) KIND FULLTEXT"
+cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.tags\`) KIND LIST"
+```
+
+Inspect the configured indexes and planner path with:
+
+```bash
+cupld query --db default "SHOW INDEXES ON :MarkdownDocument"
+cupld query --db default "EXPLAIN MATCH (d:MarkdownDocument) WHERE d.\`md.body\` CONTAINS 'term' RETURN d.\`src.path\`"
+```
+
+`memory_search` never creates these indexes during read-only MCP search. `memory reindex` continues to inspect and report existing schema index definitions without creating new indexes.
+
+## Memory Agent Workflow
+
+For the specialized markdown memory workflow, prefer this order:
+
+1. Configure MCP with `cupld install --mcp --target <target> --scope <cwd|home> --db default --dry-run`, then rerun without `--dry-run` when the config looks right.
+2. Call `memory_health` and check `ok`, `db_path`, `markdown_root`, `markdown_root_exists`, `read_only`, `safe_for_writes`, and `write_status`.
+3. Call `memory_doctor` and check `status`, `checks`, and `next_actions` before relying on memory state.
+4. Use `memory_search` for retrieval, then `memory_get` for full note text or `memory_context` with the result `uri` when prompt assembly needs bounded graph context. Treat the search result `uri` as the identity for both follow-up calls.
+5. Use `memory_add` when the user asks you to remember something. Use `memory_sync` after direct markdown edits.
+6. Use `cupld query --db default --output json ...` or `cupld context --db default --path notes/example.md --output json` for graph operations beyond the memory tools.
+7. Use `cupld query --db default --with-md ...` only for advanced transient reads where persisting sync state is intentionally not desired.
+
+Use explicit transactions for multi-statement batches. Outside a transaction, mutating statements commit immediately.
 
 ## Markdown Memory And Watch Mode
 
@@ -524,7 +576,7 @@ Useful commands:
 
 ```bash
 cupld query --db default --with-md \
-  "MATCH (d:MarkdownDocument) RETURN d.`src.path`, d.`md.title` ORDER BY d.`src.path`"
+  'MATCH (d:MarkdownDocument) RETURN d.`src.path`, d.`md.title` ORDER BY d.`src.path`'
 ```
 
 ```bash
@@ -614,34 +666,12 @@ Markdown notes:
 - Fragments remain document-level: `other.md#section` resolves to `other.md`, while `#section` alone creates no edge.
 - Malformed frontmatter falls back to body-only parsing.
 
-## Automation Contracts
-
-`query`, `context`, and `check` expose stable machine contracts when `--output json` or `--output ndjson` is selected.
-
-- `cupld query --output json` writes one JSON envelope to stdout with `ok`, `command`, `policy`, and `results`.
-- `cupld query --output ndjson` writes one `query_meta` line, one `query_result` line per result set, and one `query_row` line per returned row.
-- `cupld context --output json` writes one seeded JSON envelope to stdout with `ok`, `command`, `mode`, `policy`, `retrieval_usage`, `provenance`, `request`, `seeds`, `nodes`, `edges`, and `warnings`.
-- `cupld context --output ndjson` writes one `context_meta` line followed by deterministic `context_seed`, `context_node`, and `context_edge` lines.
-- `cupld check --db ...` reports the database storage integrity summary. Use `cupld memory check --output json` when automation needs the full markdown maintenance envelope.
-- `cupld memory check|find-stale|find-orphans|reindex --output json` writes one JSON envelope to stdout with `ok`, `command`, `status`, resolved `db_path`, resolved `root` where applicable, `summary`, `checks`, and `items`.
-- `cupld memory ... --output ndjson` writes one `memory_meta` line, one `memory_check` line per check, and one `memory_item` line per item.
-- `cupld memory ... --output table` is the default human-readable sectioned table format.
-- Memory maintenance `status` values are stable: `pass`, `warn`, and `fail`.
-- `query` and `context` failures in JSON or NDJSON mode write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
-- Memory maintenance failures in JSON or NDJSON mode also write a machine error envelope to stderr with `ok: false`, `error.code`, and `error.message`.
-
-Current automation controls:
-
-- `CUPLD_QUERY_MAX_ROWS` sets the default `query --max-rows` cap.
-- `CUPLD_NO_INSTALL_PROMPT=1` disables interactive install and refresh prompts on REPL startup.
-- Prefer explicit `ORDER BY` plus explicit `LIMIT` for deterministic context windows.
-- Use named parameters with `--params-json` or `--params-file`.
-
 ## Further Docs
 
 Use this guide for current day-to-day CLI and automation behavior.
 
 - [`../README.md`](../README.md): public docs map and reading order
+- [`../memory.md`](../memory.md): markdown memory setup and maintenance
 - [`./visualise.md`](./visualise.md): notes specific to the `--visualise` scene viewer
 - [`../../README.md`](../../README.md): short project overview
 
