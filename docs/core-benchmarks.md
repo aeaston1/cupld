@@ -2,6 +2,11 @@
 
 `scripts/benchmark_core.py` measures generic graph operations through the embedded Rust API and the actual CLI. It uses a release example, Python 3's standard library, and optional GNU `time`; it adds no Cargo dependencies. Every measured query verifies its expected answer. A failure exits nonzero and leaves a report with `status: "failed"` instead of publishing a successful timing.
 
+The [2026-09-09 baseline and candidate comparison](benchmarks/2026-09-09-core-baseline.md)
+records the first measured read-efficiency change, remaining memory/WAL costs,
+and complete raw reports. CI runs the smoke workload as a correctness check;
+there are no timing or RSS thresholds in that gate.
+
 Run from the checkout with the repository's Rust toolchain and Python 3 available:
 
 ```sh

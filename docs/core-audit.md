@@ -5,6 +5,10 @@ starting revision is `1d982b1` (persistence hardening, PR #53). Source inspectio
 establishes behavior; the [benchmark harness](core-benchmarks.md) establishes
 resource observations. Neither establishes a larger-than-RAM guarantee.
 
+The [first recorded comparison](benchmarks/2026-09-09-core-baseline.md) includes
+the baseline and candidate artifacts, measured read-copy improvement, and
+remaining storage growth and process-memory costs.
+
 ## Product contract
 
 cupld is an in-process property graph database with a CLI and an embedded Rust

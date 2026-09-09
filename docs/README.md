@@ -15,7 +15,7 @@ cupld is an in-process graph database with a CLI for people and their existing a
 - [Viewer](agents/visualise.md): interactive graph exploration
 - [Core audit](core-audit.md): current capabilities, gaps, and database roadmap
 - [Core benchmarks](core-benchmarks.md): reproducible performance and resource measurements
-- [Reliability backlog](backlog.md): previously recorded reliability and retrieval issues
+- [Development roadmap](backlog.md): prioritized core milestones, retained memory work, and resolved reliability issues
 
 The resource goal is bounded RAM and eventual larger-than-RAM graph operation. The current engine loads its graph into memory; response budgets are not an execution-memory guarantee. Treat `internal/` notes as historical planning material and use the public references for current behavior.
 
