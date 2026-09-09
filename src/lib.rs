@@ -31,5 +31,6 @@ pub use source::{
     MarkdownWatchOptions, MarkdownWatchReport, SourceError, configured_markdown_root,
     markdown_alias_diagnostics, set_markdown_root, sync_markdown_root,
     sync_markdown_root_with_options, watch_markdown_root, watch_markdown_root_with_sync_options,
+    watch_markdown_root_with_sync_options_and_persist,
 };
-pub use storage::{IntegrityReport, StorageError};
+pub use storage::{IntegrityReport, StorageError, StorageRevision};

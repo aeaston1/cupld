@@ -239,6 +239,9 @@ enum SourceErrorKind {
     Io,
     Graph(GraphError),
     NodeNotFound,
+    /// A database persistence failure reported by a watch-mode `on_sync`
+    /// callback, carrying the underlying runtime error code.
+    Persistence(&'static str),
 }
 
 impl SourceErrorKind {
@@ -247,6 +250,7 @@ impl SourceErrorKind {
             Self::Io => "io_error",
             Self::Graph(error) => error.code(),
             Self::NodeNotFound => "node_not_found",
+            Self::Persistence(code) => code,
         }
     }
 }
@@ -277,6 +281,12 @@ impl SourceError {
 
     pub fn code(&self) -> &'static str {
         self.kind.as_str()
+    }
+
+    /// Wrap a database persistence failure so a watch-mode `on_sync` callback
+    /// can report it without losing the underlying error code.
+    pub fn persistence(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(SourceErrorKind::Persistence(code), message)
     }
 }
 
@@ -438,12 +448,31 @@ pub fn watch_markdown_root_with_sync_options(
     sync_options: &MarkdownSyncOptions,
     options: &MarkdownWatchOptions,
 ) -> Result<MarkdownWatchReport, SourceError> {
-    let root = normalize_root_path(root)?;
-    let mut last_report = Some(sync_markdown_root_with_options(
+    watch_markdown_root_with_sync_options_and_persist(
         engine,
-        &root,
+        root,
         sync_options,
-    )?);
+        options,
+        &mut |_: &mut CupldEngine, _: &MarkdownSyncReport| Ok(()),
+    )
+}
+
+/// Watch `root` like [`watch_markdown_root_with_sync_options`], calling
+/// `on_sync` with the synced engine after the initial run and after every
+/// later sync run so each run can be persisted before the next one starts.
+/// The callback may replace the engine, for example after reopening a
+/// database that another writer changed; the watch continues with it.
+pub fn watch_markdown_root_with_sync_options_and_persist(
+    engine: &mut CupldEngine,
+    root: &Path,
+    sync_options: &MarkdownSyncOptions,
+    options: &MarkdownWatchOptions,
+    on_sync: &mut dyn FnMut(&mut CupldEngine, &MarkdownSyncReport) -> Result<(), SourceError>,
+) -> Result<MarkdownWatchReport, SourceError> {
+    let root = normalize_root_path(root)?;
+    let initial_report = sync_markdown_root_with_options(engine, &root, sync_options)?;
+    on_sync(engine, &initial_report)?;
+    let mut last_report = Some(initial_report);
     let mut report = MarkdownWatchReport {
         root: root.clone(),
         sync_runs: 1,
@@ -479,6 +508,7 @@ pub fn watch_markdown_root_with_sync_options(
 
         if batcher.should_flush(now, options) {
             let sync_report = sync_markdown_root_with_options(engine, &root, sync_options)?;
+            on_sync(engine, &sync_report)?;
             report.sync_runs += 1;
             last_report = Some(sync_report.clone());
             batcher.flush();

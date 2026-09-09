@@ -9,8 +9,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cupld::{
-    MAX_TRAVERSAL_DEPTH, MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions,
-    MemoryMaintenanceReport, MemoryMaintenanceStatus, QueryResult, RuntimeValue, Session, Value,
+    CupldEngine, MAX_TRAVERSAL_DEPTH, MarkdownSyncOptions, MarkdownSyncReport,
+    MarkdownWatchOptions, MemoryMaintenanceReport, MemoryMaintenanceStatus, QueryResult,
+    RuntimeValue, Session, SourceError, Value,
     automation::{
         AutomationError, AutomationPolicy, format_error_json as machine_error_json,
         parse_params_json as parse_params_json_impl, query_as_json, query_as_ndjson,
@@ -25,7 +26,7 @@ use cupld::{
     memory_eval,
     package::WorkspacePackage,
     set_markdown_root, sync_markdown_root, sync_markdown_root_with_options,
-    watch_markdown_root_with_sync_options,
+    watch_markdown_root_with_sync_options_and_persist,
 };
 use memory_maintenance::{
     build_memory_check_report, run_memory_find_orphans, run_memory_find_stale, run_memory_reindex,
@@ -2166,6 +2167,9 @@ fn run_sync_markdown(
     let include_fs_graph = include_fs_graph || package.configured_markdown_include_fs_graph();
     let sync_options = MarkdownSyncOptions { include_fs_graph };
     let mut engine = session.engine().clone();
+    let resync = |engine: &mut CupldEngine| {
+        sync_markdown_root_with_options(engine, &root, &sync_options).map(|_| ())
+    };
     let report = if watch {
         let options = MarkdownWatchOptions {
             poll_interval,
@@ -2174,9 +2178,19 @@ fn run_sync_markdown(
             idle_timeout,
             max_runs,
         };
-        let report =
-            watch_markdown_root_with_sync_options(&mut engine, &root, &sync_options, &options)
-                .map_err(|error| error.to_string())?;
+        // Persist after every run so a concurrent writer costs at most one
+        // re-sync instead of the whole watch session.
+        let mut on_sync = |engine: &mut CupldEngine, _: &MarkdownSyncReport| {
+            persist_engine_with_retry(&mut session, engine, resync)
+        };
+        let report = watch_markdown_root_with_sync_options_and_persist(
+            &mut engine,
+            &root,
+            &sync_options,
+            &options,
+            &mut on_sync,
+        )
+        .map_err(|error| error.to_string())?;
         println!(
             "watch root={} runs={} events={}",
             report.root.display(),
@@ -2193,18 +2207,13 @@ fn run_sync_markdown(
             tombstoned_directories: 0,
             structural_edges: 0,
         })
-    } else if include_fs_graph {
-        sync_markdown_root_with_options(&mut engine, &root, &sync_options)
-            .map_err(|error| error.to_string())?
     } else {
-        sync_markdown_root_with_options(&mut engine, &root, &sync_options)
-            .map_err(|error| error.to_string())?
+        let report = sync_markdown_root_with_options(&mut engine, &root, &sync_options)
+            .map_err(|error| error.to_string())?;
+        persist_engine_with_retry(&mut session, &mut engine, resync)
+            .map_err(|error| error.to_string())?;
+        report
     };
-    engine.commit().map_err(|error| error.to_string())?;
-    session
-        .replace_engine(engine)
-        .map_err(|error| error.to_string())?;
-    session.save().map_err(|error| error.to_string())?;
     println!(
         "synced root={} scanned={} upserted={} tombstoned={} links={}",
         report.root.display(),
@@ -2221,14 +2230,54 @@ fn run_source_set_root(db_path: PathBuf, root: PathBuf) -> Result<(), String> {
     let root = resolve_markdown_root(Some(&root), None)?;
     let mut engine = session.engine().clone();
     set_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?;
-    engine.commit().map_err(|error| error.to_string())?;
-    session
-        .replace_engine(engine)
-        .map_err(|error| error.to_string())?;
-    session.save().map_err(|error| error.to_string())?;
+    persist_engine_with_retry(&mut session, &mut engine, |engine| {
+        set_markdown_root(engine, &root)
+    })
+    .map_err(|error| error.to_string())?;
     persist_local_package_state(&db_path, &root)?;
     println!("markdown_root {}", root.display());
     Ok(())
+}
+
+const PERSIST_ATTEMPTS: usize = 3;
+const DATABASE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Commit `engine` into `session` and save it. When another cupld writer
+/// changed or is changing the database, reopen it, replay `apply` on the fresh
+/// engine, and try again a bounded number of times. `apply` must be
+/// idempotent against its inputs; markdown sync and root configuration are.
+fn persist_engine_with_retry(
+    session: &mut Session,
+    engine: &mut CupldEngine,
+    mut apply: impl FnMut(&mut CupldEngine) -> Result<(), SourceError>,
+) -> Result<(), SourceError> {
+    let mut attempt = 1;
+    loop {
+        engine.commit()?;
+        let error = match session
+            .replace_engine(engine.clone())
+            .and_then(|()| session.save())
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let retryable = matches!(error.code(), "database_busy" | "database_changed");
+        if !retryable || attempt >= PERSIST_ATTEMPTS {
+            return Err(SourceError::persistence(error.code(), error.message()));
+        }
+        attempt += 1;
+        if error.code() == "database_busy" {
+            thread::sleep(DATABASE_BUSY_RETRY_DELAY);
+        }
+        let path = session
+            .path()
+            .expect("file-backed session has a path")
+            .to_path_buf();
+        *session = Session::open(&path)
+            .map_err(|error| SourceError::persistence(error.code(), error.message()))?;
+        *engine = session.engine().clone();
+        apply(engine)?;
+    }
 }
 
 fn run_mcp_serve(

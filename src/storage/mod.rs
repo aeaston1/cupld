@@ -1,7 +1,8 @@
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::{
@@ -18,6 +19,25 @@ const LEGACY_FORMAT_VERSION: u32 = 0;
 const LEGACY_COMPAT_VERSION: u32 = 0;
 const HEADER_SIZE: usize = 128;
 const WAL_RECORD_MAGIC: &[u8; 4] = b"WALR";
+const WAL_HEADER_SIZE: usize = 48;
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Identifies the exact persisted bytes observed by a reader.
+/// Pass the latest revision to each write; do not reuse it after a successful write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRevision {
+    byte_len: usize,
+    checksum: u64,
+}
+
+impl StorageRevision {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            byte_len: bytes.len(),
+            checksum: checksum(bytes),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct IntegrityReport {
@@ -25,6 +45,7 @@ pub struct IntegrityReport {
     pub last_tx_id: u64,
     pub wal_records: usize,
     pub recovered_tail: bool,
+    pub revision: StorageRevision,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +63,10 @@ struct StorageFormatVersion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StorageErrorKind {
     Io,
+    DatabaseBusy,
+    DatabaseChanged,
+    DatabaseExists,
+    PersistenceUncertain,
     Graph(GraphError),
     FileHeader,
     FileLayout,
@@ -62,6 +87,10 @@ impl StorageErrorKind {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Io => "io_error",
+            Self::DatabaseBusy => "database_busy",
+            Self::DatabaseChanged => "database_changed",
+            Self::DatabaseExists => "database_exists",
+            Self::PersistenceUncertain => "persistence_uncertain",
             Self::Graph(error) => error.code(),
             Self::FileHeader => "file_header",
             Self::FileLayout => "file_layout",
@@ -142,34 +171,40 @@ impl From<GraphError> for StorageError {
     }
 }
 
-pub fn save_compacted(path: &Path, engine: &CupldEngine) -> Result<[u8; 16], StorageError> {
-    let db_uuid = file_uuid();
-    let snapshot = encode_state(&engine.to_state())?;
-    let header = FileHeader {
-        clean: true,
-        db_uuid,
-        snapshot_offset: HEADER_SIZE as u64,
-        snapshot_len: snapshot.len() as u64,
-        wal_offset: (HEADER_SIZE + snapshot.len()) as u64,
-        wal_len: 0,
-        last_tx_id: engine.snapshot().tx_id().get(),
-        snapshot_checksum: checksum(&snapshot),
-        wal_checksum: checksum(&[]),
-    };
-    let bytes = assemble_file(&header, &snapshot, &[]);
-    write_durable(path, &bytes)?;
-    Ok(db_uuid)
+/// Create a new database. Existing destinations are never overwritten.
+pub fn save_compacted(path: &Path, engine: &CupldEngine) -> Result<StorageRevision, StorageError> {
+    let path = canonical_database_path(path)?;
+    // Reject before acquiring the writer so a refused destination gains no
+    // `.lock` sidecar; check again under the lock for concurrent creators.
+    require_new_destination(&path)?;
+    let writer = DatabaseWriter::acquire(&path)?;
+    require_new_destination(&writer.path)?;
+    let bytes = compacted_bytes(engine, file_uuid())?;
+    write_durable(&writer.path, &bytes)?;
+    Ok(StorageRevision::from_bytes(&bytes))
+}
+
+/// Reject destinations that already exist, or cannot name a database file, so
+/// `SAVE AS` never replaces or locks an unrelated path.
+fn require_new_destination(path: &Path) -> Result<(), StorageError> {
+    database_file_name(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(StorageError::new(
+            StorageErrorKind::DatabaseExists,
+            "SAVE AS destination already exists; open it before saving",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn append_commit(
     path: &Path,
     engine: &CupldEngine,
-    db_uuid: Option<[u8; 16]>,
-) -> Result<[u8; 16], StorageError> {
-    if !path.exists() {
-        return save_compacted(path, engine);
-    }
-    let existing = fs::read(path)?;
+    expected: StorageRevision,
+) -> Result<StorageRevision, StorageError> {
+    let writer = DatabaseWriter::acquire(path)?;
+    let existing = writer.read_expected(expected)?;
     let parsed = parse_file(&existing)?;
     let tx_id = engine.snapshot().tx_id().get();
     let state = encode_state(&engine.to_state())?;
@@ -179,7 +214,7 @@ pub fn append_commit(
     wal.extend(record);
     let header = FileHeader {
         clean: true,
-        db_uuid: db_uuid.unwrap_or(parsed.header.db_uuid),
+        db_uuid: parsed.header.db_uuid,
         snapshot_offset: HEADER_SIZE as u64,
         snapshot_len: parsed.snapshot_bytes.len() as u64,
         wal_offset: (HEADER_SIZE + parsed.snapshot_bytes.len()) as u64,
@@ -188,9 +223,15 @@ pub fn append_commit(
         snapshot_checksum: checksum(&parsed.snapshot_bytes),
         wal_checksum: checksum(&wal),
     };
-    let bytes = assemble_file(&header, &parsed.snapshot_bytes, &wal);
-    write_durable(path, &bytes)?;
-    Ok(header.db_uuid)
+    // A read-only probe may supply a legacy revision. Never label legacy snapshot
+    // bytes with the current format when committing through that session.
+    let bytes = if parsed.format.version == FORMAT_VERSION {
+        assemble_file(&header, &parsed.snapshot_bytes, &wal)
+    } else {
+        compacted_bytes(engine, parsed.header.db_uuid)?
+    };
+    write_durable(&writer.path, &bytes)?;
+    Ok(StorageRevision::from_bytes(&bytes))
 }
 
 pub fn load(path: &Path) -> Result<(CupldEngine, IntegrityReport), StorageError> {
@@ -209,22 +250,54 @@ fn load_with_migration_policy(
 ) -> Result<(CupldEngine, IntegrityReport), StorageError> {
     let bytes = fs::read(path)?;
     let parsed = parse_file(&bytes)?;
-    apply_migration_policy(path, parsed.format, migration_policy)?;
+    if migration_policy == MigrationPolicy::MigrateInPlace
+        && plan_migration(parsed.format)?.rewrite_header
+    {
+        // Re-read under the stable sidecar lock: a writer could have committed
+        // between the initial read and lock acquisition.
+        let writer = DatabaseWriter::acquire(path)?;
+        let bytes = fs::read(&writer.path)?;
+        let parsed = parse_file(&bytes)?;
+        let engine = decode_engine(&parsed)?;
+        let revision = if plan_migration(parsed.format)?.rewrite_header {
+            let migrated = compacted_bytes(&engine, parsed.header.db_uuid)?;
+            write_durable(&writer.path, &migrated)?;
+            StorageRevision::from_bytes(&migrated)
+        } else {
+            StorageRevision::from_bytes(&bytes)
+        };
+        let report = integrity_report(&parsed, &engine, revision);
+        return Ok((engine, report));
+    }
+    let engine = decode_engine(&parsed)?;
+    let report = integrity_report(&parsed, &engine, StorageRevision::from_bytes(&bytes));
+    Ok((engine, report))
+}
+
+fn decode_engine(parsed: &ParsedFile) -> Result<CupldEngine, StorageError> {
     let mut state = decode_state(&parsed.snapshot_bytes, parsed.format)?;
     for record in &parsed.wal_records {
         state = decode_state(&record.payload, parsed.format)?;
     }
-    let engine = CupldEngine::from_state(state)?;
-    let report = IntegrityReport {
-        db_uuid: parsed.header.db_uuid,
-        last_tx_id: parsed.header.last_tx_id,
-        wal_records: parsed.wal_records.len(),
-        recovered_tail: parsed.recovered_tail,
-    };
-    Ok((engine, report))
+    Ok(CupldEngine::from_state(state)?)
 }
 
-pub fn compact(path: &Path, engine: &CupldEngine, db_uuid: [u8; 16]) -> Result<(), StorageError> {
+fn integrity_report(
+    parsed: &ParsedFile,
+    engine: &CupldEngine,
+    revision: StorageRevision,
+) -> IntegrityReport {
+    IntegrityReport {
+        db_uuid: parsed.header.db_uuid,
+        // The header may name an interrupted transaction that was not recovered.
+        last_tx_id: engine.snapshot().tx_id().get(),
+        wal_records: parsed.wal_records.len(),
+        recovered_tail: parsed.recovered_tail,
+        revision,
+    }
+}
+
+fn compacted_bytes(engine: &CupldEngine, db_uuid: [u8; 16]) -> Result<Vec<u8>, StorageError> {
     let snapshot = encode_state(&engine.to_state())?;
     let header = FileHeader {
         clean: true,
@@ -237,32 +310,28 @@ pub fn compact(path: &Path, engine: &CupldEngine, db_uuid: [u8; 16]) -> Result<(
         snapshot_checksum: checksum(&snapshot),
         wal_checksum: checksum(&[]),
     };
-    let bytes = assemble_file(&header, &snapshot, &[]);
-    write_durable(path, &bytes)?;
-    Ok(())
+    Ok(assemble_file(&header, &snapshot, &[]))
+}
+
+pub fn compact(
+    path: &Path,
+    engine: &CupldEngine,
+    expected: StorageRevision,
+) -> Result<StorageRevision, StorageError> {
+    let writer = DatabaseWriter::acquire(path)?;
+    let existing = writer.read_expected(expected)?;
+    let parsed = parse_file(&existing)?;
+    let bytes = compacted_bytes(engine, parsed.header.db_uuid)?;
+    write_durable(&writer.path, &bytes)?;
+    Ok(StorageRevision::from_bytes(&bytes))
 }
 
 pub fn check(path: &Path) -> Result<IntegrityReport, StorageError> {
-    check_with_migration_policy(path, MigrationPolicy::MigrateInPlace)
+    load(path).map(|(_, report)| report)
 }
 
 pub(crate) fn check_without_migration(path: &Path) -> Result<IntegrityReport, StorageError> {
-    check_with_migration_policy(path, MigrationPolicy::ReadOnlyProbe)
-}
-
-fn check_with_migration_policy(
-    path: &Path,
-    migration_policy: MigrationPolicy,
-) -> Result<IntegrityReport, StorageError> {
-    let bytes = fs::read(path)?;
-    let parsed = parse_file(&bytes)?;
-    apply_migration_policy(path, parsed.format, migration_policy)?;
-    Ok(IntegrityReport {
-        db_uuid: parsed.header.db_uuid,
-        last_tx_id: parsed.header.last_tx_id,
-        wal_records: parsed.wal_records.len(),
-        recovered_tail: parsed.recovered_tail,
-    })
+    load_without_migration(path).map(|(_, report)| report)
 }
 
 #[derive(Clone, Copy)]
@@ -307,7 +376,11 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, StorageError> {
         .wal_offset
         .checked_add(header.wal_len)
         .ok_or_else(|| StorageError::new("file_layout", "invalid wal length"))?;
-    if wal_end as usize > bytes.len() || snapshot_end as usize > bytes.len() {
+    if snapshot_end > bytes.len() as u64
+        || header.snapshot_offset != HEADER_SIZE as u64
+        || header.wal_offset != snapshot_end
+        || header.wal_offset > bytes.len() as u64
+    {
         return Err(StorageError::new(
             "file_layout",
             "section offsets exceed file size",
@@ -322,8 +395,9 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, StorageError> {
         ));
     }
 
-    let wal_bytes = &bytes[header.wal_offset as usize..wal_end as usize];
+    let wal_bytes = &bytes[header.wal_offset as usize..wal_end.min(bytes.len() as u64) as usize];
     let (wal_records, valid_wal_len, recovered_tail) = parse_wal(wal_bytes)?;
+    let recovered_tail = recovered_tail || wal_end > bytes.len() as u64;
     let valid_wal_bytes = wal_bytes[..valid_wal_len].to_vec();
     if !recovered_tail && checksum(&valid_wal_bytes) != header.wal_checksum {
         return Err(StorageError::new("wal_checksum", "wal checksum mismatch"));
@@ -341,39 +415,39 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, StorageError> {
 
 fn parse_wal(bytes: &[u8]) -> Result<(Vec<WalRecord>, usize, bool), StorageError> {
     let mut cursor = 0usize;
+    let mut valid_end = 0usize;
     let mut records = Vec::new();
-    let mut recovered_tail = false;
 
     while cursor < bytes.len() {
-        if bytes.len() - cursor < 40 {
-            recovered_tail = true;
-            break;
-        }
-        if &bytes[cursor..cursor + 4] != WAL_RECORD_MAGIC {
-            recovered_tail = true;
+        if bytes.len() - cursor < WAL_HEADER_SIZE || &bytes[cursor..cursor + 4] != WAL_RECORD_MAGIC
+        {
             break;
         }
         cursor += 4;
-        let _seq_no = read_u64(bytes, &mut cursor)?;
+        let seq_no = read_u64(bytes, &mut cursor)?;
         let _tx_id = read_u64(bytes, &mut cursor)?;
-        let _record_count = read_u32(bytes, &mut cursor)?;
-        let payload_len = read_u64(bytes, &mut cursor)? as usize;
+        let record_count = read_u32(bytes, &mut cursor)?;
+        let payload_len = read_u64(bytes, &mut cursor)?;
         let payload_checksum = read_u64(bytes, &mut cursor)?;
-        let _tx_checksum = read_u64(bytes, &mut cursor)?;
-        if bytes.len() - cursor < payload_len {
-            recovered_tail = true;
+        let tx_checksum = read_u64(bytes, &mut cursor)?;
+        if seq_no != records.len() as u64 + 1
+            || record_count != 1
+            || payload_len > (bytes.len() - cursor) as u64
+        {
             break;
         }
-        let payload = bytes[cursor..cursor + payload_len].to_vec();
-        cursor += payload_len;
-        if checksum(&payload) != payload_checksum {
-            recovered_tail = true;
+        let payload = &bytes[cursor..cursor + payload_len as usize];
+        if checksum(payload) != payload_checksum || tx_checksum != payload_checksum {
             break;
         }
-        records.push(WalRecord { payload });
+        cursor += payload.len();
+        records.push(WalRecord {
+            payload: payload.to_vec(),
+        });
+        valid_end = cursor;
     }
 
-    Ok((records, cursor, recovered_tail))
+    Ok((records, valid_end, valid_end != bytes.len()))
 }
 
 fn assemble_file(header: &FileHeader, snapshot: &[u8], wal: &[u8]) -> Vec<u8> {
@@ -471,44 +545,6 @@ fn plan_migration(format: StorageFormatVersion) -> Result<MigrationPlan, Storage
         "file_version",
         "unsupported file format version",
     ))
-}
-
-fn maybe_migrate_file(path: &Path, format: StorageFormatVersion) -> Result<(), StorageError> {
-    let migration = plan_migration(format)?;
-    if !migration.rewrite_header {
-        return Ok(());
-    }
-
-    let bytes = fs::read(path)?;
-    let parsed = parse_file(&bytes)?;
-    let migrated = (|| -> Result<(), StorageError> {
-        let mut state = decode_state(&parsed.snapshot_bytes, parsed.format)?;
-        for record in &parsed.wal_records {
-            state = decode_state(&record.payload, parsed.format)?;
-        }
-        let engine = CupldEngine::from_state(state)?;
-        compact(path, &engine, parsed.header.db_uuid)
-    })();
-
-    if migrated.is_ok() {
-        return migrated;
-    }
-
-    let mut header_only = bytes;
-    header_only[8..12].copy_from_slice(&migration.target.version.to_le_bytes());
-    header_only[12..16].copy_from_slice(&migration.target.compat.to_le_bytes());
-    write_durable(path, &header_only)
-}
-
-fn apply_migration_policy(
-    path: &Path,
-    format: StorageFormatVersion,
-    migration_policy: MigrationPolicy,
-) -> Result<(), StorageError> {
-    match migration_policy {
-        MigrationPolicy::MigrateInPlace => maybe_migrate_file(path, format),
-        MigrationPolicy::ReadOnlyProbe => plan_migration(format).map(|_| ()),
-    }
 }
 
 fn encode_wal_record(seq_no: u64, tx_id: u64, payload: &[u8]) -> Vec<u8> {
@@ -937,11 +973,263 @@ fn read_optional_system_time(
     )))
 }
 
-fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    let mut file = fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+/// Resolve aliases before deriving the stable lock path or replacing a file.
+pub(crate) fn canonical_database_path(path: &Path) -> Result<PathBuf, StorageError> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A dangling symlink is not a new database destination.
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(error.into());
+            }
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let name = database_file_name(path)?;
+            Ok(fs::canonicalize(parent)?.join(name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn database_file_name(path: &Path) -> io::Result<&std::ffi::OsStr> {
+    path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "database path has no file name",
+        )
+    })
+}
+
+struct DatabaseWriter {
+    path: PathBuf,
+    // Never unlink the sidecar: unlinking would let another writer lock a new inode.
+    _lock: fs::File,
+}
+
+impl Drop for DatabaseWriter {
+    fn drop(&mut self) {
+        // A concurrent process spawn can briefly inherit this descriptor before
+        // exec closes it. Unlock explicitly so an inherited/duplicated handle
+        // cannot extend the write scope after this guard is dropped.
+        let _ = self._lock.unlock();
+    }
+}
+
+impl DatabaseWriter {
+    fn acquire(path: &Path) -> Result<Self, StorageError> {
+        let path = canonical_database_path(path)?;
+        let mut lock_name = database_file_name(&path)?.to_os_string();
+        lock_name.push(".lock");
+        let lock_path = path.with_file_name(lock_name);
+        validate_lock_sidecar(&lock_path)?;
+        // Owner-only, like the temporary file: an advisory lock needs only an
+        // open descriptor, so a readable sidecar lets any local user block writes.
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(&lock_path)?;
+        validate_lock_sidecar(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // OpenOptions::mode only protects newly created files. Tighten
+            // sidecars from older versions through the open descriptor, without
+            // replacing the inode that other writers use for coordination.
+            lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        match lock.try_lock() {
+            Ok(()) => Ok(Self { path, _lock: lock }),
+            Err(fs::TryLockError::WouldBlock) => Err(StorageError::new(
+                StorageErrorKind::DatabaseBusy,
+                "another writer is updating this database; retry after it completes",
+            )),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn read_expected(&self, expected: StorageRevision) -> Result<Vec<u8>, StorageError> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageError::new(
+                    StorageErrorKind::DatabaseChanged,
+                    "database was removed since it was opened; reopen before writing",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if StorageRevision::from_bytes(&bytes) != expected {
+            return Err(StorageError::new(
+                StorageErrorKind::DatabaseChanged,
+                "database changed since it was opened; reopen before writing",
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+fn validate_lock_sidecar(path: &Path) -> Result<(), StorageError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let valid = metadata.is_file() && metadata.len() == 0;
+    #[cfg(unix)]
+    let valid = {
+        use std::os::unix::fs::MetadataExt;
+        valid && metadata.nlink() == 1
+    };
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "database lock sidecar must be an empty regular file without aliases",
+        )
+        .into());
+    }
     Ok(())
+}
+
+struct PendingFile(PathBuf);
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "database has multiple hard links; use one database path",
+                    )
+                    .into());
+                }
+            }
+            if metadata.permissions().readonly() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "database file is read-only",
+                )
+                .into());
+            }
+            // Atomic rename depends on directory permissions; also respect the
+            // existing file's OS write access before replacing it.
+            fs::OpenOptions::new().write(true).open(path)?;
+            Some(metadata.permissions())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let (temporary, mut file) = loop {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(path.file_name().expect("canonical file name"));
+        name.push(format!(
+            ".{}-{}.tmp",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temporary = path.with_file_name(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => break (PendingFile(temporary), file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)?;
+    }
+    let middle = bytes.len() / 2;
+    file.write_all(&bytes[..middle])?;
+    #[cfg(test)]
+    inject_write_failure(WriteStage::PartialWrite)?;
+    file.write_all(&bytes[middle..])?;
+    #[cfg(test)]
+    inject_write_failure(WriteStage::FileSync)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(test)]
+    inject_write_failure(WriteStage::Rename)?;
+    fs::rename(&temporary.0, path)?;
+    // From this point the new database is visible. A failed directory flush
+    // cannot be treated as a rolled-back commit or safely retried blindly.
+    sync_parent(path).map_err(|error| StorageError::new(StorageErrorKind::PersistenceUncertain,
+        format!("database replacement is visible but directory sync failed ({error}); reopen before writing")))?;
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    inject_write_failure(WriteStage::DirectorySync)?;
+    #[cfg(unix)]
+    {
+        let parent = path.parent().expect("canonical parent directory");
+        match fs::File::open(parent)?.sync_all() {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                ) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // std has no portable way to flush a directory on Windows.
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteStage {
+    PartialWrite,
+    FileSync,
+    Rename,
+    DirectorySync,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITE_FAILURE: std::cell::Cell<Option<WriteStage>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_write_at(stage: WriteStage) {
+    WRITE_FAILURE.set(Some(stage));
+}
+
+#[cfg(test)]
+fn inject_write_failure(stage: WriteStage) -> io::Result<()> {
+    if WRITE_FAILURE.get() == Some(stage) {
+        WRITE_FAILURE.set(None);
+        Err(io::Error::other("injected persistence failure"))
+    } else {
+        Ok(())
+    }
 }
 
 fn system_time_parts(value: SystemTime) -> (i64, u32) {
@@ -1100,20 +1388,38 @@ fn read_bytes(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>, StorageError>
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        COMPAT_VERSION, FORMAT_VERSION, FileHeader, HEADER_SIZE, IndexStatus, StorageError,
-        append_commit, assemble_file, check, check_without_migration, checksum, compact,
-        encode_property_map, file_uuid, load, load_without_migration, push_bool,
-        push_optional_string, push_property_type, push_schema_target, push_string, push_strings,
-        push_u8, push_u32, push_u64, save_compacted,
+        COMPAT_VERSION, DatabaseWriter, FORMAT_VERSION, FileHeader, HEADER_SIZE, IndexStatus,
+        StorageError, WriteStage, append_commit, assemble_file, check, check_without_migration,
+        checksum, compact, encode_property_map, encode_wal_record, fail_next_write_at, file_uuid,
+        load, load_without_migration, parse_file, push_bool, push_optional_string,
+        push_property_type, push_schema_target, push_string, push_strings, push_u8, push_u32,
+        push_u64, save_compacted,
     };
     use crate::engine::{EngineState, IndexKind};
     use crate::runtime::Session;
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("{}_{}.cupld", name, std::process::id()))
+        std::env::temp_dir().join(format!(
+            "{}_{}_{}.cupld",
+            name,
+            std::process::id(),
+            super::TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn lock_path(path: &Path) -> PathBuf {
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".lock");
+        path.with_file_name(name)
+    }
+
+    /// Remove a test database together with the `.lock` sidecar beside it.
+    fn remove_database(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lock_path(path));
     }
 
     fn copy_fixture(name: &str) -> PathBuf {
@@ -1212,13 +1518,13 @@ mod tests {
         session
             .execute_script("CREATE (n:Person {name: 'Grace'})", &BTreeMap::new())
             .unwrap();
-        append_commit(&path, session.engine(), Some(uuid)).unwrap();
+        append_commit(&path, session.engine(), uuid).unwrap();
 
         let (engine, report) = load(&path).unwrap();
         assert_eq!(report.wal_records, 1);
         assert_eq!(engine.stats().node_count, 2);
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1232,32 +1538,20 @@ mod tests {
         session
             .execute_script("CREATE (n:Person {name: 'Grace'})", &BTreeMap::new())
             .unwrap();
-        append_commit(&path, session.engine(), Some(uuid)).unwrap();
+        let uuid = append_commit(&path, session.engine(), uuid).unwrap();
         compact(&path, session.engine(), uuid).unwrap();
 
         let report = check(&path).unwrap();
         assert_eq!(report.wal_records, 0);
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
     fn check_migrates_legacy_header_versions_in_place() {
-        let path = temp_path("cupld_storage_migrate");
-        let mut session = Session::new_in_memory();
-        session
-            .execute_script("CREATE (n:Person {name: 'Ada'})", &BTreeMap::new())
-            .unwrap();
-        save_compacted(&path, session.engine()).unwrap();
-
-        let mut bytes = fs::read(&path).unwrap();
-        bytes[8..12].copy_from_slice(&0u32.to_le_bytes());
-        bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
-        fs::write(&path, &bytes).unwrap();
-
+        let path = copy_fixture("person_v0_1_0.cupld");
         let report = check(&path).unwrap();
-        assert_eq!(report.wal_records, 0);
-
+        assert_eq!(report.wal_records, 8);
         let bytes = fs::read(&path).unwrap();
         assert_eq!(
             u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
@@ -1267,8 +1561,8 @@ mod tests {
             u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
             COMPAT_VERSION
         );
-
-        let _ = fs::remove_file(path);
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 4);
+        remove_database(&path);
     }
 
     #[test]
@@ -1286,7 +1580,7 @@ mod tests {
         assert_eq!(report.wal_records, 8);
         assert_eq!(fs::read(&path).unwrap(), original);
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1306,7 +1600,7 @@ mod tests {
         let error = check(&path).unwrap_err();
         assert_eq!(error.code(), "file_version");
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1356,6 +1650,431 @@ mod tests {
             FORMAT_VERSION
         );
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
+    }
+    fn create_committed_database(name: &str) -> (PathBuf, Session) {
+        let path = temp_path(name);
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script("CREATE (:Doc {name: 'original'})", &BTreeMap::new())
+            .unwrap();
+        session.save_as(&path).unwrap();
+        (path, session)
+    }
+
+    #[test]
+    fn failed_replacements_preserve_disk_and_autocommit_state() {
+        for stage in [
+            WriteStage::PartialWrite,
+            WriteStage::FileSync,
+            WriteStage::Rename,
+        ] {
+            let (path, mut session) = create_committed_database("failed_autocommit");
+            let original = fs::read(&path).unwrap();
+            let original_tx = session.transaction_info().last_tx_id;
+            fail_next_write_at(stage);
+            let error = session
+                .execute_script("CREATE (:Doc {name: 'failed'})", &BTreeMap::new())
+                .unwrap_err();
+            assert_eq!(error.code(), "io_error");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(session.engine().stats().node_count, 1);
+            assert_eq!(session.transaction_info().last_tx_id, original_tx);
+            assert!(!session.is_dirty());
+            assert_eq!(load(&path).unwrap().0.stats().node_count, 1);
+            let prefix = format!(".{}.", path.file_name().unwrap().to_string_lossy());
+            assert!(!fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            }));
+            session
+                .execute_script("CREATE (:Doc {name: 'retry'})", &BTreeMap::new())
+                .unwrap();
+            assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
+            remove_database(&path);
+        }
+    }
+
+    #[test]
+    fn failed_explicit_commit_retains_pending_transaction_for_retry() {
+        let (path, mut session) = create_committed_database("failed_transaction");
+        let original = fs::read(&path).unwrap();
+        let original_tx = session.transaction_info().last_tx_id;
+        session.execute_script("BEGIN", &BTreeMap::new()).unwrap();
+        session
+            .execute_script("CREATE (:Doc {name: 'pending'})", &BTreeMap::new())
+            .unwrap();
+        fail_next_write_at(WriteStage::FileSync);
+        assert_eq!(
+            session
+                .execute_script("COMMIT", &BTreeMap::new())
+                .unwrap_err()
+                .code(),
+            "io_error"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(session.transaction_info().active);
+        assert_eq!(session.transaction_info().last_tx_id, original_tx);
+        assert_eq!(session.engine().stats().node_count, 2);
+        session.execute_script("COMMIT", &BTreeMap::new()).unwrap();
+        assert_eq!(session.transaction_info().last_tx_id, original_tx + 1);
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn failed_save_preserves_replacement_engine_and_prior_database() {
+        let (path, mut session) = create_committed_database("failed_save");
+        let original = fs::read(&path).unwrap();
+        let mut replacement = Session::new_in_memory();
+        replacement
+            .execute_script("CREATE (:Doc {name: 'new'})", &BTreeMap::new())
+            .unwrap();
+        replacement
+            .execute_script("CREATE (:Doc {name: 'another'})", &BTreeMap::new())
+            .unwrap();
+        session
+            .replace_engine(replacement.engine().clone())
+            .unwrap();
+        fail_next_write_at(WriteStage::Rename);
+        assert_eq!(session.save().unwrap_err().code(), "io_error");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(session.is_dirty());
+        assert_eq!(session.engine().stats().node_count, 2);
+        session.save().unwrap();
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn failed_directory_sync_requires_reopening_and_cannot_be_cleared() {
+        let (path, mut session) = create_committed_database("uncertain_commit");
+        session.execute_script("BEGIN", &BTreeMap::new()).unwrap();
+        session
+            .execute_script("SAVEPOINT pending", &BTreeMap::new())
+            .unwrap();
+        session
+            .execute_script("CREATE (:Doc {name: 'published'})", &BTreeMap::new())
+            .unwrap();
+        fail_next_write_at(WriteStage::DirectorySync);
+        let error = session
+            .execute_script("COMMIT", &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code(), "persistence_uncertain");
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
+        for query in [
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT pending",
+            "COMMIT",
+            "CREATE (:Doc)",
+        ] {
+            assert_eq!(
+                session
+                    .execute_script(query, &BTreeMap::new())
+                    .unwrap_err()
+                    .code(),
+                "persistence_uncertain"
+            );
+        }
+        assert_eq!(session.save().unwrap_err().code(), "persistence_uncertain");
+        assert_eq!(
+            session
+                .save_as(temp_path("uncertain_copy"))
+                .unwrap_err()
+                .code(),
+            "persistence_uncertain"
+        );
+        assert_eq!(
+            session
+                .replace_engine(Session::new_in_memory().engine().clone())
+                .unwrap_err()
+                .code(),
+            "persistence_uncertain"
+        );
+        let mut reopened = Session::open(&path).unwrap();
+        reopened
+            .execute_script("CREATE (:Doc {name: 'next'})", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 3);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn invalid_wal_tails_are_removed_before_new_commits() {
+        // Every short header length, including 40..47, plus a short payload
+        // and a fully present payload with a bad checksum must recover safely.
+        for tail_case in 0..=50 {
+            let (path, mut session) = create_committed_database("wal_tail");
+            session
+                .execute_script("CREATE (:Doc {name: 'committed'})", &BTreeMap::new())
+                .unwrap();
+            let committed_tx = session.transaction_info().last_tx_id;
+            let bytes = fs::read(&path).unwrap();
+            let parsed = parse_file(&bytes).unwrap();
+            let mut tail = encode_wal_record(2, committed_tx + 1, b"uncommitted payload");
+            match tail_case {
+                0..=47 => tail.truncate(tail_case),
+                48 => tail.truncate(51),
+                49 => *tail.last_mut().unwrap() ^= 1,
+                _ => tail[40] ^= 1,
+            }
+            let mut wal = parsed.valid_wal_bytes.clone();
+            wal.extend(&tail);
+            let mut header = parsed.header;
+            header.wal_len = wal.len() as u64;
+            header.last_tx_id = committed_tx + 1;
+            header.wal_checksum = checksum(&wal);
+            let mut damaged = assemble_file(&header, &parsed.snapshot_bytes, &wal);
+            if tail_case == 0 {
+                // A crash can leave the header advertising bytes absent from disk.
+                header.wal_len += 10;
+                damaged = assemble_file(&header, &parsed.snapshot_bytes, &wal);
+            }
+            fs::write(&path, damaged).unwrap();
+            let (engine, report) = load(&path).unwrap();
+            assert!(report.recovered_tail, "case {tail_case}");
+            assert_eq!(report.last_tx_id, committed_tx);
+            assert_eq!(engine.stats().node_count, 2);
+            let mut recovered = Session::open(&path).unwrap();
+            recovered
+                .execute_script("CREATE (:Doc {name: 'after recovery'})", &BTreeMap::new())
+                .unwrap();
+            let (engine, report) = load(&path).unwrap();
+            assert!(!report.recovered_tail);
+            assert_eq!(report.wal_records, 2);
+            assert_eq!(engine.stats().node_count, 3);
+            remove_database(&path);
+        }
+    }
+
+    #[test]
+    fn failed_migration_never_relabels_or_replaces_original_bytes() {
+        for stage in [
+            WriteStage::PartialWrite,
+            WriteStage::FileSync,
+            WriteStage::Rename,
+        ] {
+            let path = copy_fixture("person_v0_1_0.cupld");
+            let original = fs::read(&path).unwrap();
+            fail_next_write_at(stage);
+            assert_eq!(load(&path).unwrap_err().code(), "io_error");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(
+                load_without_migration(&path).unwrap().0.stats().node_count,
+                4
+            );
+            assert_eq!(load(&path).unwrap().0.stats().node_count, 4);
+            remove_database(&path);
+        }
+        let path = copy_fixture("person_v0_1_0.cupld");
+        let parsed = parse_file(&fs::read(&path).unwrap()).unwrap();
+        let invalid_state = [0u8; 1];
+        let mut header = parsed.header;
+        header.snapshot_len = invalid_state.len() as u64;
+        header.wal_offset = (HEADER_SIZE + invalid_state.len()) as u64;
+        header.wal_len = 0;
+        header.snapshot_checksum = checksum(&invalid_state);
+        header.wal_checksum = checksum(&[]);
+        let mut invalid = assemble_file(&header, &invalid_state, &[]);
+        invalid[8..12].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&path, &invalid).unwrap();
+        assert_eq!(check(&path).unwrap_err().code(), "decode_eof");
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn writer_lock_is_exclusive_across_processes_and_released_on_exit() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        let (path, mut session) = create_committed_database("process_lock");
+        let original = fs::read(&path).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "storage::tests::lock_holder_process",
+                "--nocapture",
+            ])
+            .env("CUPLD_TEST_STORAGE_LOCK_PATH", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "lock holder exited before acquiring lock"
+            );
+            if line.trim() == "LOCKED" {
+                break;
+            }
+        }
+        assert_eq!(
+            session
+                .execute_script("CREATE (:Doc)", &BTreeMap::new())
+                .unwrap_err()
+                .code(),
+            "database_busy"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(Session::open(&path).unwrap().engine().stats().node_count, 1);
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        session
+            .execute_script("CREATE (:Doc)", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
+        remove_database(&path);
+    }
+
+    /// Subprocess helper for the cross-process lock test; not a test itself.
+    #[test]
+    #[ignore]
+    fn lock_holder_process() {
+        use std::io::Write;
+        let Some(path) = std::env::var_os("CUPLD_TEST_STORAGE_LOCK_PATH") else {
+            return;
+        };
+        let _writer = DatabaseWriter::acquire(std::path::Path::new(&path)).unwrap();
+        println!("LOCKED");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_line(&mut String::new()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_lock_sidecar_permissions_are_tightened_without_replacement() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (path, mut session) = create_committed_database("legacy_lock_permissions");
+        let sidecar = lock_path(&path);
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::metadata(&sidecar).unwrap();
+        assert_eq!(before.permissions().mode() & 0o777, 0o644);
+
+        session
+            .execute_script("CREATE (:Doc)", &BTreeMap::new())
+            .unwrap();
+
+        let after = fs::metadata(&sidecar).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
+        remove_database(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_preserves_permissions_and_refuses_readonly_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let (path, mut session) = create_committed_database("permissions");
+        // New databases and their lock sidecars start owner-only.
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(lock_path(&path)).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        session
+            .execute_script("CREATE (:Doc)", &BTreeMap::new())
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        session.compact().unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert_eq!(
+            session
+                .execute_script("CREATE (:Doc)", &BTreeMap::new())
+                .unwrap_err()
+                .code(),
+            "io_error"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(session.engine().stats().node_count, 2);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        session
+            .execute_script("CREATE (:Doc)", &BTreeMap::new())
+            .unwrap();
+        remove_database(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_or_nonempty_lock_sidecars_are_rejected_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+        let (path, mut session) = create_committed_database("lock_aliases");
+        let writer = DatabaseWriter::acquire(&path).unwrap();
+        let lock_path = lock_path(&path);
+        drop(writer);
+        fs::remove_file(&lock_path).unwrap();
+        let original = fs::read(&path).unwrap();
+        symlink(&path, &lock_path).unwrap();
+        assert_eq!(session.save().unwrap_err().code(), "io_error");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_file(&lock_path).unwrap();
+        fs::hard_link(&path, &lock_path).unwrap();
+        assert_eq!(session.save().unwrap_err().code(), "io_error");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_file(&lock_path).unwrap();
+        // An empty hard-linked sidecar passes the length check, so only the
+        // Unix alias rule can reject it.
+        let empty_target = path.with_extension("empty");
+        fs::write(&empty_target, b"").unwrap();
+        fs::hard_link(&empty_target, &lock_path).unwrap();
+        let error = session.save().unwrap_err();
+        assert_eq!(error.code(), "io_error");
+        assert!(error.to_string().contains("without aliases"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::metadata(&empty_target).unwrap().len(), 0);
+        fs::remove_file(&lock_path).unwrap();
+        fs::remove_file(&empty_target).unwrap();
+        fs::write(&lock_path, b"unrelated file").unwrap();
+        assert_eq!(session.save().unwrap_err().code(), "io_error");
+        assert_eq!(fs::read(&lock_path).unwrap(), b"unrelated file");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_file(&lock_path).unwrap();
+        session.save().unwrap();
+        remove_database(&path);
+    }
+    #[test]
+    fn duplicated_lock_descriptor_does_not_extend_writer_scope() {
+        let (path, _) = create_committed_database("lock_lifetime");
+        let writer = DatabaseWriter::acquire(&path).unwrap();
+        let inherited = writer._lock.try_clone().unwrap();
+        drop(writer);
+        let next_writer = DatabaseWriter::acquire(&path).unwrap();
+        drop(next_writer);
+        drop(inherited);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn save_as_root_destination_returns_error_without_losing_unsaved_state() {
+        let mut session = Session::new_in_memory();
+        session
+            .execute_script("CREATE (:Doc)", &BTreeMap::new())
+            .unwrap();
+        let current = std::env::current_dir().unwrap();
+        let root = current.ancestors().last().unwrap();
+        assert_eq!(session.save_as(root).unwrap_err().code(), "io_error");
+        assert!(session.path().is_none());
+        assert!(session.is_dirty());
+        assert_eq!(session.engine().stats().node_count, 1);
     }
 }

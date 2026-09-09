@@ -131,7 +131,8 @@ pub struct Session {
     savepoints: Vec<(String, CupldEngine, bool)>,
     failed_transaction: bool,
     path: Option<PathBuf>,
-    db_uuid: Option<[u8; 16]>,
+    revision: Option<storage::StorageRevision>,
+    persistence_uncertain: bool,
     dirty: bool,
 }
 
@@ -149,7 +150,8 @@ impl Session {
             savepoints: Vec::new(),
             failed_transaction: false,
             path: None,
-            db_uuid: None,
+            revision: None,
+            persistence_uncertain: false,
             dirty: false,
         }
     }
@@ -161,19 +163,20 @@ impl Session {
             savepoints: Vec::new(),
             failed_transaction: false,
             path: None,
-            db_uuid: None,
+            revision: None,
+            persistence_uncertain: false,
             dirty: false,
         }
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ExecutionError> {
-        let path = path.as_ref().to_path_buf();
+        let path = storage::canonical_database_path(path.as_ref())?;
         let (engine, report) = storage::load(&path).map_err(ExecutionError::from)?;
         Ok(Self::from_loaded_path(path, engine, report))
     }
 
     pub(crate) fn open_without_migration(path: impl AsRef<Path>) -> Result<Self, ExecutionError> {
-        let path = path.as_ref().to_path_buf();
+        let path = storage::canonical_database_path(path.as_ref())?;
         let (engine, report) =
             storage::load_without_migration(&path).map_err(ExecutionError::from)?;
         Ok(Self::from_loaded_path(path, engine, report))
@@ -190,7 +193,8 @@ impl Session {
             savepoints: Vec::new(),
             failed_transaction: false,
             path: Some(path),
-            db_uuid: Some(report.db_uuid),
+            revision: Some(report.revision),
+            persistence_uncertain: false,
             dirty: false,
         }
     }
@@ -200,6 +204,7 @@ impl Session {
     }
 
     pub fn replace_engine(&mut self, engine: CupldEngine) -> Result<(), ExecutionError> {
+        self.require_certain_persistence()?;
         if self.transaction_base.is_some() {
             return Err(ExecutionError::new(
                 "transaction_active",
@@ -222,27 +227,69 @@ impl Session {
     }
 
     pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<(), ExecutionError> {
-        let path = path.as_ref().to_path_buf();
-        let db_uuid = storage::save_compacted(&path, &self.engine).map_err(ExecutionError::from)?;
+        self.require_certain_persistence()?;
+        self.require_no_transaction_for_save()?;
+        let path = storage::canonical_database_path(path.as_ref())?;
+        if let Some(current) = &self.path
+            && storage::canonical_database_path(current)? == path
+        {
+            return self.save();
+        }
+        let result = storage::save_compacted(&path, &self.engine);
+        let revision = self.accept_persistence_result(result)?;
         self.path = Some(path);
-        self.db_uuid = Some(db_uuid);
+        self.revision = Some(revision);
         self.dirty = false;
         Ok(())
     }
 
     pub fn save(&mut self) -> Result<(), ExecutionError> {
+        self.require_certain_persistence()?;
+        self.require_no_transaction_for_save()?;
         let Some(path) = self.path.clone() else {
             return Err(ExecutionError::new(
                 "save_requires_path",
                 "unnamed in-memory databases require SAVE AS",
             ));
         };
-        let db_uuid = self
-            .db_uuid
-            .ok_or_else(|| ExecutionError::new("db_uuid_missing", "database UUID is missing"))?;
-        storage::compact(&path, &self.engine, db_uuid).map_err(ExecutionError::from)?;
+        let revision = self.revision.expect("file-backed session has a revision");
+        let result = storage::compact(&path, &self.engine, revision);
+        self.revision = Some(self.accept_persistence_result(result)?);
         self.dirty = false;
         Ok(())
+    }
+
+    fn require_no_transaction_for_save(&self) -> Result<(), ExecutionError> {
+        if self.transaction_base.is_some() {
+            return Err(ExecutionError::new(
+                "transaction_active",
+                "commit or roll back the transaction before SAVE or SAVE AS",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_certain_persistence(&self) -> Result<(), ExecutionError> {
+        if self.persistence_uncertain {
+            return Err(ExecutionError::new(
+                "persistence_uncertain",
+                "a previous replacement has uncertain durability; reopen the database before writing",
+            ));
+        }
+        Ok(())
+    }
+
+    fn accept_persistence_result(
+        &mut self,
+        result: Result<storage::StorageRevision, storage::StorageError>,
+    ) -> Result<storage::StorageRevision, ExecutionError> {
+        if let Err(error) = &result
+            && error.code() == "persistence_uncertain"
+        {
+            self.persistence_uncertain = true;
+            self.dirty = true;
+        }
+        result.map_err(ExecutionError::from)
     }
 
     pub fn compact(&mut self) -> Result<(), ExecutionError> {
@@ -294,6 +341,9 @@ impl Session {
         statement: &Statement,
         params: &BTreeMap<String, Value>,
     ) -> Result<QueryResult, ExecutionError> {
+        if statement.is_mutating() || statement.is_transaction_control() {
+            self.require_certain_persistence()?;
+        }
         if self.failed_transaction && !statement.allowed_in_failed_transaction() {
             return Err(ExecutionError::new(
                 "transaction_failed",
@@ -312,6 +362,7 @@ impl Session {
             Statement::Show(kind) => self.show(kind),
             _ => {
                 let snapshot = self.engine.clone();
+                let was_dirty = self.dirty;
                 let result = self.execute_data_statement(statement, params);
                 match (self.transaction_base.is_some(), result) {
                     (_, Ok(result)) if statement.is_mutating() => {
@@ -319,8 +370,18 @@ impl Session {
                             self.dirty = true;
                             Ok(result)
                         } else {
-                            self.engine.commit().map_err(ExecutionError::from)?;
-                            self.persist_after_commit()?;
+                            let persisted = self
+                                .engine
+                                .commit()
+                                .map_err(ExecutionError::from)
+                                .and_then(|_| self.persist_after_commit());
+                            if let Err(error) = persisted {
+                                if !self.persistence_uncertain {
+                                    self.engine = snapshot;
+                                    self.dirty = was_dirty;
+                                }
+                                return Err(error);
+                            }
                             Ok(result)
                         }
                     }
@@ -365,8 +426,20 @@ impl Session {
                 "no active transaction",
             ));
         }
-        self.engine.commit().map_err(ExecutionError::from)?;
-        self.persist_after_commit()?;
+        let pending = self.engine.clone();
+        let persisted = self
+            .engine
+            .commit()
+            .map_err(ExecutionError::from)
+            .and_then(|_| self.persist_after_commit());
+        if let Err(error) = persisted {
+            if !self.persistence_uncertain {
+                // Keep the pending transaction and its original transaction ID
+                // so a transient pre-publication failure can be retried.
+                self.engine = pending;
+            }
+            return Err(error);
+        }
         self.transaction_base = None;
         self.savepoints.clear();
         self.failed_transaction = false;
@@ -1913,10 +1986,11 @@ impl Session {
     }
 
     fn persist_after_commit(&mut self) -> Result<(), ExecutionError> {
+        self.require_certain_persistence()?;
         if let Some(path) = self.path.clone() {
-            let db_uuid = storage::append_commit(&path, &self.engine, self.db_uuid)
-                .map_err(ExecutionError::from)?;
-            self.db_uuid = Some(db_uuid);
+            let revision = self.revision.expect("file-backed session has a revision");
+            let result = storage::append_commit(&path, &self.engine, revision);
+            self.revision = Some(self.accept_persistence_result(result)?);
             self.dirty = false;
         } else {
             self.dirty = true;
@@ -2545,6 +2619,7 @@ enum ExecutionErrorCode {
     IndexTypeError,
     MultiStatementRequiresTransaction,
     PropertyAccessTypeError,
+    PersistenceUncertain,
     RemoveTarget,
     RegexCompileError,
     RegexTypeError,
@@ -2583,6 +2658,7 @@ impl ExecutionErrorCode {
             Self::IndexTypeError => "index_type_error",
             Self::MultiStatementRequiresTransaction => "multi_statement_requires_transaction",
             Self::PropertyAccessTypeError => "property_access_type_error",
+            Self::PersistenceUncertain => "persistence_uncertain",
             Self::RemoveTarget => "remove_target",
             Self::RegexCompileError => "regex_compile_error",
             Self::RegexTypeError => "regex_type_error",
@@ -2623,6 +2699,7 @@ impl From<&'static str> for ExecutionErrorCode {
             "index_type_error" => Self::IndexTypeError,
             "multi_statement_requires_transaction" => Self::MultiStatementRequiresTransaction,
             "property_access_type_error" => Self::PropertyAccessTypeError,
+            "persistence_uncertain" => Self::PersistenceUncertain,
             "remove_target" => Self::RemoveTarget,
             "regex_compile_error" => Self::RegexCompileError,
             "regex_type_error" => Self::RegexTypeError,
@@ -3871,6 +3948,9 @@ mod tests {
             vec![vec![RuntimeValue::String("Ada".to_owned())]]
         );
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&path);
+        let mut lock_name = path.file_name().unwrap().to_os_string();
+        lock_name.push(".lock");
+        let _ = fs::remove_file(path.with_file_name(lock_name));
     }
 }

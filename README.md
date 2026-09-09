@@ -107,6 +107,8 @@ cupld compact --db default
 
 Beta note: opening or checking a `.cupld` created by an older `cupld` release upgrades it in place to the current on-disk format. Treat `.cupld` files as forward-only during beta if you may need rollback.
 
+Database writes sync a temporary file beside the database and atomically replace the destination. Cooperating writers use a persistent `<database>.lock` sidecar; leave that file in place. A stale session must reopen before saving, and `SAVE AS` refuses to overwrite a different existing database. See the [persistence contract](docs/agents/README.md#database-persistence) for recovery errors and platform durability limits.
+
 Open the viewer:
 
 ```bash

@@ -35,14 +35,16 @@ They are recorded for later and are outside the implementation scope of PR #50.
 
 ## 3. Make database persistence crash-safe
 
-- Source finding: `write_durable` truncates the live database with `File::create`
-  before writing and syncing its replacement. An interrupted or failed write
-  can damage the existing store; no crash reproduction was attempted.
-- Add atomic replacement, protection against competing writers, and meaningful
-  interruption/recovery tests. Include WAL recovery and migration failure paths
-  in the investigation.
-- Starting points: `src/storage/mod.rs` (`write_durable`, `append_commit`,
-  `parse_wal`, migration handling) and `src/runtime/mod.rs` (`Session`).
+- Implemented on `codex/crash-safe-storage`; awaiting review and merge.
+- Saves, commits, compaction, and migrations now use a synced temporary file and
+  atomic replacement. Persistent writer locks plus revision checks reject
+  overlapping or stale writes; active-transaction saves are rejected.
+- WAL recovery keeps only complete validated records. Migration failures retain
+  original bytes, and post-rename flush failures require reopening the session.
+- Coverage includes injected partial-write/sync/rename failures, interrupted WAL
+  headers and payloads, migration failure, process locks, stale/cloned sessions,
+  permissions, aliases, and side-effect-free diagnostic reads.
+- Details and platform limits: `docs/agents/README.md`, Database Persistence.
 
 ## 5. Establish realistic retrieval and growth baselines
 

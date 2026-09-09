@@ -1,13 +1,12 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::time::Instant;
 
 use cupld::{PropertyMap, RuntimeValue, Session, Value};
 
 use support::{
-    TestDb, copy_fixture, header_version, run, run_with_params, seed_person_graph,
+    TestDb, copy_fixture, header_version, remove_database, run, run_with_params, seed_person_graph,
     sorted_debug_rows, string_cell,
 };
 
@@ -279,7 +278,7 @@ fn real_v0_1_0_fixture_opens_and_migrates_in_place() {
     drop(session);
 
     assert!(header_version(&path) > 1);
-    let _ = fs::remove_file(path);
+    remove_database(&path);
 }
 
 #[test]
@@ -307,7 +306,7 @@ fn real_v0_1_0_fixture_check_migrates_in_place() {
             )
     }));
 
-    let _ = fs::remove_file(path);
+    remove_database(&path);
 }
 
 #[test]

@@ -68,6 +68,75 @@ Important constraints:
 - If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
 - `mcp serve` is a single-threaded stdio server. It emits MCP JSON-RPC on stdout only and writes diagnostics to stderr.
 
+## Database Persistence
+
+Every database commit, save, compaction, and format migration writes a uniquely
+created temporary file in the database directory, flushes it, and replaces the
+database with one rename. Failures before the rename preserve the original
+committed bytes. Incomplete or checksum-invalid WAL tails are discarded back to
+the last complete record before another commit is appended. Migration validates
+the decoded graph before replacing any bytes; a failed migration never relabels
+legacy data as a newer format.
+
+Writes acquire an exclusive OS lock on a persistent `<database>.lock` sidecar
+and compare the database revision read by the session before replacing it. Keep
+the sidecar empty and in place; do not delete or replace it while cupld may be
+running. Symbolic links, nonempty files, and nonregular files are rejected as
+sidecars; Unix also rejects hard-linked sidecars and databases. Each session binds
+to its canonical database path when opened, so later symlink retargeting does
+not redirect its writes. Hard-linked database paths are unsupported on all
+platforms; use a single canonical path. The lock is advisory: it coordinates
+cooperating cupld processes only and does not stop external programs from
+modifying database or sidecar files directly. On Unix each writer sets the
+sidecar to owner-only permissions (`0600`), including sidecars created by older
+versions. This prevents other local users from opening it; it does not revoke
+descriptors they already hold. Opening/checking
+current-format databases and MCP diagnostic probes do not create sidecars; an
+explicit legacy migration does acquire a write lock.
+
+- `database_busy`: another writer owns the lock. Retry after it finishes; a
+  session that became stale must then reopen.
+- `database_changed`: the database bytes changed or the file disappeared after
+  this session read it. Reopen before writing; cupld does not merge stale edits.
+- `database_exists`: `SAVE AS` names a different existing file. Open that file
+  explicitly or choose a new destination. `SAVE AS` to the current canonical
+  path performs a guarded save and preserves the database identity.
+- `persistence_uncertain`: the rename succeeded but the directory flush failed.
+  The replacement is visible, and its durability is uncertain. Reopen the
+  destination and inspect the result before retrying; the session rejects
+  further writes and transaction control, including rollback, until reopened.
+
+Existing database permission bits are preserved, and files marked read-only or
+not writable by the process cannot be replaced. New Unix database files start
+with owner-only permissions. `SAVE`, `SAVE AS`, and compaction reject active
+transactions; commit or roll back first. An ordinary pre-rename write failure
+restores an autocommit statement's previous in-memory state. A failed explicit
+`COMMIT` retains its pending transaction and original transaction ID for retry
+or rollback. A failed save retains the session's unsaved graph.
+
+`cupld sync markdown` and `cupld source set-root` recover from concurrent cupld
+writers: when the save reports `database_busy` or `database_changed`, the CLI
+reopens the database, replays the sync or root change on the fresh state, and
+saves again, up to three attempts. In `--watch` mode this happens after every
+sync run, so a concurrent write costs one re-sync rather than the whole watch
+session.
+
+On Unix, cupld also flushes the parent directory after renaming when the
+filesystem supports directory sync. Windows uses the standard library's file
+flush and replacement operations; Rust's standard library provides no portable
+directory flush there. Power-loss durability therefore depends on platform,
+filesystem, and hardware guarantees. A killed process may leave an unused
+`.DATABASE.PID-COUNTER.tmp` file; such files are never treated as databases or
+recovery records and may be removed when no writer is running.
+
+Rust library callers now receive an opaque `StorageRevision` from
+`storage::save_compacted`, `storage::append_commit`, and `storage::compact`.
+`append_commit` and `compact` require the last revision, available from
+`IntegrityReport::revision`, and return the revision for the next write.
+`save_compacted` creates a new destination only. The revision is an optimistic
+concurrency token, not a cryptographic integrity guarantee. Existing CLI/MCP
+success payloads keep their current shapes.
+
 ## Query, Search, And Context
 
 Use `cupld query` when you need exact graph reads, global listings, schema-driven inspection, or deterministic node discovery:
@@ -159,7 +228,7 @@ MCP resources:
 - `memory://tag/{tag}`
 - `memory://config`
 
-MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
+MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. Cooperating cupld writers are serialized at persistence. Underlying persistence failures report `database_busy` for overlapping writes or `database_changed` for stale sessions; MCP write tools retain their existing `sync_failed` response wrappers and include the persistence reason in the message. Reopen after a stale-session error. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
 
 `memory_add` creates a new note and never replaces an existing file. Without `path_hint`, it uses the title slug and adds a numeric suffix when needed: `project-detail.md`, `project-detail-2.md`, and so on. An omitted title starts at `memory-note.md`. Use the returned `note_path` and `uri` for the actual allocated identity. With an explicit `path_hint`, an occupied path returns `ok: false` with `error.code: "already_exists"`, preserving the existing file and DB state. Existing file symlinks, including dangling links, count as occupied paths and are never followed when creating a note. Parent directories must resolve inside the configured markdown root; an escaping parent symlink returns `invalid_path` before creating anything beneath it. To update a note, edit its markdown file with normal filesystem tools, then call `memory_sync`. A response with `status: "markdown_written_sync_failed"` means the note is already written at `note_path`; call `memory_sync` to ingest it instead of calling `memory_add` again, which would create a duplicate note.
 
@@ -443,7 +512,7 @@ Markdown behavior:
 - `:MD_LINKS_TO` remains authored-only and compatibility-focused. Filesystem structure uses the filesystem edge types instead of link edges.
 - Filesystem sync does not create `:MD_SIBLING_OF` or other pairwise sibling edges.
 - Filesystem edges persist `md.edge_weight`; MCP `memory_search` consumes that opt-in structure only as a weak deterministic retrieval signal for lexical ties. Lexical relevance remains primary, and authored `:MD_LINKS_TO` evidence remains distinct from filesystem structural evidence.
-- `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
+- `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes and persists after every sync run. If another cupld writer changed the database in between, the watcher reopens it, re-syncs, and saves again (see Database Persistence).
 - `--poll-ms` controls the poll interval.
 - `--debounce-ms` controls the stable-change debounce window.
 - `--batch-ms` bounds the coalescing window before a forced watched sync.
