@@ -85,10 +85,12 @@ running. Symbolic links, nonempty files, and nonregular files are rejected as
 sidecars; Unix also rejects hard-linked sidecars and databases. Each session binds
 to its canonical database path when opened, so later symlink retargeting does
 not redirect its writes. Hard-linked database paths are unsupported on all
-platforms; use a single canonical path. Locking coordinates cooperating cupld
-writers, not external programs that modify database or sidecar files directly.
-Opening/checking current-format databases and MCP diagnostic probes do not
-create sidecars; an explicit legacy migration does acquire a write lock.
+platforms; use a single canonical path. The lock is advisory: it coordinates
+cooperating cupld processes only and does not stop external programs from
+modifying database or sidecar files directly. On Unix the sidecar is created
+owner-only, so other local users cannot hold it. Opening/checking
+current-format databases and MCP diagnostic probes do not create sidecars; an
+explicit legacy migration does acquire a write lock.
 
 - `database_busy`: another writer owns the lock. Retry after it finishes; a
   session that became stale must then reopen.
@@ -109,6 +111,13 @@ transactions; commit or roll back first. An ordinary pre-rename write failure
 restores an autocommit statement's previous in-memory state. A failed explicit
 `COMMIT` retains its pending transaction and original transaction ID for retry
 or rollback. A failed save retains the session's unsaved graph.
+
+`cupld sync markdown` and `cupld source set-root` recover from concurrent cupld
+writers: when the save reports `database_busy` or `database_changed`, the CLI
+reopens the database, replays the sync or root change on the fresh state, and
+saves again, up to three attempts. In `--watch` mode this happens after every
+sync run, so a concurrent write costs one re-sync rather than the whole watch
+session.
 
 On Unix, cupld also flushes the parent directory after renaming when the
 filesystem supports directory sync. Windows uses the standard library's file
@@ -495,7 +504,7 @@ Markdown behavior:
 - `:MD_LINKS_TO` remains authored-only and compatibility-focused. Filesystem structure uses the filesystem edge types instead of link edges.
 - Filesystem sync does not create `:MD_SIBLING_OF` or other pairwise sibling edges.
 - Filesystem edges persist `md.edge_weight`; MCP `memory_search` consumes that opt-in structure only as a weak deterministic retrieval signal for lexical ties. Lexical relevance remains primary, and authored `:MD_LINKS_TO` evidence remains distinct from filesystem structural evidence.
-- `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes.
+- `cupld sync markdown --watch` performs the initial persisted sync, then keeps polling for changes and persists after every sync run. If another cupld writer changed the database in between, the watcher reopens it, re-syncs, and saves again (see Database Persistence).
 - `--poll-ms` controls the poll interval.
 - `--debounce-ms` controls the stable-change debounce window.
 - `--batch-ms` bounds the coalescing window before a forced watched sync.

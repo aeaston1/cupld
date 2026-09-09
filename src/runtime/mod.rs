@@ -3948,6 +3948,9 @@ mod tests {
             vec![vec![RuntimeValue::String("Ada".to_owned())]]
         );
 
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&path);
+        let mut lock_name = path.file_name().unwrap().to_os_string();
+        lock_name.push(".lock");
+        let _ = fs::remove_file(path.with_file_name(lock_name));
     }
 }

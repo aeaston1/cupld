@@ -53,8 +53,21 @@ impl TestDb {
 
 impl Drop for TestDb {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        remove_database(&self.path);
     }
+}
+
+/// The `<database>.lock` sidecar cupld keeps beside a database.
+pub fn lock_sidecar_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().expect("database file name").to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Remove a database file together with its lock sidecar.
+pub fn remove_database(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(lock_sidecar_path(path));
 }
 
 pub fn seed_person_graph(session: &mut Session) {

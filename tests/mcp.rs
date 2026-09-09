@@ -9,7 +9,7 @@ use cupld::json::{self, JsonValue};
 use cupld::mcp::{self, McpConfig};
 use cupld::{MarkdownSyncOptions, Session, sync_markdown_root, sync_markdown_root_with_options};
 
-use support::{TestDb, copy_fixture, header_version};
+use support::{TestDb, copy_fixture, header_version, lock_sidecar_path};
 
 static NEXT_TEMP_DIR_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -1733,6 +1733,58 @@ fn read_only_rejects_write_and_sync_tools() {
     assert!(tool_text(&sync).contains("read_only"));
     let add = call(&config, "memory_add", r#"{"content":"Nope"}"#);
     assert!(tool_text(&add).contains("read_only"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_add_reports_database_busy_inside_the_sync_failed_wrapper() {
+    let db = TestDb::new("mcp_add_database_busy");
+    let root = temp_dir("mcp_add_database_busy");
+    fs::create_dir_all(&root).unwrap();
+    let config = config(db.path(), &root, false);
+
+    // Hold the writer lock the way another cupld process would.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_sidecar_path(&fs::canonicalize(db.path()).unwrap()))
+        .unwrap();
+    lock.try_lock().unwrap();
+
+    let blocked = tool_payload(&call(
+        &config,
+        "memory_add",
+        r#"{"title":"Blocked Note","path_hint":"notes/blocked.md","content":"Written while locked."}"#,
+    ));
+    assert_eq!(blocked.get("ok").and_then(JsonValue::as_bool), Some(false));
+    assert_eq!(
+        blocked.get("status").and_then(JsonValue::as_str),
+        Some("markdown_written_sync_failed")
+    );
+    let error = blocked.get("error").expect("error object");
+    assert_eq!(
+        error.get("code").and_then(JsonValue::as_str),
+        Some("sync_failed")
+    );
+    assert!(
+        error
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .unwrap()
+            .contains("database_busy"),
+        "{}",
+        json_text(&blocked)
+    );
+    assert!(root.join("notes/blocked.md").exists());
+
+    lock.unlock().unwrap();
+    let synced = tool_payload(&call(&config, "memory_sync", "{}"));
+    assert_eq!(synced.get("ok").and_then(JsonValue::as_bool), Some(true));
+    let listed = tool_payload(&call(&config, "memory_list", "{}"));
+    assert_eq!(item_paths(&listed), vec!["notes/blocked.md"]);
 
     fs::remove_dir_all(root).unwrap();
 }

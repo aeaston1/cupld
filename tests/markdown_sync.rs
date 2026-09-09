@@ -4,12 +4,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cupld::{
-    MarkdownSyncOptions, MarkdownWatchOptions, RuntimeValue, Session, configured_markdown_root,
-    set_markdown_root, sync_markdown_root_with_options, watch_markdown_root_with_sync_options,
+    CupldEngine, MarkdownSyncOptions, MarkdownSyncReport, MarkdownWatchOptions, RuntimeValue,
+    Session, SourceError, configured_markdown_root, set_markdown_root,
+    sync_markdown_root_with_options, watch_markdown_root_with_sync_options,
+    watch_markdown_root_with_sync_options_and_persist,
 };
 
 use support::{TestDb, run};
@@ -1788,6 +1790,131 @@ fn sync_root_into_db_with_fs_graph(db_path: &std::path::Path, root: &std::path::
             include_fs_graph: true,
         },
     );
+}
+
+#[test]
+fn watch_mode_persists_each_run_and_resyncs_after_a_concurrent_writer() {
+    let db = TestDb::new("markdown_watch_concurrent_writer");
+    let root = temp_dir("markdown_watch_concurrent_writer");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.md"), "# A").unwrap();
+
+    let watcher = thread::spawn({
+        let db_path = db.path().to_path_buf();
+        let root = root.clone();
+        move || {
+            let mut session = Session::open(&db_path).unwrap();
+            let mut engine = session.engine().clone();
+            let sync_options = MarkdownSyncOptions::default();
+            let mut stale_saves = 0;
+            let mut on_sync = |engine: &mut CupldEngine, _: &MarkdownSyncReport| {
+                persist_with_retry(&mut session, engine, &mut stale_saves, |engine| {
+                    sync_markdown_root_with_options(engine, &root, &sync_options).map(|_| ())
+                })
+            };
+            let report = watch_markdown_root_with_sync_options_and_persist(
+                &mut engine,
+                &root,
+                &sync_options,
+                &MarkdownWatchOptions {
+                    poll_interval: Duration::from_millis(10),
+                    debounce: Duration::from_millis(40),
+                    max_batch_window: Duration::from_millis(150),
+                    idle_timeout: Some(Duration::from_secs(5)),
+                    max_runs: Some(2),
+                },
+                &mut on_sync,
+            )
+            .unwrap();
+            (report, stale_saves)
+        }
+    });
+
+    // Once the initial run is on disk, write through a separate session so the
+    // watcher's revision is stale by the time its second run persists.
+    wait_for_persisted_documents(db.path(), 1);
+    let mut other = Session::open(db.path()).unwrap();
+    run(&mut other, "CREATE (:Concurrent {name: 'other-writer'})");
+    drop(other);
+    thread::sleep(Duration::from_millis(40));
+    fs::write(root.join("b.md"), "# B").unwrap();
+
+    let (report, stale_saves) = watcher.join().unwrap();
+    assert_eq!(report.sync_runs, 2);
+    assert!(
+        stale_saves >= 1,
+        "the second run should have recovered from a stale revision"
+    );
+
+    let mut reopened = db.open();
+    let documents = run(
+        &mut reopened,
+        "MATCH (d:MarkdownDocument) RETURN d.`src.path` ORDER BY d.`src.path`",
+    );
+    assert_eq!(
+        documents.rows,
+        vec![
+            vec![RuntimeValue::String("a.md".to_owned())],
+            vec![RuntimeValue::String("b.md".to_owned())],
+        ]
+    );
+    let concurrent = run(&mut reopened, "MATCH (n:Concurrent) RETURN n.name");
+    assert_eq!(
+        concurrent.rows,
+        vec![vec![RuntimeValue::String("other-writer".to_owned())]]
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Mirror of the CLI's persist-with-retry: commit and save, and when another
+/// writer changed or holds the database, reopen it, replay `apply`, and retry.
+fn persist_with_retry(
+    session: &mut Session,
+    engine: &mut CupldEngine,
+    retries: &mut usize,
+    mut apply: impl FnMut(&mut CupldEngine) -> Result<(), SourceError>,
+) -> Result<(), SourceError> {
+    for _ in 0..3 {
+        engine.commit()?;
+        match session
+            .replace_engine(engine.clone())
+            .and_then(|()| session.save())
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if matches!(error.code(), "database_busy" | "database_changed") => {
+                *retries += 1;
+                if error.code() == "database_busy" {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                let path = session.path().unwrap().to_path_buf();
+                *session = Session::open(&path).unwrap();
+                *engine = session.engine().clone();
+                apply(engine)?;
+            }
+            Err(error) => return Err(SourceError::persistence(error.code(), error.message())),
+        }
+    }
+    Err(SourceError::persistence(
+        "database_changed",
+        "gave up after three attempts",
+    ))
+}
+
+fn wait_for_persisted_documents(db_path: &std::path::Path, expected: i64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut session = Session::open(db_path).unwrap();
+        let count = run(&mut session, "MATCH (d:MarkdownDocument) RETURN count(d)");
+        if count.rows == vec![vec![RuntimeValue::Int(expected)]] {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watcher did not persist {expected} documents in time"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn watch_root_into_db(

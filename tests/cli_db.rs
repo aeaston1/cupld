@@ -42,6 +42,9 @@ impl TempPath {
 impl Drop for TempPath {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        let mut lock_name = self.path.file_name().unwrap().to_os_string();
+        lock_name.push(".lock");
+        let _ = fs::remove_file(self.path.with_file_name(lock_name));
     }
 }
 

@@ -173,20 +173,29 @@ impl From<GraphError> for StorageError {
 
 /// Create a new database. Existing destinations are never overwritten.
 pub fn save_compacted(path: &Path, engine: &CupldEngine) -> Result<StorageRevision, StorageError> {
-    let writer = DatabaseWriter::acquire(path)?;
-    match fs::symlink_metadata(&writer.path) {
-        Ok(_) => {
-            return Err(StorageError::new(
-                StorageErrorKind::DatabaseExists,
-                "SAVE AS destination already exists; open it before saving",
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    let path = canonical_database_path(path)?;
+    // Reject before acquiring the writer so a refused destination gains no
+    // `.lock` sidecar; check again under the lock for concurrent creators.
+    require_new_destination(&path)?;
+    let writer = DatabaseWriter::acquire(&path)?;
+    require_new_destination(&writer.path)?;
     let bytes = compacted_bytes(engine, file_uuid())?;
     write_durable(&writer.path, &bytes)?;
     Ok(StorageRevision::from_bytes(&bytes))
+}
+
+/// Reject destinations that already exist, or cannot name a database file, so
+/// `SAVE AS` never replaces or locks an unrelated path.
+fn require_new_destination(path: &Path) -> Result<(), StorageError> {
+    database_file_name(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(StorageError::new(
+            StorageErrorKind::DatabaseExists,
+            "SAVE AS destination already exists; open it before saving",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn append_commit(
@@ -977,16 +986,20 @@ pub(crate) fn canonical_database_path(path: &Path) -> Result<PathBuf, StorageErr
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
-            let name = path.file_name().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "database path has no file name",
-                )
-            })?;
+            let name = database_file_name(path)?;
             Ok(fs::canonicalize(parent)?.join(name))
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn database_file_name(path: &Path) -> io::Result<&std::ffi::OsStr> {
+    path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "database path has no file name",
+        )
+    })
 }
 
 struct DatabaseWriter {
@@ -1007,24 +1020,20 @@ impl Drop for DatabaseWriter {
 impl DatabaseWriter {
     fn acquire(path: &Path) -> Result<Self, StorageError> {
         let path = canonical_database_path(path)?;
-        let mut lock_name = path
-            .file_name()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "database path has no file name",
-                )
-            })?
-            .to_os_string();
+        let mut lock_name = database_file_name(&path)?.to_os_string();
         lock_name.push(".lock");
         let lock_path = path.with_file_name(lock_name);
         validate_lock_sidecar(&lock_path)?;
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        // Owner-only, like the temporary file: an advisory lock needs only an
+        // open descriptor, so a readable sidecar lets any local user block writes.
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(&lock_path)?;
         validate_lock_sidecar(&lock_path)?;
         match lock.try_lock() {
             Ok(()) => Ok(Self { path, _lock: lock }),
@@ -1371,7 +1380,7 @@ fn read_bytes(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>, StorageError>
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         COMPAT_VERSION, DatabaseWriter, FORMAT_VERSION, FileHeader, HEADER_SIZE, IndexStatus,
@@ -1391,6 +1400,18 @@ mod tests {
             std::process::id(),
             super::TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    fn lock_path(path: &Path) -> PathBuf {
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".lock");
+        path.with_file_name(name)
+    }
+
+    /// Remove a test database together with the `.lock` sidecar beside it.
+    fn remove_database(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lock_path(path));
     }
 
     fn copy_fixture(name: &str) -> PathBuf {
@@ -1495,7 +1516,7 @@ mod tests {
         assert_eq!(report.wal_records, 1);
         assert_eq!(engine.stats().node_count, 2);
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1515,7 +1536,7 @@ mod tests {
         let report = check(&path).unwrap();
         assert_eq!(report.wal_records, 0);
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1533,7 +1554,7 @@ mod tests {
             COMPAT_VERSION
         );
         assert_eq!(load(&path).unwrap().0.stats().node_count, 4);
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1551,7 +1572,7 @@ mod tests {
         assert_eq!(report.wal_records, 8);
         assert_eq!(fs::read(&path).unwrap(), original);
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1571,7 +1592,7 @@ mod tests {
         let error = check(&path).unwrap_err();
         assert_eq!(error.code(), "file_version");
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
 
     #[test]
@@ -1621,7 +1642,7 @@ mod tests {
             FORMAT_VERSION
         );
 
-        let _ = fs::remove_file(path);
+        remove_database(&path);
     }
     fn create_committed_database(name: &str) -> (PathBuf, Session) {
         let path = temp_path(name);
@@ -1665,7 +1686,7 @@ mod tests {
                 .execute_script("CREATE (:Doc {name: 'retry'})", &BTreeMap::new())
                 .unwrap();
             assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
-            fs::remove_file(path).unwrap();
+            remove_database(&path);
         }
     }
 
@@ -1693,7 +1714,7 @@ mod tests {
         session.execute_script("COMMIT", &BTreeMap::new()).unwrap();
         assert_eq!(session.transaction_info().last_tx_id, original_tx + 1);
         assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
 
     #[test]
@@ -1717,7 +1738,7 @@ mod tests {
         assert_eq!(session.engine().stats().node_count, 2);
         session.save().unwrap();
         assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
 
     #[test]
@@ -1770,7 +1791,7 @@ mod tests {
             .execute_script("CREATE (:Doc {name: 'next'})", &BTreeMap::new())
             .unwrap();
         assert_eq!(load(&path).unwrap().0.stats().node_count, 3);
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
 
     #[test]
@@ -1817,7 +1838,7 @@ mod tests {
             assert!(!report.recovered_tail);
             assert_eq!(report.wal_records, 2);
             assert_eq!(engine.stats().node_count, 3);
-            fs::remove_file(path).unwrap();
+            remove_database(&path);
         }
     }
 
@@ -1838,7 +1859,7 @@ mod tests {
                 4
             );
             assert_eq!(load(&path).unwrap().0.stats().node_count, 4);
-            fs::remove_file(path).unwrap();
+            remove_database(&path);
         }
         let path = copy_fixture("person_v0_1_0.cupld");
         let parsed = parse_file(&fs::read(&path).unwrap()).unwrap();
@@ -1854,7 +1875,7 @@ mod tests {
         fs::write(&path, &invalid).unwrap();
         assert_eq!(check(&path).unwrap_err().code(), "decode_eof");
         assert_eq!(fs::read(&path).unwrap(), invalid);
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
 
     #[test]
@@ -1865,6 +1886,7 @@ mod tests {
         let original = fs::read(&path).unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
                 "storage::tests::lock_holder_process",
                 "--nocapture",
@@ -1901,10 +1923,12 @@ mod tests {
             .execute_script("CREATE (:Doc)", &BTreeMap::new())
             .unwrap();
         assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
 
+    /// Subprocess helper for the cross-process lock test; not a test itself.
     #[test]
+    #[ignore]
     fn lock_holder_process() {
         use std::io::Write;
         let Some(path) = std::env::var_os("CUPLD_TEST_STORAGE_LOCK_PATH") else {
@@ -1921,6 +1945,15 @@ mod tests {
     fn replacement_preserves_permissions_and_refuses_readonly_database() {
         use std::os::unix::fs::PermissionsExt;
         let (path, mut session) = create_committed_database("permissions");
+        // New databases and their lock sidecars start owner-only.
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(lock_path(&path)).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         session
             .execute_script("CREATE (:Doc)", &BTreeMap::new())
@@ -1949,7 +1982,7 @@ mod tests {
         session
             .execute_script("CREATE (:Doc)", &BTreeMap::new())
             .unwrap();
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
 
     #[cfg(unix)]
@@ -1958,9 +1991,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let (path, mut session) = create_committed_database("lock_aliases");
         let writer = DatabaseWriter::acquire(&path).unwrap();
-        let mut name = path.file_name().unwrap().to_os_string();
-        name.push(".lock");
-        let lock_path = path.with_file_name(name);
+        let lock_path = lock_path(&path);
         drop(writer);
         fs::remove_file(&lock_path).unwrap();
         let original = fs::read(&path).unwrap();
@@ -1972,13 +2003,25 @@ mod tests {
         assert_eq!(session.save().unwrap_err().code(), "io_error");
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::remove_file(&lock_path).unwrap();
+        // An empty hard-linked sidecar passes the length check, so only the
+        // Unix alias rule can reject it.
+        let empty_target = path.with_extension("empty");
+        fs::write(&empty_target, b"").unwrap();
+        fs::hard_link(&empty_target, &lock_path).unwrap();
+        let error = session.save().unwrap_err();
+        assert_eq!(error.code(), "io_error");
+        assert!(error.to_string().contains("without aliases"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::metadata(&empty_target).unwrap().len(), 0);
+        fs::remove_file(&lock_path).unwrap();
+        fs::remove_file(&empty_target).unwrap();
         fs::write(&lock_path, b"unrelated file").unwrap();
         assert_eq!(session.save().unwrap_err().code(), "io_error");
         assert_eq!(fs::read(&lock_path).unwrap(), b"unrelated file");
         assert_eq!(fs::read(&path).unwrap(), original);
         fs::remove_file(&lock_path).unwrap();
         session.save().unwrap();
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
     #[test]
     fn duplicated_lock_descriptor_does_not_extend_writer_scope() {
@@ -1989,7 +2032,7 @@ mod tests {
         let next_writer = DatabaseWriter::acquire(&path).unwrap();
         drop(next_writer);
         drop(inherited);
-        fs::remove_file(path).unwrap();
+        remove_database(&path);
     }
 
     #[test]

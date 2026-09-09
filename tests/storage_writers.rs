@@ -167,18 +167,29 @@ fn save_as_does_not_replace_another_database_or_rebind_the_session() {
     let directory = TestDirectory::new("existing_save_as");
     let source = directory.path().join("source.cupld");
     let destination = directory.path().join("destination.cupld");
+    let unrelated = directory.path().join("secrets.txt");
     let mut session = create_database(&source);
     let mut other = create_database(&destination);
     run(&mut other, "CREATE (:Note {name: 'destination'})");
     let other_bytes = fs::read(&destination).unwrap();
+    fs::write(&unrelated, b"not a database").unwrap();
+    let entries = directory_entries(directory.path());
     let original_path = session.path().unwrap().to_path_buf();
 
     assert_eq!(
         session.save_as(&destination).unwrap_err().code(),
         "database_exists"
     );
+    assert_eq!(
+        session.save_as(&unrelated).unwrap_err().code(),
+        "database_exists"
+    );
     assert_eq!(session.path(), Some(original_path.as_path()));
     assert_eq!(fs::read(&destination).unwrap(), other_bytes);
+    assert_eq!(fs::read(&unrelated).unwrap(), b"not a database");
+    // A refused destination gains no `.lock` sidecar or other new entries.
+    assert!(!directory.path().join("secrets.txt.lock").exists());
+    assert_eq!(directory_entries(directory.path()), entries);
     run(&mut session, "CREATE (:Note {name: 'source'})");
     assert_eq!(fs::read(&destination).unwrap(), other_bytes);
     assert_eq!(
