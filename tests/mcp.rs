@@ -1159,6 +1159,507 @@ fn memory_search_rejects_unknown_retrieval_mode() {
 }
 
 #[test]
+fn memory_reads_hide_synced_tombstones_and_show_restored_notes() {
+    let db = TestDb::new("mcp_tombstone_reads");
+    let root = temp_dir("mcp_tombstone_reads");
+    fs::create_dir_all(&root).unwrap();
+    let deleted_body = "---\ntags: [keep]\n---\n# Deleted Needle\n\nquartz needle";
+    fs::write(root.join("a-deleted.md"), deleted_body).unwrap();
+    fs::write(
+        root.join("z-current.md"),
+        "---\ntags: [keep]\n---\n# Current\n\nquartz needle",
+    )
+    .unwrap();
+    sync_root(db.path(), &root);
+    let config = config(db.path(), &root, false);
+    let original = tool_payload(&call(
+        &config,
+        "memory_get",
+        r#"{"id_or_uri":"a-deleted.md"}"#,
+    ));
+    let original_id = original.get("item").unwrap().get("id").unwrap().clone();
+    fs::remove_file(root.join("a-deleted.md")).unwrap();
+    // Reads continue to reflect the DB until the deletion is explicitly synced.
+    assert_eq!(
+        item_paths(&tool_payload(&call(&config, "memory_list", "{}"))),
+        vec!["a-deleted.md", "z-current.md"]
+    );
+    let sync = tool_payload(&call(&config, "memory_sync", "{}"));
+    assert!(json_text(&sync).contains("\"tombstoned_documents\":1"));
+
+    for indexed in [false, true] {
+        if indexed {
+            create_markdown_search_indexes(db.path());
+        }
+        for args in [
+            r#"{"query":"needle","limit":1}"#,
+            r#"{"query":"quartz needle","limit":1}"#,
+            r#"{"query":"needle","tags":["keep"],"limit":1}"#,
+        ] {
+            let payload = tool_payload(&call(&config, "memory_search", args));
+            assert_eq!(item_paths(&payload), vec!["z-current.md"], "{args}");
+            assert_eq!(
+                payload
+                    .get("retrieval")
+                    .unwrap()
+                    .get("index_used")
+                    .and_then(JsonValue::as_bool),
+                Some(indexed && !args.contains("quartz"))
+            );
+        }
+        assert!(
+            item_paths(&tool_payload(&call(
+                &config,
+                "memory_search",
+                r#"{"query":"Deleted"}"#,
+            )))
+            .is_empty(),
+            "indexed metadata supplementation must also exclude tombstones"
+        );
+    }
+    for args in [r#"{"limit":1}"#, r#"{"tags":["keep"],"limit":1}"#] {
+        let payload = tool_payload(&call(&config, "memory_list", args));
+        assert_eq!(item_paths(&payload), vec!["z-current.md"]);
+    }
+    for identity in [
+        "a-deleted.md".to_owned(),
+        "memory://note/a-deleted.md".to_owned(),
+        "Deleted Needle".to_owned(),
+        "deleted needle".to_owned(),
+        original_id.as_i64().unwrap().to_string(),
+    ] {
+        let args = json_text(&JsonValue::object([("id_or_uri", identity.into())]));
+        for tool in ["memory_get", "memory_context"] {
+            let payload = json_text(&tool_payload(&call(&config, tool, &args)));
+            assert!(
+                payload.contains("\"code\":\"not_found\""),
+                "{tool} {args}: {payload}"
+            );
+        }
+    }
+    for uri in ["memory://index", "memory://recent", "memory://tag/keep"] {
+        let response = rpc(
+            &config,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{{"uri":"{uri}"}}}}"#
+            ),
+        );
+        assert_eq!(
+            item_paths(&resource_payload(&response)),
+            vec!["z-current.md"]
+        );
+    }
+    let deleted_resource = rpc(
+        &config,
+        r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"memory://note/a-deleted.md"}}"#,
+    );
+    assert!(json_text(&resource_payload(&deleted_resource)).contains("\"code\":\"not_found\""));
+
+    fs::write(root.join("a-deleted.md"), deleted_body).unwrap();
+    let restored = tool_payload(&call(&config, "memory_sync", "{}"));
+    assert_eq!(restored.get("ok").and_then(JsonValue::as_bool), Some(true));
+    let restored = tool_payload(&call(
+        &config,
+        "memory_get",
+        r#"{"id_or_uri":"a-deleted.md"}"#,
+    ));
+    assert_eq!(restored.get("item").unwrap().get("id"), Some(&original_id));
+    for args in [
+        r#"{"path":"a-deleted.md","depth":0}"#,
+        r#"{"id_or_uri":"memory://note/a-deleted.md","depth":0}"#,
+    ] {
+        let restored = tool_payload(&call(&config, "memory_context", args));
+        assert_eq!(restored.get("ok").and_then(JsonValue::as_bool), Some(true));
+        assert!(json_text(&restored).contains("a-deleted.md"));
+    }
+    assert_eq!(
+        item_paths(&tool_payload(&call(
+            &config,
+            "memory_search",
+            r#"{"query":"needle"}"#,
+        ))),
+        vec!["a-deleted.md", "z-current.md"]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_context_excludes_tombstones_before_traversal_and_budgets() {
+    use cupld::context::{ContextDirection, ContextRequest};
+    use cupld::{PropertyMap, Value};
+
+    let db = TestDb::new("mcp_tombstone_context");
+    let root = temp_dir("mcp_tombstone_context");
+    fs::create_dir_all(root.join("deleted-dir")).unwrap();
+    fs::write(root.join("seed.md"), "# Seed").unwrap();
+    fs::write(root.join("deleted-dir/deleted.md"), "# Deleted").unwrap();
+    fs::write(root.join("current.md"), "# Current").unwrap();
+    sync_root_with_fs_graph(db.path(), &root);
+    fs::remove_dir_all(root.join("deleted-dir")).unwrap();
+    sync_root_with_fs_graph(db.path(), &root);
+    // Native edges may intentionally survive markdown sync. They must not leak
+    // a tombstone or use it as a bridge to unrelated live context.
+    let mut session = Session::open(db.path()).unwrap();
+    let mut engine = session.engine().clone();
+    let node_at = |path: &str| {
+        engine
+            .nodes()
+            .find(|node| node.property("src.path") == Some(&Value::from(path)))
+            .unwrap()
+            .id()
+    };
+    let seed_id = node_at("seed.md");
+    let deleted_id = node_at("deleted-dir/deleted.md");
+    let current_id = node_at("current.md");
+    let dir_id = node_at("deleted-dir");
+    for target in [deleted_id, dir_id, current_id] {
+        engine
+            .create_edge(seed_id, target, "NATIVE_LINK", PropertyMap::new())
+            .unwrap();
+    }
+    let behind = engine
+        .create_node(
+            ["Native"],
+            PropertyMap::from_pairs([("name".to_owned(), Value::from("behind tombstone"))]),
+        )
+        .unwrap();
+    engine
+        .create_edge(deleted_id, behind, "NATIVE_LINK", PropertyMap::new())
+        .unwrap();
+    let native_id = engine
+        .create_node(
+            ["Native"],
+            PropertyMap::from_pairs([
+                ("name".to_owned(), Value::from("native missing")),
+                ("src.status".to_owned(), Value::from("missing")),
+            ]),
+        )
+        .unwrap()
+        .get();
+    let deleted_id = deleted_id.get();
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+    drop(session);
+    let config = config(db.path(), &root, false);
+    for args in [
+        r#"{"path":"seed.md","depth":3,"edge_types":["NATIVE_LINK"]}"#,
+        r#"{"path":"seed.md","depth":3,"edge_types":["NATIVE_LINK"],"max_nodes":2,"max_edges":1}"#,
+    ] {
+        let payload = tool_payload(&call(&config, "memory_context", args));
+        let text = json_text(&payload);
+        assert_eq!(
+            payload.get("nodes").unwrap().as_array().unwrap().len(),
+            2,
+            "{text}"
+        );
+        assert_eq!(
+            payload.get("edges").unwrap().as_array().unwrap().len(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("current.md"), "{text}");
+        assert!(!text.contains("deleted-dir"), "{text}");
+        assert!(!text.contains("behind tombstone"), "{text}");
+    }
+    for (args, code) in [
+        (
+            r#"{"path":"deleted-dir/deleted.md"}"#.to_owned(),
+            "context_seed_path_not_found",
+        ),
+        (
+            r#"{"paths":["seed.md","deleted-dir/deleted.md"]}"#.to_owned(),
+            "context_seed_path_not_found",
+        ),
+        (
+            r#"{"path":"deleted-dir"}"#.to_owned(),
+            "context_seed_path_not_found",
+        ),
+        (
+            format!(r#"{{"node":{deleted_id}}}"#),
+            "context_seed_not_found",
+        ),
+    ] {
+        let payload = tool_payload(&call(&config, "memory_context", &args));
+        assert!(
+            json_text(&payload).contains(code),
+            "{args}: {}",
+            json_text(&payload)
+        );
+    }
+    let native = tool_payload(&call(
+        &config,
+        "memory_context",
+        &format!(r#"{{"node":{native_id}}}"#),
+    ));
+    assert_eq!(native.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert!(json_text(&native).contains("native missing"));
+    let historical = ContextRequest {
+        db_path: db.path().to_path_buf(),
+        nodes: vec![deleted_id.try_into().unwrap()],
+        paths: vec![],
+        seeds: vec![],
+        depth: 1,
+        direction: ContextDirection::Out,
+        edge_types: vec![],
+        labels: vec![],
+        max_nodes: 10,
+        max_edges: 10,
+    }
+    .run()
+    .unwrap();
+    assert!(
+        historical
+            .nodes
+            .iter()
+            .any(|node| node.src_status.as_deref() == Some("missing"))
+    );
+    assert!(
+        historical
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "context_seed_source_stale")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_sync_honors_workspace_fs_graph_setting_for_directory_tombstones() {
+    // `memory_sync` reads `[markdown] include_fs_graph` from the workspace the
+    // server runs in, so drive the built binary with that working directory
+    // instead of changing this test process's own.
+    for include_fs_graph in [false, true] {
+        let db = TestDb::new("mcp_tombstone_dir_sync");
+        let workspace = temp_dir("mcp_tombstone_dir_sync");
+        let root = workspace.join("notes");
+        fs::create_dir_all(workspace.join(".cupld")).unwrap();
+        fs::write(
+            workspace.join(".cupld").join("config.toml"),
+            if include_fs_graph {
+                "version = 1\n\n[markdown]\ninclude_fs_graph = true\n"
+            } else {
+                "version = 1\n"
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("deleted-dir")).unwrap();
+        fs::write(root.join("seed.md"), "# Seed").unwrap();
+        fs::write(root.join("deleted-dir/deleted.md"), "# Deleted").unwrap();
+        fs::write(root.join("current.md"), "# Current").unwrap();
+        // The CLI fs-graph sync builds the directory nodes; the agent then
+        // deletes a directory and syncs through the tool.
+        sync_root_with_fs_graph(db.path(), &root);
+        fs::remove_dir_all(root.join("deleted-dir")).unwrap();
+
+        let responses = serve_in_workspace(
+            &workspace,
+            db.path(),
+            &root,
+            &[
+                ("memory_sync", "{}"),
+                ("memory_context", r#"{"path":"seed.md","depth":3}"#),
+                ("memory_context", r#"{"path":"deleted-dir"}"#),
+            ],
+        );
+        let sync = json_text(&tool_payload(&responses[0]));
+        assert!(
+            sync.contains("\"tombstoned_documents\":1"),
+            "include_fs_graph={include_fs_graph}: {sync}"
+        );
+        assert!(
+            sync.contains(&format!(
+                "\"tombstoned_directories\":{}",
+                usize::from(include_fs_graph)
+            )),
+            "include_fs_graph={include_fs_graph}: {sync}"
+        );
+        if include_fs_graph {
+            let context = json_text(&tool_payload(&responses[1]));
+            assert!(context.contains("current.md"), "{context}");
+            assert!(!context.contains("deleted-dir"), "{context}");
+            let deleted = json_text(&tool_payload(&responses[2]));
+            assert!(deleted.contains("context_seed_path_not_found"), "{deleted}");
+        }
+        fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[test]
+fn memory_identity_resolution_follows_surviving_and_renamed_notes() {
+    let db = TestDb::new("mcp_tombstone_identity");
+    let root = temp_dir("mcp_tombstone_identity");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.md"), "# Shared\n\nfirst").unwrap();
+    fs::write(root.join("b.md"), "# Shared\n\nsecond").unwrap();
+    sync_root(db.path(), &root);
+    let config = config(db.path(), &root, false);
+    let by_title = r#"{"id_or_uri":"Shared"}"#;
+    let assert_resolves_to = |args: &str, path: &str| {
+        let payload = tool_payload(&call(&config, "memory_get", args));
+        assert_eq!(
+            payload
+                .get("item")
+                .and_then(|item| item.get("path"))
+                .and_then(JsonValue::as_str),
+            Some(path),
+            "memory_get {args}: {}",
+            json_text(&payload)
+        );
+        let payload = tool_payload(&call(&config, "memory_context", args));
+        assert_eq!(
+            payload.get("ok").and_then(JsonValue::as_bool),
+            Some(true),
+            "memory_context {args}: {}",
+            json_text(&payload)
+        );
+        assert_eq!(
+            payload.get("nodes").unwrap().as_array().unwrap().len(),
+            1,
+            "memory_context {args}: {}",
+            json_text(&payload)
+        );
+        assert!(
+            json_text(&payload).contains(&format!("\"{path}\"")),
+            "memory_context {args}: {}",
+            json_text(&payload)
+        );
+    };
+    let assert_not_found = |args: &str, matches: usize| {
+        for tool in ["memory_get", "memory_context"] {
+            let payload = json_text(&tool_payload(&call(&config, tool, args)));
+            assert!(
+                payload.contains("\"code\":\"not_found\""),
+                "{tool} {args}: {payload}"
+            );
+            // Only memory_get reports how many notes matched the identity.
+            if tool == "memory_get" {
+                assert!(
+                    payload.contains(&format!("\"matches\":{matches}")),
+                    "{tool} {args}: {payload}"
+                );
+            }
+        }
+    };
+
+    // Two live notes share the title, so the lookup is ambiguous.
+    assert_not_found(by_title, 2);
+
+    fs::remove_file(root.join("a.md")).unwrap();
+    let sync = json_text(&tool_payload(&call(&config, "memory_sync", "{}")));
+    assert!(sync.contains("\"tombstoned_documents\":1"), "{sync}");
+    assert_resolves_to(by_title, "b.md");
+
+    // The title follows a renamed file; the old path identity is gone. The
+    // report counts every note still missing, so a.md and b.md both appear.
+    fs::rename(root.join("b.md"), root.join("c.md")).unwrap();
+    let sync = json_text(&tool_payload(&call(&config, "memory_sync", "{}")));
+    assert!(sync.contains("\"tombstoned_documents\":2"), "{sync}");
+    assert_resolves_to(by_title, "c.md");
+    assert_resolves_to(r#"{"id_or_uri":"memory://note/c.md"}"#, "c.md");
+    assert_not_found(r#"{"id_or_uri":"memory://note/b.md"}"#, 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_reads_preserve_legacy_notes_and_ignore_tombstoned_structure() {
+    use cupld::{PropertyMap, Value};
+    let db = TestDb::new("mcp_tombstone_structure");
+    let root = temp_dir("mcp_tombstone_structure");
+    fs::create_dir_all(&root).unwrap();
+    let mut session = Session::open(db.path()).unwrap();
+    let mut engine = session.engine().clone();
+    let mut docs = Vec::new();
+    for (path, status) in [("a-legacy.md", None), ("b-current.md", Some("current"))] {
+        let mut properties = PropertyMap::from_pairs([
+            ("src.path".to_owned(), Value::from(path)),
+            ("md.title".to_owned(), Value::from("Needle")),
+            ("md.body".to_owned(), Value::from("needle")),
+            ("md.tags".to_owned(), Value::List(vec![Value::from("keep")])),
+        ]);
+        if let Some(status) = status {
+            properties.insert("src.status".to_owned(), Value::from(status));
+        }
+        docs.push(
+            engine
+                .create_node(["MarkdownDocument"], properties)
+                .unwrap(),
+        );
+    }
+    let mut dirs = Vec::new();
+    for (path, status) in [("deleted-dir", "missing"), ("parent", "current")] {
+        dirs.push(
+            engine
+                .create_node(
+                    ["MarkdownDirectory"],
+                    PropertyMap::from_pairs([
+                        ("src.path".to_owned(), Value::from(path)),
+                        ("src.status".to_owned(), Value::from(status)),
+                    ]),
+                )
+                .unwrap(),
+        );
+    }
+    for (from, to, kind) in [
+        (docs[0], dirs[0], "MD_IN_DIRECTORY"),
+        (docs[1], dirs[1], "MD_IN_DIRECTORY"),
+        (dirs[0], dirs[1], "MD_PARENT_DIRECTORY"),
+    ] {
+        engine
+            .create_edge(
+                from,
+                to,
+                kind,
+                PropertyMap::from_pairs([("md.edge_weight".to_owned(), Value::from(1i64))]),
+            )
+            .unwrap();
+    }
+    engine.commit().unwrap();
+    session.replace_engine(engine).unwrap();
+    session.save().unwrap();
+    drop(session);
+    let config = config(db.path(), &root, false);
+    for indexed in [false, true] {
+        if indexed {
+            create_markdown_search_indexes(db.path());
+        }
+        for args in [
+            r#"{"query":"needle"}"#,
+            r#"{"query":"needle","tags":["keep"]}"#,
+        ] {
+            let payload = tool_payload(&call(&config, "memory_search", args));
+            assert_eq!(item_paths(&payload), vec!["a-legacy.md", "b-current.md"]);
+            for item in payload.get("items").unwrap().as_array().unwrap() {
+                assert_eq!(
+                    item.get("structural_signal")
+                        .unwrap()
+                        .get("score")
+                        .and_then(JsonValue::as_i64),
+                    Some(0)
+                );
+            }
+        }
+    }
+    let legacy = tool_payload(&call(
+        &config,
+        "memory_get",
+        r#"{"id_or_uri":"a-legacy.md"}"#,
+    ));
+    assert_eq!(legacy.get("ok").and_then(JsonValue::as_bool), Some(true));
+    let legacy = tool_payload(&call(
+        &config,
+        "memory_context",
+        r#"{"path":"a-legacy.md"}"#,
+    ));
+    assert_eq!(legacy.get("ok").and_then(JsonValue::as_bool), Some(true));
+    assert!(!json_text(&legacy).contains("deleted-dir"));
+    assert_eq!(
+        item_paths(&tool_payload(&call(&config, "memory_list", "{}"))),
+        vec!["a-legacy.md", "b-current.md"]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_search_uses_markdown_indexes_without_changing_ranked_results() {
     let fallback_db = TestDb::new("mcp_search_fallback_candidates");
     let indexed_db = TestDb::new("mcp_search_indexed_candidates");
@@ -1794,10 +2295,64 @@ fn rpc(config: &McpConfig, input: &str) -> JsonValue {
 }
 
 fn call(config: &McpConfig, name: &str, args: &str) -> JsonValue {
-    let input = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+    rpc(config, &tool_call_request(1, name, args))
+}
+
+fn tool_call_request(id: usize, name: &str, args: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+    )
+}
+
+/// Runs `cupld mcp serve` with `workspace` as its working directory, so the
+/// server discovers that workspace's `.cupld/config.toml`, and returns one
+/// response per tool call.
+fn serve_in_workspace(
+    workspace: &Path,
+    db_path: &Path,
+    root: &Path,
+    calls: &[(&str, &str)],
+) -> Vec<JsonValue> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cupld"))
+        .args(["mcp", "serve", "--db"])
+        .arg(db_path)
+        .arg("--root")
+        .arg(root)
+        .current_dir(workspace)
+        .env("CUPLD_NO_INSTALL_PROMPT", "1")
+        .env("CUPLD_NO_UPGRADE_CHECK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = String::new();
+    for (index, (name, args)) in calls.iter().enumerate() {
+        input.push_str(&tool_call_request(index + 1, name, args));
+        input.push('\n');
+    }
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    rpc(config, &input)
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let responses = stdout
+        .lines()
+        .map(|line| json::parse(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), calls.len(), "{stdout}");
+    responses
 }
 
 fn json_text(value: &JsonValue) -> String {

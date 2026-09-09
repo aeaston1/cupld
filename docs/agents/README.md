@@ -62,7 +62,7 @@ Important constraints:
 - Passing a missing `path.cupld` to the REPL creates a new database file.
 - Opening or checking an older `.cupld` file may upgrade it in place to the current on-disk format.
 - Repo-local package defaults live in `.cupld/config.toml`.
-- `[markdown] include_fs_graph = true` enables filesystem structure sync for `cupld sync markdown` only.
+- `[markdown] include_fs_graph = true` enables filesystem structure sync for `cupld sync markdown` and for MCP `memory_sync`/`memory_add` syncs run from that workspace.
 - `--db default` is an alias for `./.cupld/default.cupld`.
 - `install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in user config `install-state.toml`.
 - If `install-state.toml` is corrupt or points at the wrong install, run `cupld install ...` again with the intended target/path, DB, and root to rewrite it.
@@ -162,6 +162,10 @@ MCP resources:
 MCP reads are DB-backed only and never scan markdown files or run hidden markdown syncs. Use `memory_sync` to ingest markdown into DB state. `memory_add` writes markdown under the configured root, then syncs before reporting success. `--read-only` disables `memory_add` and `memory_sync`. External concurrent DB writers are unsupported in V1. Agent harnesses should inspect `tools/list` input schemas and send documented arguments. Read tools preserve compatibility by ignoring unknown fields and returning `warnings`; write tools reject unknown fields before mutating state.
 
 `memory_context` expands from a search result URI/path or explicit node/path seeds into the same bounded context envelope as `cupld context --output json`. Accepted arguments include `id_or_uri`, `path`, `paths`, `node`, `nodes`, `depth`, `direction`, `edge_types`, `labels`, `max_nodes`, and `max_edges`. This lets MCP-capable harnesses move from `memory_search` to prompt context without shelling out.
+
+After `memory_sync` records a deletion (`src.status = missing`), ordinary MCP reads exclude that note: `memory_search` (including indexed candidates), `memory_get`, `memory_list`, and note/index/recent/tag resources. Deleted notes do not consume result limits or affect structural ranking. A deleted note lookup returns `not_found`; recreating its file and syncing makes the same note identity readable again. Reads continue to reflect the last sync, so deleting a file alone does not immediately hide it.
+
+`memory_context` also excludes tombstoned `MarkdownDocument` and `MarkdownDirectory` nodes and their incident edges before resolving seeds and traversing the graph. Directory tombstones are recorded only by filesystem-graph syncs: `memory_sync` (and the sync inside `memory_add`) honors the `[markdown] include_fs_graph` setting of the workspace `mcp serve` runs in, so with that setting enabled an MCP sync marks a deleted directory missing just like `cupld sync markdown --include-fs-graph`; without it, `memory_sync` tombstones the deleted documents but leaves directory nodes untouched. Deleted node/path seeds return the existing `context_seed_not_found`/`context_seed_path_not_found` errors; deleted URI/title seeds return `not_found`. Tombstones cannot bridge traversal or consume retrieval budgets. For compatibility, notes with no `src.status` and native graph nodes remain readable. The native `cupld context` command and explicit graph queries retain their existing historical access, including tombstones and stale-source warnings.
 
 `memory_doctor` returns the agent-facing memory readiness report. It should identify itself with `tool: "memory_doctor"`, use the same `pass` / `warn` / `fail` status vocabulary as memory maintenance reports, include a non-empty `checks` array, explain DB-backed sync visibility, and provide `next_actions` such as calling `memory_sync` when markdown edits may not be reflected in DB-backed reads.
 

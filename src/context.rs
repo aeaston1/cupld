@@ -121,8 +121,25 @@ struct ContextGraph {
 
 impl ContextRequest {
     pub fn run(&self) -> Result<ContextEnvelope, AutomationError> {
+        self.run_with_node_filter(|_| true)
+    }
+
+    pub(crate) fn run_for_memory(&self) -> Result<ContextEnvelope, AutomationError> {
+        self.run_with_node_filter(|node| {
+            node.src_status.as_deref() != Some("missing")
+                || !node
+                    .labels
+                    .iter()
+                    .any(|label| label == "MarkdownDocument" || label == "MarkdownDirectory")
+        })
+    }
+
+    fn run_with_node_filter(
+        &self,
+        keep_node: impl Fn(&ContextNode) -> bool,
+    ) -> Result<ContextEnvelope, AutomationError> {
         let mut session = Session::open(&self.db_path).map_err(AutomationError::from)?;
-        let graph = load_context_graph(&mut session)?;
+        let graph = load_context_graph(&mut session, keep_node)?;
         build_context_response(&self.db_path, self, graph)
     }
 }
@@ -232,19 +249,26 @@ pub fn context_as_query_result(response: &ContextEnvelope) -> QueryResult {
     }
 }
 
-fn load_context_graph(session: &mut Session) -> Result<ContextGraph, AutomationError> {
+fn load_context_graph(
+    session: &mut Session,
+    keep_node: impl Fn(&ContextNode) -> bool,
+) -> Result<ContextGraph, AutomationError> {
     let snapshot = session.engine().snapshot();
     let nodes = snapshot
         .nodes()
-        .map(|node| {
-            let context_node = ContextNode::from_node(node);
-            (context_node.node_id, context_node)
-        })
+        .map(ContextNode::from_node)
+        .filter(keep_node)
+        .map(|node| (node.node_id, node))
         .collect::<BTreeMap<_, _>>();
     let mut edges = BTreeMap::new();
     let mut outgoing: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     let mut incoming: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for edge in snapshot.edges().map(ContextEdge::from_edge) {
+        // Remove incident edges before traversal so hidden nodes cannot bridge
+        // context or consume retrieval budgets. Native context keeps all nodes.
+        if !nodes.contains_key(&edge.source_node_id) || !nodes.contains_key(&edge.target_node_id) {
+            continue;
+        }
         outgoing
             .entry(edge.source_node_id)
             .or_default()

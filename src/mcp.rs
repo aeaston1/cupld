@@ -8,9 +8,9 @@ use crate::json::{self, JsonValue};
 use crate::package::WorkspacePackage;
 use crate::runtime::{RuntimeValue, Session};
 use crate::source::{
-    MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, configured_markdown_root, sync_markdown_root,
+    MD_IN_DIRECTORY, MD_PARENT_DIRECTORY, configured_markdown_root, sync_markdown_root_with_options,
 };
-use crate::{MarkdownSyncReport, Value};
+use crate::{MarkdownSyncOptions, MarkdownSyncReport, Value};
 
 const MAX_LIMIT: usize = 50;
 const DEFAULT_LIMIT: usize = 10;
@@ -1107,7 +1107,7 @@ fn memory_context(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, Mcp
         max_nodes: args.optional_usize("max_nodes", 25, 250)?,
         max_edges: args.optional_usize("max_edges", 100, 1_000)?,
     };
-    match request.run() {
+    match request.run_for_memory() {
         Ok(envelope) => json::parse(&context_as_json(&envelope))
             .map(|payload| with_warnings(payload, warnings))
             .map_err(|error| McpToolError::new("context_serialization_failed", error.to_string())),
@@ -1485,7 +1485,18 @@ fn sync_configured_root(config: &McpConfig) -> Result<MarkdownSyncReport, String
     let root = resolve_markdown_root(config, Some(&session))
         .ok_or_else(|| "markdown root is not configured".to_owned())?;
     let mut engine = session.engine().clone();
-    let report = sync_markdown_root(&mut engine, &root).map_err(|error| error.to_string())?;
+    // Honor the workspace `[markdown] include_fs_graph` setting like
+    // `cupld sync markdown` does, so MCP syncs also tombstone deleted
+    // directories. A config read failure falls back to documents only.
+    let include_fs_graph = WorkspacePackage::discover_current()
+        .map(|package| package.configured_markdown_include_fs_graph())
+        .unwrap_or(false);
+    let report = sync_markdown_root_with_options(
+        &mut engine,
+        &root,
+        &MarkdownSyncOptions { include_fs_graph },
+    )
+    .map_err(|error| error.to_string())?;
     engine.commit().map_err(|error| error.to_string())?;
     session
         .replace_engine(engine)
@@ -1637,16 +1648,7 @@ fn load_search_docs(
 }
 
 fn load_docs_from_session(session: &mut Session) -> Result<Vec<MemoryDoc>, String> {
-    let result = session
-        .execute_script(
-            "MATCH (d:MarkdownDocument)
-             RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
-             ORDER BY d.`src.path`",
-            &BTreeMap::new(),
-        )
-        .map_err(|error| error.to_string())?
-        .remove(0);
-    Ok(result.rows.into_iter().map(MemoryDoc::from_row).collect())
+    query_memory_docs(session, "")
 }
 
 fn query_memory_docs(session: &mut Session, where_clause: &str) -> Result<Vec<MemoryDoc>, String> {
@@ -1655,21 +1657,26 @@ fn query_memory_docs(session: &mut Session, where_clause: &str) -> Result<Vec<Me
             &format!(
                 "MATCH (d:MarkdownDocument)
                  {where_clause}
-                 RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
-                 ORDER BY d.`src.path`"
+                 RETURN {}
+                 ORDER BY d.`src.path`",
+                memory_doc_projection()
             ),
             &BTreeMap::new(),
         )
         .map_err(|error| error.to_string())?
         .remove(0);
-    Ok(result.rows.into_iter().map(MemoryDoc::from_row).collect())
+    Ok(result
+        .rows
+        .into_iter()
+        .filter_map(MemoryDoc::from_row)
+        .collect())
 }
 
 fn query_memory_doc_identities(session: &mut Session) -> Result<Vec<(i64, String)>, String> {
     let result = session
         .execute_script(
             "MATCH (d:MarkdownDocument)
-             RETURN id(d), d.`md.title`
+             RETURN id(d), d.`md.title`, d.`src.status`
              ORDER BY d.`src.path`",
             &BTreeMap::new(),
         )
@@ -1678,6 +1685,7 @@ fn query_memory_doc_identities(session: &mut Session) -> Result<Vec<(i64, String
     Ok(result
         .rows
         .into_iter()
+        .filter(|row| string_at(row, 2) != "missing")
         .map(|row| (int_at(&row, 0), string_at(&row, 1)))
         .collect())
 }
@@ -1686,23 +1694,10 @@ fn load_indexed_body_candidates(
     session: &mut Session,
     query: &str,
 ) -> Result<(Vec<MemoryDoc>, bool), String> {
-    let indexed = session
-        .execute_script(
-            &format!(
-                "MATCH (d:MarkdownDocument)
-                 WHERE d.`md.body` CONTAINS {}
-                 RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
-                 ORDER BY d.`src.path`",
-                cypher_string(query)
-            ),
-            &BTreeMap::new(),
-        )
-        .map_err(|error| error.to_string())?
-        .remove(0)
-        .rows
-        .into_iter()
-        .map(MemoryDoc::from_row)
-        .collect::<Vec<_>>();
+    let indexed = query_memory_docs(
+        session,
+        &format!("WHERE d.`md.body` CONTAINS {}", cypher_string(query)),
+    )?;
 
     let indexed_ids = indexed.iter().map(|doc| doc.id).collect::<BTreeSet<_>>();
     let mut docs = indexed;
@@ -1725,23 +1720,8 @@ fn load_indexed_tag_candidates(
     for tag in tags {
         clauses.push(format!("{} IN d.`md.tags`", cypher_string(tag)));
     }
-    let result = session
-        .execute_script(
-            &format!(
-                "MATCH (d:MarkdownDocument)
-                 WHERE {}
-                 RETURN id(d), d.`src.path`, d.`md.title`, d.`md.tags`, d.`md.aliases`, d.`md.headings`, d.`md.body`, d.`md.raw`, d.`src.status`
-                 ORDER BY d.`src.path`",
-                clauses.join(" AND ")
-            ),
-            &BTreeMap::new(),
-        )
-        .map_err(|error| error.to_string())?
-        .remove(0);
-    Ok((
-        result.rows.into_iter().map(MemoryDoc::from_row).collect(),
-        true,
-    ))
+    let docs = query_memory_docs(session, &format!("WHERE {}", clauses.join(" AND ")))?;
+    Ok((docs, true))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1813,9 +1793,44 @@ struct MemoryDoc {
     raw: String,
 }
 
+/// The single projection every `MemoryDoc` query returns. `MemoryDoc::from_row`
+/// reads rows positionally, so the column order here is the only definition.
+const MEMORY_DOC_COLUMNS: [&str; 9] = [
+    "id(d)",
+    "d.`src.path`",
+    "d.`md.title`",
+    "d.`md.tags`",
+    "d.`md.aliases`",
+    "d.`md.headings`",
+    "d.`md.body`",
+    "d.`md.raw`",
+    "d.`src.status`",
+];
+const MEMORY_DOC_STATUS_INDEX: usize = MEMORY_DOC_COLUMNS.len() - 1;
+
+fn memory_doc_projection() -> String {
+    MEMORY_DOC_COLUMNS.join(", ")
+}
+
 impl MemoryDoc {
-    fn from_row(row: Vec<RuntimeValue>) -> Self {
-        Self {
+    fn from_row(row: Vec<RuntimeValue>) -> Option<Self> {
+        // A row of the wrong width did not come from MEMORY_DOC_COLUMNS, so its
+        // status column cannot be trusted; never treat it as a live note.
+        debug_assert_eq!(
+            row.len(),
+            MEMORY_DOC_COLUMNS.len(),
+            "memory doc queries must RETURN MEMORY_DOC_COLUMNS"
+        );
+        if row.len() != MEMORY_DOC_COLUMNS.len() {
+            return None;
+        }
+        // Sync retains deleted notes as tombstones for historical graph queries.
+        // Filter before ranking, identity resolution, or limits; legacy notes
+        // without src.status remain readable.
+        if string_at(&row, MEMORY_DOC_STATUS_INDEX) == "missing" {
+            return None;
+        }
+        Some(Self {
             id: int_at(&row, 0),
             path: string_at(&row, 1),
             title: string_at(&row, 2),
@@ -1824,7 +1839,7 @@ impl MemoryDoc {
             headings: string_list_at(&row, 5),
             body: string_at(&row, 6),
             raw: string_at(&row, 7),
-        }
+        })
     }
 
     fn to_item_json(&self, max_chars: usize) -> JsonValue {
@@ -2153,12 +2168,41 @@ struct DirectoryEdge {
     edge_weight: usize,
 }
 
+/// Columns both structural queries RETURN after the source key: the directory
+/// path, the edge weight, and the sync status of each endpoint. `DirectoryEdge`
+/// rows are read positionally by `live_directory_edge`.
+fn structural_edge_projection(source: &str, target: &str) -> String {
+    format!("{target}.`src.path`, e.`md.edge_weight`, {source}.`src.status`, {target}.`src.status`")
+}
+const STRUCTURAL_EDGE_COLUMN_COUNT: usize = 5;
+
+fn live_directory_edge(row: &[RuntimeValue]) -> Option<DirectoryEdge> {
+    debug_assert_eq!(
+        row.len(),
+        STRUCTURAL_EDGE_COLUMN_COUNT,
+        "structural queries must RETURN the source key and structural_edge_projection"
+    );
+    if row.len() != STRUCTURAL_EDGE_COLUMN_COUNT
+        || string_at(row, 3) == "missing"
+        || string_at(row, 4) == "missing"
+    {
+        return None;
+    }
+    Some(DirectoryEdge {
+        path: string_at(row, 1),
+        edge_weight: edge_weight_at(row, 2),
+    })
+}
+
 fn load_structural_index(session: &mut Session) -> Result<StructuralIndex, String> {
     let doc_rows = session
         .execute_script(
-            "MATCH (d:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
-             RETURN id(d), dir.`src.path`, e.`md.edge_weight`
-             ORDER BY id(d), dir.`src.path`",
+            &format!(
+                "MATCH (d:MarkdownDocument)-[e:MD_IN_DIRECTORY]->(dir:MarkdownDirectory)
+                 RETURN id(d), {}
+                 ORDER BY id(d), dir.`src.path`",
+                structural_edge_projection("d", "dir")
+            ),
             &BTreeMap::new(),
         )
         .map_err(|error| error.to_string())?
@@ -2166,20 +2210,22 @@ fn load_structural_index(session: &mut Session) -> Result<StructuralIndex, Strin
         .rows;
     let mut doc_directories: BTreeMap<i64, Vec<DirectoryEdge>> = BTreeMap::new();
     for row in doc_rows {
-        doc_directories
-            .entry(int_at(&row, 0))
-            .or_default()
-            .push(DirectoryEdge {
-                path: string_at(&row, 1),
-                edge_weight: edge_weight_at(&row, 2),
-            });
+        if let Some(edge) = live_directory_edge(&row) {
+            doc_directories
+                .entry(int_at(&row, 0))
+                .or_default()
+                .push(edge);
+        }
     }
 
     let parent_rows = session
         .execute_script(
-            "MATCH (child:MarkdownDirectory)-[e:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
-             RETURN child.`src.path`, parent.`src.path`, e.`md.edge_weight`
-             ORDER BY child.`src.path`, parent.`src.path`",
+            &format!(
+                "MATCH (child:MarkdownDirectory)-[e:MD_PARENT_DIRECTORY]->(parent:MarkdownDirectory)
+                 RETURN child.`src.path`, {}
+                 ORDER BY child.`src.path`, parent.`src.path`",
+                structural_edge_projection("child", "parent")
+            ),
             &BTreeMap::new(),
         )
         .map_err(|error| error.to_string())?
@@ -2187,13 +2233,12 @@ fn load_structural_index(session: &mut Session) -> Result<StructuralIndex, Strin
         .rows;
     let mut directory_parents: BTreeMap<String, Vec<DirectoryEdge>> = BTreeMap::new();
     for row in parent_rows {
-        directory_parents
-            .entry(string_at(&row, 0))
-            .or_default()
-            .push(DirectoryEdge {
-                path: string_at(&row, 1),
-                edge_weight: edge_weight_at(&row, 2),
-            });
+        if let Some(edge) = live_directory_edge(&row) {
+            directory_parents
+                .entry(string_at(&row, 0))
+                .or_default()
+                .push(edge);
+        }
     }
 
     Ok(StructuralIndex {
