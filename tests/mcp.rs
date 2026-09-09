@@ -1230,8 +1230,11 @@ fn memory_reads_hide_synced_tombstones_and_show_restored_notes() {
     ] {
         let args = json_text(&JsonValue::object([("id_or_uri", identity.into())]));
         for tool in ["memory_get", "memory_context"] {
-            let payload = tool_payload(&call(&config, tool, &args));
-            assert!(json_text(&payload).contains("\"code\":\"not_found\""));
+            let payload = json_text(&tool_payload(&call(&config, tool, &args)));
+            assert!(
+                payload.contains("\"code\":\"not_found\""),
+                "{tool} {args}: {payload}"
+            );
         }
     }
     for uri in ["memory://index", "memory://recent", "memory://tag/keep"] {
@@ -1417,6 +1420,143 @@ fn memory_context_excludes_tombstones_before_traversal_and_budgets() {
             .iter()
             .any(|warning| warning.code == "context_seed_source_stale")
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_sync_honors_workspace_fs_graph_setting_for_directory_tombstones() {
+    // `memory_sync` reads `[markdown] include_fs_graph` from the workspace the
+    // server runs in, so drive the built binary with that working directory
+    // instead of changing this test process's own.
+    for include_fs_graph in [false, true] {
+        let db = TestDb::new("mcp_tombstone_dir_sync");
+        let workspace = temp_dir("mcp_tombstone_dir_sync");
+        let root = workspace.join("notes");
+        fs::create_dir_all(workspace.join(".cupld")).unwrap();
+        fs::write(
+            workspace.join(".cupld").join("config.toml"),
+            if include_fs_graph {
+                "version = 1\n\n[markdown]\ninclude_fs_graph = true\n"
+            } else {
+                "version = 1\n"
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("deleted-dir")).unwrap();
+        fs::write(root.join("seed.md"), "# Seed").unwrap();
+        fs::write(root.join("deleted-dir/deleted.md"), "# Deleted").unwrap();
+        fs::write(root.join("current.md"), "# Current").unwrap();
+        // The CLI fs-graph sync builds the directory nodes; the agent then
+        // deletes a directory and syncs through the tool.
+        sync_root_with_fs_graph(db.path(), &root);
+        fs::remove_dir_all(root.join("deleted-dir")).unwrap();
+
+        let responses = serve_in_workspace(
+            &workspace,
+            db.path(),
+            &root,
+            &[
+                ("memory_sync", "{}"),
+                ("memory_context", r#"{"path":"seed.md","depth":3}"#),
+                ("memory_context", r#"{"path":"deleted-dir"}"#),
+            ],
+        );
+        let sync = json_text(&tool_payload(&responses[0]));
+        assert!(
+            sync.contains("\"tombstoned_documents\":1"),
+            "include_fs_graph={include_fs_graph}: {sync}"
+        );
+        assert!(
+            sync.contains(&format!(
+                "\"tombstoned_directories\":{}",
+                usize::from(include_fs_graph)
+            )),
+            "include_fs_graph={include_fs_graph}: {sync}"
+        );
+        if include_fs_graph {
+            let context = json_text(&tool_payload(&responses[1]));
+            assert!(context.contains("current.md"), "{context}");
+            assert!(!context.contains("deleted-dir"), "{context}");
+            let deleted = json_text(&tool_payload(&responses[2]));
+            assert!(deleted.contains("context_seed_path_not_found"), "{deleted}");
+        }
+        fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[test]
+fn memory_identity_resolution_follows_surviving_and_renamed_notes() {
+    let db = TestDb::new("mcp_tombstone_identity");
+    let root = temp_dir("mcp_tombstone_identity");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.md"), "# Shared\n\nfirst").unwrap();
+    fs::write(root.join("b.md"), "# Shared\n\nsecond").unwrap();
+    sync_root(db.path(), &root);
+    let config = config(db.path(), &root, false);
+    let by_title = r#"{"id_or_uri":"Shared"}"#;
+    let assert_resolves_to = |args: &str, path: &str| {
+        let payload = tool_payload(&call(&config, "memory_get", args));
+        assert_eq!(
+            payload
+                .get("item")
+                .and_then(|item| item.get("path"))
+                .and_then(JsonValue::as_str),
+            Some(path),
+            "memory_get {args}: {}",
+            json_text(&payload)
+        );
+        let payload = tool_payload(&call(&config, "memory_context", args));
+        assert_eq!(
+            payload.get("ok").and_then(JsonValue::as_bool),
+            Some(true),
+            "memory_context {args}: {}",
+            json_text(&payload)
+        );
+        assert_eq!(
+            payload.get("nodes").unwrap().as_array().unwrap().len(),
+            1,
+            "memory_context {args}: {}",
+            json_text(&payload)
+        );
+        assert!(
+            json_text(&payload).contains(&format!("\"{path}\"")),
+            "memory_context {args}: {}",
+            json_text(&payload)
+        );
+    };
+    let assert_not_found = |args: &str, matches: usize| {
+        for tool in ["memory_get", "memory_context"] {
+            let payload = json_text(&tool_payload(&call(&config, tool, args)));
+            assert!(
+                payload.contains("\"code\":\"not_found\""),
+                "{tool} {args}: {payload}"
+            );
+            // Only memory_get reports how many notes matched the identity.
+            if tool == "memory_get" {
+                assert!(
+                    payload.contains(&format!("\"matches\":{matches}")),
+                    "{tool} {args}: {payload}"
+                );
+            }
+        }
+    };
+
+    // Two live notes share the title, so the lookup is ambiguous.
+    assert_not_found(by_title, 2);
+
+    fs::remove_file(root.join("a.md")).unwrap();
+    let sync = json_text(&tool_payload(&call(&config, "memory_sync", "{}")));
+    assert!(sync.contains("\"tombstoned_documents\":1"), "{sync}");
+    assert_resolves_to(by_title, "b.md");
+
+    // The title follows a renamed file; the old path identity is gone. The
+    // report counts every note still missing, so a.md and b.md both appear.
+    fs::rename(root.join("b.md"), root.join("c.md")).unwrap();
+    let sync = json_text(&tool_payload(&call(&config, "memory_sync", "{}")));
+    assert!(sync.contains("\"tombstoned_documents\":2"), "{sync}");
+    assert_resolves_to(by_title, "c.md");
+    assert_resolves_to(r#"{"id_or_uri":"memory://note/c.md"}"#, "c.md");
+    assert_not_found(r#"{"id_or_uri":"memory://note/b.md"}"#, 0);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2155,10 +2295,64 @@ fn rpc(config: &McpConfig, input: &str) -> JsonValue {
 }
 
 fn call(config: &McpConfig, name: &str, args: &str) -> JsonValue {
-    let input = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+    rpc(config, &tool_call_request(1, name, args))
+}
+
+fn tool_call_request(id: usize, name: &str, args: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+    )
+}
+
+/// Runs `cupld mcp serve` with `workspace` as its working directory, so the
+/// server discovers that workspace's `.cupld/config.toml`, and returns one
+/// response per tool call.
+fn serve_in_workspace(
+    workspace: &Path,
+    db_path: &Path,
+    root: &Path,
+    calls: &[(&str, &str)],
+) -> Vec<JsonValue> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cupld"))
+        .args(["mcp", "serve", "--db"])
+        .arg(db_path)
+        .arg("--root")
+        .arg(root)
+        .current_dir(workspace)
+        .env("CUPLD_NO_INSTALL_PROMPT", "1")
+        .env("CUPLD_NO_UPGRADE_CHECK", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = String::new();
+    for (index, (name, args)) in calls.iter().enumerate() {
+        input.push_str(&tool_call_request(index + 1, name, args));
+        input.push('\n');
+    }
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    rpc(config, &input)
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let responses = stdout
+        .lines()
+        .map(|line| json::parse(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), calls.len(), "{stdout}");
+    responses
 }
 
 fn json_text(value: &JsonValue) -> String {

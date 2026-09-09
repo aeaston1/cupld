@@ -15,14 +15,17 @@ They are recorded for later and are outside the implementation scope of PR #50.
 
 ## 2. Exclude deleted notes from normal retrieval
 
-- Implemented on `codex/exclude-deleted-memory`; awaiting merge.
-- Ordinary MCP search, get, list, and resources exclude notes marked
+- Resolved. Ordinary MCP search, get, list, and resources exclude notes marked
   `src.status = missing`; deleted structural nodes cannot affect ranking.
 - MCP context excludes deleted markdown notes/directories and their incident
   edges before traversal. Legacy notes without status and native graph nodes
   remain readable; explicit graph queries and CLI context retain tombstones.
+- `memory_sync` and `memory_add` honor the workspace
+  `[markdown] include_fs_graph` setting, so MCP syncs tombstone deleted
+  directories the same way `cupld sync markdown` does.
 - Regression coverage exercises delete/sync/read, indexed search, restoration,
-  identity lookups, resources, context budgets, and historical compatibility.
+  identity lookups including title collisions and renames, resources, context
+  budgets, MCP-driven directory tombstones, and historical compatibility.
 
 ## 3. Make database persistence crash-safe
 
