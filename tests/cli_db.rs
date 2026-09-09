@@ -3037,31 +3037,6 @@ fn scripted_database_commands_never_check_releases_or_write_a_release_cache() {
 
 #[cfg(unix)]
 #[test]
-fn cli_db_command_stays_silent_when_latest_release_check_fails() {
-    let workspace = TempDir::new("cli_upgrade_hint_failure_workspace");
-    seed_workspace_default_db(workspace.path());
-    let curl_dir = TempDir::new("cli_upgrade_hint_failure_curl");
-    write_fake_curl(curl_dir.path(), "unavailable", 22);
-    let path = curl_dir.path().to_str().unwrap();
-
-    let output = run_cli_with_env_in_dir(
-        &["schema", "--db", "default"],
-        "",
-        Some(workspace.path()),
-        &[("CUPLD_NO_UPGRADE_CHECK", "0"), ("PATH", path)],
-    );
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stderr.contains("A newer cupld release is available"));
-}
-
-#[cfg(unix)]
-#[test]
 fn cli_mcp_serve_skips_release_upgrade_check() {
     let workspace = TempDir::new("cli_mcp_upgrade_hint_workspace");
     seed_workspace_default_db(workspace.path());

@@ -38,7 +38,10 @@ EOF
 
 Your agent supplies the query; cupld executes graph operations and returns data. No model configuration or memory bootstrap is needed for this workflow. Give the agent the [query surface](#query-surface) and [schema reference](#schema-and-index-surface) so it uses the supported syntax.
 
-For repeatable shell automation, set `CUPLD_NO_INSTALL_PROMPT=1` and `CUPLD_NO_UPGRADE_CHECK=1` to suppress optional setup prompts and release checks.
+Scripted commands do not check for releases or write a release-check cache.
+The optional release hint runs only in an interactive file-backed REPL;
+`CUPLD_NO_UPGRADE_CHECK=1` disables it there as well. Set
+`CUPLD_NO_INSTALL_PROMPT=1` to suppress optional REPL setup prompts.
 
 ## Agent Surfaces
 
@@ -404,7 +407,7 @@ Current automation controls:
 
 - `CUPLD_QUERY_MAX_ROWS` sets the default `query --max-rows` cap (otherwise 1,000 rows per result set). This cap truncates output after execution; JSON/NDJSON result metadata reports `truncated`.
 - `CUPLD_NO_INSTALL_PROMPT=1` disables optional install and refresh prompts on REPL startup.
-- `CUPLD_NO_UPGRADE_CHECK=1` disables optional release checks.
+- `CUPLD_NO_UPGRADE_CHECK=1` disables the optional interactive REPL release check. Scripted commands skip it automatically.
 - Prefer explicit `ORDER BY` plus explicit `LIMIT` for deterministic context windows.
 - Use named parameters with `--params-json` or `--params-file`.
 

@@ -1,10 +1,50 @@
-# Deferred development backlog
+# Development roadmap
 
-Deferred after repository triage on 2026-09-07. These retain their original
-priority numbers; priority 4 covers reconciling PR #50 and preparing a release.
-They are recorded for later and are outside the implementation scope of PR #50.
+The 2026-09-09 refocus makes the general in-process graph database and its CLI
+the primary product. Keep zero third-party dependencies and read/write queries
+by default. Retain memory while gradually separating it into a future extension.
+The [core audit](core-audit.md) distinguishes shipped behavior from the target
+toolbox; [resource benchmarks](core-benchmarks.md) provide reproducible evidence.
 
-## 1. Prevent accidental memory overwrites
+## Current milestone: core hardening and evidence
+
+- Establish the generic capability audit and resource harness, including CLI
+  startup versus already-open session work, peak RAM, and repeated-edit growth.
+- Remove the redundant engine snapshot on read-only query execution, preserving
+  transaction errors, savepoints, rollback, and all write behavior.
+- Keep scripted CLI startup local by limiting release hints to interactive REPLs.
+- Lead onboarding with generic graphs. Existing markdown and MCP memory remain
+  documented and supported; no extension packaging or storage-format change.
+
+## Next priorities
+
+1. **Reduce measured core costs.** Use the baseline to prioritize resident graph
+   copies, materialized query/context data, index candidate construction, and
+   full-state WAL growth. Require before/after measurements and behavior tests;
+   avoid claiming bounded memory from a response cap.
+2. **Complete the agent CLI contract.** Add dedicated noninteractive creation,
+   structured capability discovery, consistent schema/check output and argument
+   errors, and optional read-only access. Preserve read/write defaults. Read-only
+   access must address migration-on-open as well as query mutation. Acceptance:
+   an agent can create/open, discover, query/update, and diagnose a native graph
+   through documented machine interfaces without markdown or MCP.
+3. **Add generic graph interchange.** Specify typed values, IDs/endpoints,
+   schema, duplicate handling, and failure atomicity before implementing bulk
+   import/export. Acceptance: lossless round trips of nodes, edges, properties,
+   and supported schema, including malformed and interrupted input cases.
+   Query row exports alone do not meet this requirement.
+4. **Deliver bounded-RAM storage and execution.** Design disk access, eviction,
+   transaction durability, intermediate results, and format migration together.
+   Acceptance: correct queries and updates on graphs larger than an enforced
+   memory budget, with explicit handling of oversized operations. This is a
+   separate engine milestone, not a claim about current behavior.
+5. **Extract the memory application.** Move markdown ingestion, note lifecycle,
+   memory ranking, and harness memory setup behind a stable core boundary.
+   Preserve existing data and workflows until an optional first-party package
+   supplies their replacement. Defer an extension loader/registry until this
+   integration has demonstrated the necessary API.
+
+## Resolved: prevent accidental memory overwrites
 
 - Shipped: `memory_add` creates notes atomically and never replaces an existing
   file.
@@ -19,7 +59,7 @@ They are recorded for later and are outside the implementation scope of PR #50.
 - Starting points: `src/mcp.rs` (`memory_add`, `safe_relative_path`,
   `prepare_confined_parent`) and `tests/mcp.rs`.
 
-## 2. Exclude deleted notes from normal retrieval
+## Resolved: exclude deleted notes from normal retrieval
 
 - Resolved. Ordinary MCP search, get, list, and resources exclude notes marked
   `src.status = missing`; deleted structural nodes cannot affect ranking.
@@ -33,9 +73,9 @@ They are recorded for later and are outside the implementation scope of PR #50.
   identity lookups including title collisions and renames, resources, context
   budgets, MCP-driven directory tombstones, and historical compatibility.
 
-## 3. Make database persistence crash-safe
+## Resolved: make database persistence crash-safe
 
-- Implemented on `codex/crash-safe-storage`; awaiting review and merge.
+- Merged in PR #53 (`1d982b1`), alongside the memory fixes in PRs #51 and #52.
 - Saves, commits, compaction, and migrations now use a synced temporary file and
   atomic replacement. Persistent writer locks plus revision checks reject
   overlapping or stale writes; active-transaction saves are rejected.
@@ -46,16 +86,17 @@ They are recorded for later and are outside the implementation scope of PR #50.
   permissions, aliases, and side-effect-free diagnostic reads.
 - Details and platform limits: `docs/agents/README.md`, Database Persistence.
 
-## 5. Establish realistic retrieval and growth baselines
+## Deferred memory work: realistic retrieval baselines
 
 - Current large-vault coverage uses 1,000 synthetic filler notes plus targeted
   examples. It is not a realistic latency or repeated-edit growth benchmark.
-- Measure search quality, latency, database size, and reopening cost using
-  realistic note sizes and repeated edits. Optimize the measured bottlenecks
-  before expanding semantic retrieval.
+- Generic graph resource/growth measurement now belongs to the core harness.
+  Memory-specific relevance, realistic note sizes, and retrieval latency remain
+  future application work. Core benchmarks do not establish retrieval quality.
 - Starting points: `tests/fixtures/memory/search_large_vault`, `src/mcp.rs`
   (`load_search_docs`), `src/context.rs`, and `src/storage/mod.rs`.
 
-At triage, the inspected branch was `codex/agent-harness-reliability-v2` at
+Historical context: at the 2026-09-07 triage, the inspected branch was
+`codex/agent-harness-reliability-v2` at
 `115c667`. All 391 tests, eight memory eval cases, formatting, and clippy passed.
 That baseline does not cover the failures and risks above.
