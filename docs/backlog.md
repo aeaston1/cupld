@@ -6,12 +6,18 @@ They are recorded for later and are outside the implementation scope of PR #50.
 
 ## 1. Prevent accidental memory overwrites
 
-- Reproduced: two `memory_add` calls containing only `content` both succeed at
-  `memory-note.md`; the second replaces the first note.
-- Introduce collision-safe creation and explicit update semantics. Validate the
-  final file target as well as its parent so a symlink cannot escape the root.
+- Shipped: `memory_add` creates notes atomically and never replaces an existing
+  file.
+- Reproduced before the fix: two `memory_add` calls containing only `content`
+  both succeeded at `memory-note.md`; the second replaced the first note.
+- Implicit filenames receive unique numeric suffixes, and an occupied explicit
+  `path_hint` returns `already_exists`. Final file symlinks are never followed,
+  parent confinement is checked before creating nested directories, and
+  `note_path` and `uri` report the canonical path. Updates use direct markdown
+  editing followed by `memory_sync`; after `markdown_written_sync_failed`, the
+  recovery is `memory_sync`, not a second `memory_add`.
 - Starting points: `src/mcp.rs` (`memory_add`, `safe_relative_path`,
-  `ensure_confined_write`) and `tests/mcp.rs`.
+  `prepare_confined_parent`) and `tests/mcp.rs`.
 
 ## 2. Exclude deleted notes from normal retrieval
 

@@ -2224,6 +2224,257 @@ fn memory_add_writes_markdown_and_syncs_before_success() {
 }
 
 #[test]
+fn memory_add_preserves_notes_when_generated_paths_collide() {
+    for (name, first_args, next_args, stem) in [
+        (
+            "default",
+            r#"{"content":"First remembered fact."}"#,
+            r#"{"content":"Another remembered fact."}"#,
+            "memory-note",
+        ),
+        (
+            "same_title",
+            r#"{"title":"Project Detail","content":"First remembered fact."}"#,
+            r#"{"title":"Project Detail","content":"Another remembered fact."}"#,
+            "project-detail",
+        ),
+        (
+            "same_slug",
+            r#"{"title":"Project Detail","content":"First remembered fact."}"#,
+            r#"{"title":"Project / Detail","content":"Another remembered fact."}"#,
+            "project-detail",
+        ),
+    ] {
+        let db = TestDb::new(&format!("mcp_add_collision_{name}"));
+        let root = temp_dir(&format!("mcp_add_collision_{name}"));
+        fs::create_dir_all(&root).unwrap();
+        let config = config(db.path(), &root, false);
+
+        let first = tool_payload(&call(&config, "memory_add", first_args));
+        assert_eq!(first.get("ok"), Some(&JsonValue::Bool(true)));
+        let first_path = format!("{stem}.md");
+        assert_eq!(
+            first.get("note_path"),
+            Some(&JsonValue::from(first_path.clone()))
+        );
+        let original = fs::read(root.join(&first_path)).unwrap();
+
+        for suffix in 2..=3 {
+            let added = tool_payload(&call(&config, "memory_add", next_args));
+            assert_eq!(added.get("ok"), Some(&JsonValue::Bool(true)));
+            let expected_path = format!("{stem}-{suffix}.md");
+            assert_eq!(
+                added.get("note_path"),
+                Some(&JsonValue::from(expected_path.clone()))
+            );
+            assert_eq!(
+                added.get("uri"),
+                Some(&JsonValue::from(format!("memory://note/{expected_path}")))
+            );
+            assert!(
+                fs::read_to_string(root.join(&expected_path))
+                    .unwrap()
+                    .contains("Another remembered fact.")
+            );
+            assert_eq!(fs::read(root.join(&first_path)).unwrap(), original);
+            let retrieved = tool_payload(&call(
+                &config,
+                "memory_get",
+                &json::stringify(&JsonValue::object([(
+                    "id_or_uri",
+                    added.get("uri").unwrap().clone(),
+                )])),
+            ));
+            assert_eq!(retrieved.get("ok"), Some(&JsonValue::Bool(true)));
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn memory_add_sync_failure_reports_written_note_and_memory_sync_recovery() {
+    let db = TestDb::new("mcp_add_sync_failed");
+    let root = temp_dir("mcp_add_sync_failed");
+    fs::create_dir_all(&root).unwrap();
+    // No synced document can satisfy this constraint, so the sync step fails
+    // deterministically after the markdown has already been written.
+    run_ddl(db.path(), "CREATE LABEL MarkdownDocument");
+    run_ddl(
+        db.path(),
+        "CREATE CONSTRAINT block_sync ON :MarkdownDocument REQUIRE `src.path` TYPE int",
+    );
+    let db_before = fs::read(db.path()).unwrap();
+    let config = config(db.path(), &root, false);
+
+    let response = tool_payload(&call(
+        &config,
+        "memory_add",
+        r#"{"content":"Remembered before the sync failed."}"#,
+    ));
+    assert_eq!(response.get("ok"), Some(&JsonValue::Bool(false)));
+    assert_eq!(
+        response.get("note_path"),
+        Some(&JsonValue::from("memory-note.md"))
+    );
+    assert_eq!(response.get("db_updated"), Some(&JsonValue::Bool(false)));
+    assert_eq!(
+        response.get("status"),
+        Some(&JsonValue::from("markdown_written_sync_failed"))
+    );
+    assert_eq!(
+        response.get("error").and_then(|error| error.get("code")),
+        Some(&JsonValue::from("sync_failed"))
+    );
+    let next_action = response
+        .get("next_action")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_else(|| panic!("expected next_action in {}", json_text(&response)));
+    assert!(
+        next_action.contains("already written at memory-note.md"),
+        "{next_action}"
+    );
+    assert!(next_action.contains("call memory_sync"), "{next_action}");
+    assert!(
+        next_action.contains("instead of calling memory_add again"),
+        "{next_action}"
+    );
+    assert!(
+        fs::read_to_string(root.join("memory-note.md"))
+            .unwrap()
+            .contains("Remembered before the sync failed.")
+    );
+    assert_eq!(fs::read(db.path()).unwrap(), db_before);
+
+    // The documented recovery is memory_sync, which ingests the written note
+    // without allocating a second path.
+    run_ddl(db.path(), "DROP CONSTRAINT block_sync");
+    let synced = tool_payload(&call(&config, "memory_sync", "{}"));
+    assert_eq!(synced.get("ok"), Some(&JsonValue::Bool(true)));
+    let listed = tool_payload(&call(&config, "memory_list", "{}"));
+    assert_eq!(item_paths(&listed), vec!["memory-note.md"]);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_add_rejects_explicit_path_collisions_without_changing_note_or_db() {
+    let db = TestDb::new("mcp_add_explicit_collision");
+    let root = temp_dir("mcp_add_explicit_collision");
+    fs::create_dir_all(root.join("notes")).unwrap();
+    let original = b"# Original\n\nA direct edit that has not been synced.\n";
+    fs::write(root.join("notes/existing.md"), original).unwrap();
+    let db_before = fs::read(db.path()).unwrap();
+    let config = config(db.path(), &root, false);
+
+    let response = tool_payload(&call(
+        &config,
+        "memory_add",
+        r#"{"path_hint":"notes/existing.md","content":"Replacement"}"#,
+    ));
+    assert_eq!(response.get("ok"), Some(&JsonValue::Bool(false)));
+    assert_eq!(
+        response.get("error").and_then(|error| error.get("code")),
+        Some(&JsonValue::from("already_exists"))
+    );
+    assert_eq!(
+        response
+            .get("error")
+            .and_then(|error| error.get("details"))
+            .and_then(|details| details.get("path_hint")),
+        Some(&JsonValue::from("notes/existing.md"))
+    );
+    assert_eq!(fs::read(root.join("notes/existing.md")).unwrap(), original);
+    assert_eq!(fs::read(db.path()).unwrap(), db_before);
+    assert_eq!(fs::read_dir(root.join("notes")).unwrap().count(), 1);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_add_explicit_collision_does_not_migrate_legacy_db() {
+    let db_path = copy_fixture("person_v0_1_0.cupld");
+    let root = temp_dir("mcp_add_legacy_collision");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("existing.md"), "# Existing").unwrap();
+    let db_before = fs::read(&db_path).unwrap();
+    let config = config(&db_path, &root, false);
+
+    let response = tool_payload(&call(
+        &config,
+        "memory_add",
+        r#"{"path_hint":"existing.md","content":"Replacement"}"#,
+    ));
+    assert_eq!(
+        response.get("error").and_then(|error| error.get("code")),
+        Some(&JsonValue::from("already_exists"))
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), db_before);
+    assert_eq!(header_version(&db_path), 1);
+    assert_eq!(
+        fs::read_to_string(root.join("existing.md")).unwrap(),
+        "# Existing"
+    );
+
+    fs::remove_file(db_path).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_add_rejects_existing_and_dangling_final_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let db = TestDb::new("mcp_add_final_symlink");
+    let root = temp_dir("mcp_add_final_symlink");
+    let outside = temp_dir("mcp_add_final_symlink_outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let original = b"Keep this outside file unchanged.";
+    fs::write(outside.join("existing.md"), original).unwrap();
+    let db_before = fs::read(db.path()).unwrap();
+    let config = config(db.path(), &root, false);
+
+    for name in ["existing.md", "dangling.md"] {
+        symlink(outside.join(name), root.join(name)).unwrap();
+        let response = tool_payload(&call(
+            &config,
+            "memory_add",
+            &json::stringify(&JsonValue::object([
+                ("path_hint", JsonValue::from(name)),
+                ("content", JsonValue::from("Replacement")),
+            ])),
+        ));
+        assert_eq!(response.get("ok"), Some(&JsonValue::Bool(false)));
+        assert_eq!(
+            response.get("error").and_then(|error| error.get("code")),
+            Some(&JsonValue::from("already_exists"))
+        );
+        assert!(fs::symlink_metadata(root.join(name)).unwrap().is_symlink());
+        assert_eq!(fs::read(db.path()).unwrap(), db_before);
+    }
+    assert_eq!(fs::read(outside.join("existing.md")).unwrap(), original);
+    assert!(!outside.join("dangling.md").exists());
+
+    let added = tool_payload(&call(
+        &config,
+        "memory_add",
+        r#"{"title":"Dangling","content":"A separate safe note."}"#,
+    ));
+    assert_eq!(added.get("ok"), Some(&JsonValue::Bool(true)));
+    assert_eq!(
+        added.get("note_path"),
+        Some(&JsonValue::from("dangling-2.md"))
+    );
+    assert!(!outside.join("dangling.md").exists());
+    assert_eq!(fs::read(outside.join("existing.md")).unwrap(), original);
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
 fn read_only_rejects_write_and_sync_tools() {
     let db = TestDb::new("mcp_read_only");
     let root = temp_dir("mcp_read_only");
@@ -2279,6 +2530,80 @@ fn memory_add_rejects_symlink_escape() {
 
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(outside).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_add_rejects_parent_symlink_before_creating_outside_directories() {
+    use std::os::unix::fs::symlink;
+
+    let db = TestDb::new("mcp_add_nested_symlink");
+    let root = temp_dir("mcp_add_nested_symlink");
+    let outside = temp_dir("mcp_add_nested_symlink_outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, root.join("link")).unwrap();
+    let config = config(db.path(), &root, false);
+    let db_before = fs::read(db.path()).unwrap();
+
+    let response = call(
+        &config,
+        "memory_add",
+        r#"{"path_hint":"link/new/deep/note.md","content":"Nope"}"#,
+    );
+    assert!(tool_text(&response).contains("invalid_path"));
+    assert!(!outside.join("new").exists());
+    assert_eq!(fs::read(db.path()).unwrap(), db_before);
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_add_allows_parent_symlinks_that_stay_inside_the_root() {
+    use std::os::unix::fs::symlink;
+
+    let db = TestDb::new("mcp_add_inside_symlink");
+    let root = temp_dir("mcp_add_inside_symlink");
+    fs::create_dir_all(root.join("actual")).unwrap();
+    symlink(root.join("actual"), root.join("link")).unwrap();
+    let config = config(db.path(), &root, false);
+
+    let response = tool_payload(&call(
+        &config,
+        "memory_add",
+        r#"{"path_hint":"link/new/note.md","content":"Inside the root."}"#,
+    ));
+    assert_eq!(response.get("ok"), Some(&JsonValue::Bool(true)));
+    assert_eq!(
+        response.get("note_path"),
+        Some(&JsonValue::from("actual/new/note.md"))
+    );
+    assert_eq!(
+        response.get("uri"),
+        Some(&JsonValue::from("memory://note/actual/new/note.md"))
+    );
+    assert!(
+        fs::read_to_string(root.join("actual/new/note.md"))
+            .unwrap()
+            .contains("Inside the root.")
+    );
+    let retrieved = tool_payload(&call(
+        &config,
+        "memory_get",
+        &json::stringify(&JsonValue::object([(
+            "id_or_uri",
+            response.get("uri").unwrap().clone(),
+        )])),
+    ));
+    assert_eq!(retrieved.get("ok"), Some(&JsonValue::Bool(true)));
+    assert_eq!(
+        retrieved.get("item").and_then(|item| item.get("path")),
+        Some(&JsonValue::from("actual/new/note.md"))
+    );
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn config(db_path: &Path, root: &Path, read_only: bool) -> McpConfig {
@@ -2461,6 +2786,14 @@ fn create_markdown_search_indexes(db_path: &Path) {
             "CREATE INDEX ON :MarkdownDocument(`md.tags`) KIND LIST",
             &Default::default(),
         )
+        .unwrap();
+    session.save().unwrap();
+}
+
+fn run_ddl(db_path: &Path, statement: &str) {
+    let mut session = Session::open(db_path).unwrap();
+    session
+        .execute_script(statement, &Default::default())
         .unwrap();
     session.save().unwrap();
 }

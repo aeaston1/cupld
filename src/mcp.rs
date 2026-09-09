@@ -277,7 +277,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "memory_add",
-        description: "Write a markdown memory note and sync it into the DB.",
+        description: "Create a new markdown memory note and sync it into the DB. Generated paths receive unique suffixes; an occupied explicit path returns already_exists. To update a note, edit its markdown and call memory_sync. A markdown_written_sync_failed status means the note is already written at note_path; call memory_sync to ingest it instead of calling memory_add again.",
         input_schema: memory_add_schema,
     },
     ToolSpec {
@@ -1413,7 +1413,9 @@ fn memory_add(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpTool
         ));
     }
     let content = args.required_string("content")?;
-    let session = match open_session(config) {
+    // Resolve the root without migrating the DB: rejected creations must leave
+    // database bytes unchanged. A successful creation migrates during sync.
+    let session = match open_session_without_migration(config) {
         Ok(session) => session,
         Err(error) => return Err(McpToolError::new("db_open_failed", error)),
     };
@@ -1434,27 +1436,15 @@ fn memory_add(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpTool
         Ok(path) => path,
         Err(error) => return Err(McpToolError::new("invalid_path", error)),
     };
-    let note_path = root.join(&relative_path);
-    if let Some(parent) = note_path.parent()
-        && let Err(error) = fs::create_dir_all(parent)
-    {
-        return Err(McpToolError::new(
-            "markdown_write_failed",
-            error.to_string(),
-        ));
-    }
-    if let Err(error) = ensure_confined_write(&root, &note_path) {
-        return Err(McpToolError::new("invalid_path", error));
-    }
     let tags = args.optional_string_array("tags")?;
     let source = args.optional_string("source")?;
     let markdown = note_markdown(&content, &title, &tags, source.as_deref());
-    if let Err(error) = fs::write(&note_path, markdown) {
-        return Err(McpToolError::new(
-            "markdown_write_failed",
-            error.to_string(),
-        ));
-    }
+    let relative_path = create_memory_note(
+        &root,
+        &relative_path,
+        path_hint.is_none(),
+        markdown.as_bytes(),
+    )?;
     match sync_configured_root(config) {
         Ok(report) => Ok(JsonValue::object([
             ("ok", true.into()),
@@ -1475,6 +1465,13 @@ fn memory_add(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpTool
             (
                 "error",
                 McpToolError::new("sync_failed", error).error_object(),
+            ),
+            (
+                "next_action",
+                JsonValue::from(format!(
+                    "the note is already written at {}; call memory_sync to ingest it instead of calling memory_add again, which would create a duplicate note",
+                    path_to_string(&relative_path)
+                )),
             ),
         ])),
     }
@@ -2443,19 +2440,121 @@ fn safe_relative_path(title: &str, path_hint: Option<&str>) -> Result<PathBuf, S
     Ok(path)
 }
 
-fn ensure_confined_write(root: &Path, note_path: &Path) -> Result<(), String> {
-    let root = root
-        .canonicalize()
-        .map_err(|error| format!("cannot canonicalize markdown root: {error}"))?;
-    let parent = note_path
-        .parent()
-        .ok_or_else(|| "note path has no parent".to_owned())?
-        .canonicalize()
-        .map_err(|error| format!("cannot canonicalize note parent: {error}"))?;
-    if !parent.starts_with(&root) {
-        return Err("path_hint must stay under markdown root".to_owned());
+fn create_memory_note(
+    root: &Path,
+    relative_path: &Path,
+    generate_unique_path: bool,
+    markdown: &[u8],
+) -> Result<PathBuf, McpToolError> {
+    let (root, parent) = prepare_confined_parent(root, relative_path)?;
+    let mut candidate = relative_path.to_path_buf();
+    let mut suffix = 1usize;
+    loop {
+        let file_name = candidate.file_name().expect("validated markdown filename");
+        let note_path = parent.join(file_name);
+        // create_new atomically reserves the path and refuses every existing
+        // directory entry, including a dangling or out-of-root final symlink.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&note_path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(markdown) {
+                    // Release the reserved path so a partial write neither
+                    // blocks an explicit path_hint nor syncs as a fragment.
+                    drop(file);
+                    let _ = fs::remove_file(&note_path);
+                    return Err(McpToolError::new(
+                        "markdown_write_failed",
+                        error.to_string(),
+                    ));
+                }
+                // Report the canonical identity so note_path and uri name the
+                // file that sync indexes, even when path_hint went through an
+                // in-root parent symlink.
+                return Ok(note_path
+                    .strip_prefix(&root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(candidate));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !generate_unique_path {
+                    return Err(McpToolError::with_details(
+                        "already_exists",
+                        "path_hint already exists; edit the existing markdown file and call memory_sync to update it",
+                        JsonValue::object([("path_hint", path_json(relative_path))]),
+                    ));
+                }
+                suffix = suffix.checked_add(1).ok_or_else(|| {
+                    McpToolError::new("markdown_write_failed", "no available generated note path")
+                })?;
+                let stem = relative_path
+                    .file_stem()
+                    .expect("validated markdown filename")
+                    .to_string_lossy();
+                candidate = relative_path.with_file_name(format!("{stem}-{suffix}.md"));
+            }
+            Err(error) => {
+                return Err(McpToolError::new(
+                    "markdown_write_failed",
+                    error.to_string(),
+                ));
+            }
+        }
     }
-    Ok(())
+}
+
+/// Creates the note's parent directories inside the markdown root, resolving
+/// each level so an escaping symlink is rejected before anything is created
+/// beneath it. Returns the canonical root and the canonical parent directory.
+fn prepare_confined_parent(
+    root: &Path,
+    relative_path: &Path,
+) -> Result<(PathBuf, PathBuf), McpToolError> {
+    fs::create_dir_all(root)
+        .map_err(|error| McpToolError::new("markdown_write_failed", error.to_string()))?;
+    let root = root.canonicalize().map_err(|error| {
+        McpToolError::new(
+            "invalid_path",
+            format!("cannot canonicalize markdown root: {error}"),
+        )
+    })?;
+    let relative_parent = relative_path
+        .parent()
+        .expect("validated markdown path has a parent");
+    let mut parent = root.clone();
+    for component in relative_parent.components() {
+        if let Component::CurDir = component {
+            continue;
+        }
+        parent.push(component.as_os_str());
+        match fs::create_dir(&parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(McpToolError::new(
+                    "markdown_write_failed",
+                    error.to_string(),
+                ));
+            }
+        }
+        // Resolve each parent before creating the next directory so an escaping
+        // symlink cannot cause even directory creation outside the root.
+        parent = parent.canonicalize().map_err(|error| {
+            McpToolError::new(
+                "invalid_path",
+                format!("cannot canonicalize note parent: {error}"),
+            )
+        })?;
+        if !parent.starts_with(&root) {
+            return Err(McpToolError::new(
+                "invalid_path",
+                "path_hint must stay under markdown root",
+            ));
+        }
+    }
+    Ok((root, parent))
 }
 
 fn note_markdown(content: &str, title: &str, tags: &[String], source: Option<&str>) -> String {
