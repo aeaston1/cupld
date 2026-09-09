@@ -1035,6 +1035,14 @@ impl DatabaseWriter {
         }
         let lock = options.open(&lock_path)?;
         validate_lock_sidecar(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // OpenOptions::mode only protects newly created files. Tighten
+            // sidecars from older versions through the open descriptor, without
+            // replacing the inode that other writers use for coordination.
+            lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         match lock.try_lock() {
             Ok(()) => Ok(Self { path, _lock: lock }),
             Err(fs::TryLockError::WouldBlock) => Err(StorageError::new(
@@ -1938,6 +1946,27 @@ mod tests {
         println!("LOCKED");
         std::io::stdout().flush().unwrap();
         std::io::stdin().read_line(&mut String::new()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_lock_sidecar_permissions_are_tightened_without_replacement() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (path, mut session) = create_committed_database("legacy_lock_permissions");
+        let sidecar = lock_path(&path);
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::metadata(&sidecar).unwrap();
+        assert_eq!(before.permissions().mode() & 0o777, 0o644);
+
+        session
+            .execute_script("CREATE (:Doc)", &BTreeMap::new())
+            .unwrap();
+
+        let after = fs::metadata(&sidecar).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(load(&path).unwrap().0.stats().node_count, 2);
+        remove_database(&path);
     }
 
     #[cfg(unix)]

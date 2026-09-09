@@ -87,8 +87,10 @@ to its canonical database path when opened, so later symlink retargeting does
 not redirect its writes. Hard-linked database paths are unsupported on all
 platforms; use a single canonical path. The lock is advisory: it coordinates
 cooperating cupld processes only and does not stop external programs from
-modifying database or sidecar files directly. On Unix the sidecar is created
-owner-only, so other local users cannot hold it. Opening/checking
+modifying database or sidecar files directly. On Unix each writer sets the
+sidecar to owner-only permissions (`0600`), including sidecars created by older
+versions. This prevents other local users from opening it; it does not revoke
+descriptors they already hold. Opening/checking
 current-format databases and MCP diagnostic probes do not create sidecars; an
 explicit legacy migration does acquire a write lock.
 
