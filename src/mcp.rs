@@ -277,7 +277,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "memory_add",
-        description: "Create a new markdown memory note and sync it into the DB. Generated paths receive unique suffixes; an occupied explicit path returns already_exists. To update a note, edit its markdown and call memory_sync.",
+        description: "Create a new markdown memory note and sync it into the DB. Generated paths receive unique suffixes; an occupied explicit path returns already_exists. To update a note, edit its markdown and call memory_sync. A markdown_written_sync_failed status means the note is already written at note_path; call memory_sync to ingest it instead of calling memory_add again.",
         input_schema: memory_add_schema,
     },
     ToolSpec {
@@ -1466,6 +1466,13 @@ fn memory_add(config: &McpConfig, args: &JsonValue) -> Result<JsonValue, McpTool
                 "error",
                 McpToolError::new("sync_failed", error).error_object(),
             ),
+            (
+                "next_action",
+                JsonValue::from(format!(
+                    "the note is already written at {}; call memory_sync to ingest it instead of calling memory_add again, which would create a duplicate note",
+                    path_to_string(&relative_path)
+                )),
+            ),
         ])),
     }
 }
@@ -2394,23 +2401,37 @@ fn create_memory_note(
     generate_unique_path: bool,
     markdown: &[u8],
 ) -> Result<PathBuf, McpToolError> {
-    let parent = ensure_confined_write(root, relative_path)?;
+    let (root, parent) = prepare_confined_parent(root, relative_path)?;
     let mut candidate = relative_path.to_path_buf();
     let mut suffix = 1usize;
     loop {
         let file_name = candidate.file_name().expect("validated markdown filename");
+        let note_path = parent.join(file_name);
         // create_new atomically reserves the path and refuses every existing
         // directory entry, including a dangling or out-of-root final symlink.
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(parent.join(file_name))
+            .open(&note_path)
         {
             Ok(mut file) => {
-                file.write_all(markdown).map_err(|error| {
-                    McpToolError::new("markdown_write_failed", error.to_string())
-                })?;
-                return Ok(candidate);
+                if let Err(error) = file.write_all(markdown) {
+                    // Release the reserved path so a partial write neither
+                    // blocks an explicit path_hint nor syncs as a fragment.
+                    drop(file);
+                    let _ = fs::remove_file(&note_path);
+                    return Err(McpToolError::new(
+                        "markdown_write_failed",
+                        error.to_string(),
+                    ));
+                }
+                // Report the canonical identity so note_path and uri name the
+                // file that sync indexes, even when path_hint went through an
+                // in-root parent symlink.
+                return Ok(note_path
+                    .strip_prefix(&root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(candidate));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !generate_unique_path {
@@ -2439,7 +2460,13 @@ fn create_memory_note(
     }
 }
 
-fn ensure_confined_write(root: &Path, relative_path: &Path) -> Result<PathBuf, McpToolError> {
+/// Creates the note's parent directories inside the markdown root, resolving
+/// each level so an escaping symlink is rejected before anything is created
+/// beneath it. Returns the canonical root and the canonical parent directory.
+fn prepare_confined_parent(
+    root: &Path,
+    relative_path: &Path,
+) -> Result<(PathBuf, PathBuf), McpToolError> {
     fs::create_dir_all(root)
         .map_err(|error| McpToolError::new("markdown_write_failed", error.to_string()))?;
     let root = root.canonicalize().map_err(|error| {
@@ -2482,7 +2509,7 @@ fn ensure_confined_write(root: &Path, relative_path: &Path) -> Result<PathBuf, M
             ));
         }
     }
-    Ok(parent)
+    Ok((root, parent))
 }
 
 fn note_markdown(content: &str, title: &str, tags: &[String], source: Option<&str>) -> String {
