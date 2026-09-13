@@ -59,7 +59,7 @@ CREATE (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Grace'})
 EOF
 ```
 
-The environment settings suppress optional setup prompts and release checks. `cupld graph.cupld` opens or creates the file; `cupld` alone opens an in-memory REPL. One-shot `query` requires an existing database.
+The environment settings suppress optional setup prompts and release checks. `cupld graph.cupld` opens or creates the file; `cupld` alone opens an in-memory REPL. One-shot `query` requires an existing database. A dedicated creation command with a structured receipt is still missing. Piped REPL statement errors can exit zero; use one-shot `query` for automated queries and updates.
 
 Inspect the schema, then query the graph with your agent:
 
@@ -67,6 +67,13 @@ Inspect the schema, then query the graph with your agent:
 cupld query --db graph.cupld --output json 'SHOW SCHEMA'
 cupld query --db graph.cupld --output json --params-json '{"name":"Ada"}' \
   'MATCH (a:Person {name: $name})-[:KNOWS]->(b:Person) RETURN id(a) AS node_id, a.name AS person, b.name AS knows ORDER BY b.name LIMIT 10'
+```
+
+Update the graph through the same read/write CLI:
+
+```bash
+cupld query --db graph.cupld --output json --params-json '{"name":"Ada"}' \
+  'MATCH (n:Person {name: $name}) SET n.role = "engineer"'
 ```
 
 The result identifies Ada's node and the connection to Grace. Pass a returned `node_id` to `context`; on this newly created graph, Ada's ID is `1`:
@@ -84,6 +91,16 @@ Open the graph viewer from an interactive terminal:
 ```bash
 cupld --db graph.cupld --visualise
 ```
+
+Export selected query rows as NDJSON:
+
+```bash
+cupld query --db graph.cupld --output ndjson --max-rows 1000 \
+  'MATCH (n:Person) RETURN id(n) AS node_id, n.name AS name, n.role AS role ORDER BY n.name' > people.ndjson
+```
+
+Check the result metadata for `truncated`. This exports projected rows, not a
+lossless graph backup; generic graph import/export remains a later milestone.
 
 ## Embed in Rust
 

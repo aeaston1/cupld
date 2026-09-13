@@ -16,6 +16,40 @@ toolbox; [resource benchmarks](core-benchmarks.md) provide reproducible evidence
 - Lead onboarding with generic graphs. Existing markdown and MCP memory remain
   documented and supported; no extension packaging or storage-format change.
 
+## Resolved: query correctness (H1)
+
+Final projection and aggregation now precede ORDER BY and LIMIT, with explicit
+alias sorting, existing source-expression sorting, and fallible sort-key evaluation.
+The 19 added lifecycle/CLI regressions cover grouped/global aggregates, empty input,
+WITH scope, nested projected expressions, output caps, and write/savepoint recovery.
+The fix preserves the preceding milestone's immutable read path. See the
+[query contract](agents/README.md#query-surface) and [original probes](benchmarks/2026-09-09-query-audit.md).
+
+## Additional hardening findings
+
+The [supplemental audit](benchmarks/2026-09-09-query-audit.md) retains the detailed
+H1–H7 acceptance criteria and original measurements. H1 is resolved here; its H3
+read-copy issue is covered by the preceding read-efficiency change. Remaining work:
+
+- **H2 — reliable automation:** missing-DB usage errors can be plain text even
+  with JSON selected, and piped REPL statement errors can exit zero. Require
+  consistent envelopes and nonzero scripted failure exits while retaining
+  interactive recovery, including failed-then-successful statement sequences.
+- **H4 — index construction:** seeks rebuild candidate maps. Specify index
+  ownership and invalidation across writes, rollback, schema changes, and reopen;
+  compare indexed results with scans and report matching workload measurements.
+- **H5 — intermediate budgets:** the 100k-row guard follows materialization.
+  Enforce budgets during production; cover branching traversal and wide values
+  without moving LIMIT ahead of aggregates or writes. A response cap is not a
+  larger-than-RAM execution guarantee.
+- **H6 — persistence amplification:** full-state WALs grow with each edit.
+  Compare checkpoints/deltas and a safe interim compaction policy; preserve
+  stale-writer rejection, atomic replacement, recovery, and migration behavior.
+- **H7 — decoder allocation bounds:** count fields feed allocations before
+  exhaustion checks. This is a source concern, not an OOM reproduction. Validate
+  remaining-byte/nesting limits and malformed input under subprocess budgets;
+  preserve original bytes on migration failure. Prioritize concrete crash cases.
+
 ## Next priorities
 
 1. **Reduce measured core costs.** Use the baseline to prioritize resident graph

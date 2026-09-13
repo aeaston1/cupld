@@ -1,0 +1,1256 @@
+{
+  "timestamp_utc": "2026-09-09T21:23:36.193057+00:00",
+  "source_commit": "1d982b1304324cd339d3881886109e1193bb1ffa",
+  "platform": "Linux-6.8.0-111-generic-aarch64-with-glibc2.39",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "binary_bytes": 3345624,
+  "profile": "release (not dist; not stripped)",
+  "samples": 5,
+  "edits": 10,
+  "fixture": "N Item nodes, 256 ASCII body bytes and integer key; N-1 NEXT chain edges; equality index on key",
+  "cache_policy": "warm OS cache; no cache eviction; fresh process for CLI, one warmup for open-session queries",
+  "rss_scope": "GNU time maximum resident KiB per child process including open/setup; not per-operation allocation",
+  "graphs": [
+    {
+      "nodes": 1000,
+      "edges": 999,
+      "initial_db_bytes": 373211,
+      "queries": {
+        "constant": {
+          "query": "RETURN 1 AS value",
+          "cli": {
+            "median_wall_ms": 13.703526929020882,
+            "max_peak_rss_kib": 8708,
+            "wall_ms_samples": [
+              14.147888869047165,
+              12.52823881804943,
+              13.703526929020882,
+              14.307688921689987,
+              13.311885297298431
+            ],
+            "peak_rss_kib_samples": [
+              8704,
+              8708,
+              8704,
+              8704,
+              8704
+            ]
+          },
+          "open_session": {
+            "wall_ms": 17.288709059357643,
+            "peak_rss_kib": 7664,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 6.983804
+              },
+              {
+                "metric": "query_ms",
+                "value": 0.8824059999999999
+              },
+              {
+                "metric": "query_ms",
+                "value": 0.896926
+              },
+              {
+                "metric": "query_ms",
+                "value": 0.861325
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.042207
+              },
+              {
+                "metric": "query_ms",
+                "value": 0.842726
+              }
+            ]
+          }
+        },
+        "indexed_lookup": {
+          "query": "MATCH (n:Item {key: 500}) RETURN n.key",
+          "cli": {
+            "median_wall_ms": 12.993041425943375,
+            "max_peak_rss_kib": 8836,
+            "wall_ms_samples": [
+              12.993041425943375,
+              12.725360691547394,
+              12.785561382770538,
+              16.456983983516693,
+              13.674527406692505
+            ],
+            "peak_rss_kib_samples": [
+              8836,
+              8832,
+              8832,
+              8832,
+              8836
+            ]
+          },
+          "open_session": {
+            "wall_ms": 19.776688888669014,
+            "peak_rss_kib": 7792,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 7.036605
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.225248
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.2074880000000001
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.141167
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.172607
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.1888079999999999
+              }
+            ]
+          }
+        },
+        "scan_limit_10": {
+          "query": "MATCH (n:Item) RETURN n.key LIMIT 10",
+          "cli": {
+            "median_wall_ms": 14.622293412685394,
+            "max_peak_rss_kib": 9344,
+            "wall_ms_samples": [
+              15.51985926926136,
+              15.104494988918304,
+              13.808287680149078,
+              14.622293412685394,
+              13.869207352399826
+            ],
+            "peak_rss_kib_samples": [
+              9344,
+              9344,
+              9344,
+              9344,
+              9344
+            ]
+          },
+          "open_session": {
+            "wall_ms": 20.43100818991661,
+            "peak_rss_kib": 8304,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 6.698362
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.398649
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.375169
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.313008
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.369369
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.296569
+              }
+            ]
+          }
+        },
+        "scan_output_cap_10": {
+          "query": "MATCH (n:Item) RETURN n.key",
+          "cli": {
+            "median_wall_ms": 15.088016167283058,
+            "max_peak_rss_kib": 9344,
+            "wall_ms_samples": [
+              15.088016167283058,
+              15.72578027844429,
+              14.109812676906586,
+              13.409443199634552,
+              16.008980572223663
+            ],
+            "peak_rss_kib_samples": [
+              9344,
+              9344,
+              9344,
+              9344,
+              9344
+            ]
+          },
+          "open_session": {
+            "wall_ms": 22.910185158252716,
+            "peak_rss_kib": 8304,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 7.399527
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.580331
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.57397
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.56593
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.55625
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.5358100000000001
+              }
+            ]
+          }
+        },
+        "one_hop": {
+          "query": "MATCH (n:Item {key: 500})-[:NEXT]->(m) RETURN m.key",
+          "cli": {
+            "median_wall_ms": 13.247445225715637,
+            "max_peak_rss_kib": 8836,
+            "wall_ms_samples": [
+              12.546559795737267,
+              14.320172369480133,
+              13.247445225715637,
+              12.78732344508171,
+              15.267297625541687
+            ],
+            "peak_rss_kib_samples": [
+              8832,
+              8832,
+              8832,
+              8832,
+              8836
+            ]
+          },
+          "open_session": {
+            "wall_ms": 20.0676042586565,
+            "peak_rss_kib": 7792,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 7.160925000000001
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.223647
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.2812489999999999
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.1876470000000001
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.2217280000000001
+              },
+              {
+                "metric": "query_ms",
+                "value": 1.2548080000000001
+              }
+            ]
+          }
+        }
+      },
+      "edits": {
+        "wall_ms": 443.7568187713623,
+        "peak_rss_kib": 28540,
+        "metrics": [
+          {
+            "metric": "open_ms",
+            "value": 7.2747269999999995
+          },
+          {
+            "metric": "commit_ms",
+            "value": 16.807507,
+            "db_bytes": 746359
+          },
+          {
+            "metric": "commit_ms",
+            "value": 21.568937,
+            "db_bytes": 1119507
+          },
+          {
+            "metric": "commit_ms",
+            "value": 27.006932000000003,
+            "db_bytes": 1492655
+          },
+          {
+            "metric": "commit_ms",
+            "value": 32.181524,
+            "db_bytes": 1865803
+          },
+          {
+            "metric": "commit_ms",
+            "value": 37.207116,
+            "db_bytes": 2238951
+          },
+          {
+            "metric": "commit_ms",
+            "value": 40.398097,
+            "db_bytes": 2612099
+          },
+          {
+            "metric": "commit_ms",
+            "value": 46.592575999999994,
+            "db_bytes": 2985247
+          },
+          {
+            "metric": "commit_ms",
+            "value": 51.518528,
+            "db_bytes": 3358395
+          },
+          {
+            "metric": "commit_ms",
+            "value": 57.175243,
+            "db_bytes": 3731543
+          },
+          {
+            "metric": "commit_ms",
+            "value": 61.658152,
+            "db_bytes": 4104691
+          }
+        ]
+      },
+      "after_edits_db_bytes": 4104691,
+      "cli_after_edits": {
+        "median_wall_ms": 47.43834398686886,
+        "max_peak_rss_kib": 18176,
+        "wall_ms_samples": [
+          46.05805315077305,
+          47.43834398686886,
+          49.347152933478355,
+          45.850133523344994,
+          47.78142459690571
+        ],
+        "peak_rss_kib_samples": [
+          18176,
+          18176,
+          18176,
+          18176,
+          18176
+        ]
+      },
+      "compaction": {
+        "wall_ms": 80.09098842740059,
+        "peak_rss_kib": 18668,
+        "metrics": [
+          {
+            "metric": "open_ms",
+            "value": 37.977562
+          },
+          {
+            "metric": "compact_ms",
+            "value": 35.618306000000004,
+            "db_bytes": 373228
+          }
+        ]
+      },
+      "compacted_db_bytes": 373228
+    },
+    {
+      "nodes": 10000,
+      "edges": 9999,
+      "initial_db_bytes": 3730211,
+      "queries": {
+        "constant": {
+          "query": "RETURN 1 AS value",
+          "cli": {
+            "median_wall_ms": 97.14753739535809,
+            "max_peak_rss_kib": 54360,
+            "wall_ms_samples": [
+              98.84466789662838,
+              97.14753739535809,
+              108.98181051015854,
+              94.37216073274612,
+              95.98601050674915
+            ],
+            "peak_rss_kib_samples": [
+              54356,
+              54360,
+              54356,
+              54356,
+              54360
+            ]
+          },
+          "open_session": {
+            "wall_ms": 159.2007726430893,
+            "peak_rss_kib": 53312,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 57.827327999999994
+              },
+              {
+                "metric": "query_ms",
+                "value": 13.184924
+              },
+              {
+                "metric": "query_ms",
+                "value": 12.858921
+              },
+              {
+                "metric": "query_ms",
+                "value": 16.285823
+              },
+              {
+                "metric": "query_ms",
+                "value": 13.222284
+              },
+              {
+                "metric": "query_ms",
+                "value": 12.55716
+              }
+            ]
+          }
+        },
+        "indexed_lookup": {
+          "query": "MATCH (n:Item {key: 5000}) RETURN n.key",
+          "cli": {
+            "median_wall_ms": 103.15181501209736,
+            "max_peak_rss_kib": 56536,
+            "wall_ms_samples": [
+              105.26802763342857,
+              97.95966185629368,
+              103.15181501209736,
+              98.57610799372196,
+              104.24326360225677
+            ],
+            "peak_rss_kib_samples": [
+              56532,
+              56532,
+              56536,
+              56532,
+              56532
+            ]
+          },
+          "open_session": {
+            "wall_ms": 206.79787546396255,
+            "peak_rss_kib": 55488,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 56.941122
+              },
+              {
+                "metric": "query_ms",
+                "value": 20.343369
+              },
+              {
+                "metric": "query_ms",
+                "value": 20.972893
+              },
+              {
+                "metric": "query_ms",
+                "value": 19.496243
+              },
+              {
+                "metric": "query_ms",
+                "value": 20.054848
+              },
+              {
+                "metric": "query_ms",
+                "value": 21.532017
+              }
+            ]
+          }
+        },
+        "scan_limit_10": {
+          "query": "MATCH (n:Item) RETURN n.key LIMIT 10",
+          "cli": {
+            "median_wall_ms": 112.86523565649986,
+            "max_peak_rss_kib": 61272,
+            "wall_ms_samples": [
+              108.61280933022499,
+              155.6029487401247,
+              118.44987235963345,
+              112.86523565649986,
+              112.02402971684933
+            ],
+            "peak_rss_kib_samples": [
+              61272,
+              61268,
+              61272,
+              61268,
+              61268
+            ]
+          },
+          "open_session": {
+            "wall_ms": 214.27196078002453,
+            "peak_rss_kib": 60352,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 60.368144
+              },
+              {
+                "metric": "query_ms",
+                "value": 21.332496
+              },
+              {
+                "metric": "query_ms",
+                "value": 21.306255
+              },
+              {
+                "metric": "query_ms",
+                "value": 21.180975
+              },
+              {
+                "metric": "query_ms",
+                "value": 20.936293000000003
+              },
+              {
+                "metric": "query_ms",
+                "value": 21.228335
+              }
+            ]
+          }
+        },
+        "scan_output_cap_10": {
+          "query": "MATCH (n:Item) RETURN n.key",
+          "cli": {
+            "median_wall_ms": 112.72987723350525,
+            "max_peak_rss_kib": 61272,
+            "wall_ms_samples": [
+              112.56643757224083,
+              115.66373519599438,
+              110.17366126179695,
+              112.72987723350525,
+              112.75619640946388
+            ],
+            "peak_rss_kib_samples": [
+              61272,
+              61268,
+              61268,
+              61272,
+              61268
+            ]
+          },
+          "open_session": {
+            "wall_ms": 231.21798783540726,
+            "peak_rss_kib": 60480,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 59.336136999999994
+              },
+              {
+                "metric": "query_ms",
+                "value": 24.843318
+              },
+              {
+                "metric": "query_ms",
+                "value": 23.510869
+              },
+              {
+                "metric": "query_ms",
+                "value": 22.863505999999997
+              },
+              {
+                "metric": "query_ms",
+                "value": 23.62931
+              },
+              {
+                "metric": "query_ms",
+                "value": 24.044152999999998
+              }
+            ]
+          }
+        },
+        "one_hop": {
+          "query": "MATCH (n:Item {key: 5000})-[:NEXT]->(m) RETURN m.key",
+          "cli": {
+            "median_wall_ms": 104.86122407019138,
+            "max_peak_rss_kib": 56536,
+            "wall_ms_samples": [
+              104.8938650637865,
+              104.12074439227581,
+              104.88682612776756,
+              104.86122407019138,
+              104.51790131628513
+            ],
+            "peak_rss_kib_samples": [
+              56472,
+              56536,
+              56532,
+              56532,
+              56532
+            ]
+          },
+          "open_session": {
+            "wall_ms": 203.0934877693653,
+            "peak_rss_kib": 55492,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 59.582657999999995
+              },
+              {
+                "metric": "query_ms",
+                "value": 20.645851999999998
+              },
+              {
+                "metric": "query_ms",
+                "value": 19.939926
+              },
+              {
+                "metric": "query_ms",
+                "value": 18.890520000000002
+              },
+              {
+                "metric": "query_ms",
+                "value": 19.637004
+              },
+              {
+                "metric": "query_ms",
+                "value": 19.536123999999997
+              }
+            ]
+          }
+        }
+      },
+      "edits": {
+        "wall_ms": 3717.954372987151,
+        "peak_rss_kib": 266564,
+        "metrics": [
+          {
+            "metric": "open_ms",
+            "value": 58.487771
+          },
+          {
+            "metric": "commit_ms",
+            "value": 130.225667,
+            "db_bytes": 7460359
+          },
+          {
+            "metric": "commit_ms",
+            "value": 165.818893,
+            "db_bytes": 11190507
+          },
+          {
+            "metric": "commit_ms",
+            "value": 208.30032300000002,
+            "db_bytes": 14920655
+          },
+          {
+            "metric": "commit_ms",
+            "value": 257.083353,
+            "db_bytes": 18650803
+          },
+          {
+            "metric": "commit_ms",
+            "value": 292.666098,
+            "db_bytes": 22380951
+          },
+          {
+            "metric": "commit_ms",
+            "value": 342.341014,
+            "db_bytes": 26111099
+          },
+          {
+            "metric": "commit_ms",
+            "value": 389.349513,
+            "db_bytes": 29841247
+          },
+          {
+            "metric": "commit_ms",
+            "value": 450.973024,
+            "db_bytes": 33571395
+          },
+          {
+            "metric": "commit_ms",
+            "value": 482.321583,
+            "db_bytes": 37301543
+          },
+          {
+            "metric": "commit_ms",
+            "value": 514.967391,
+            "db_bytes": 41031691
+          }
+        ]
+      },
+      "after_edits_db_bytes": 41031691,
+      "cli_after_edits": {
+        "median_wall_ms": 430.5539336055517,
+        "max_peak_rss_kib": 153844,
+        "wall_ms_samples": [
+          433.7213933467865,
+          430.4433334618807,
+          430.5539336055517,
+          420.9752343595028,
+          434.9210802465677
+        ],
+        "peak_rss_kib_samples": [
+          153844,
+          153844,
+          153844,
+          153844,
+          153844
+        ]
+      },
+      "compaction": {
+        "wall_ms": 719.7297289967537,
+        "peak_rss_kib": 166212,
+        "metrics": [
+          {
+            "metric": "open_ms",
+            "value": 378.412483
+          },
+          {
+            "metric": "compact_ms",
+            "value": 321.13248,
+            "db_bytes": 3730228
+          }
+        ]
+      },
+      "compacted_db_bytes": 3730228
+    },
+    {
+      "nodes": 50000,
+      "edges": 49999,
+      "initial_db_bytes": 18650211,
+      "queries": {
+        "constant": {
+          "query": "RETURN 1 AS value",
+          "cli": {
+            "median_wall_ms": 495.1758235692978,
+            "max_peak_rss_kib": 257592,
+            "wall_ms_samples": [
+              501.36374309659004,
+              486.13300919532776,
+              494.549298658967,
+              495.1758235692978,
+              496.2701089680195
+            ],
+            "peak_rss_kib_samples": [
+              257588,
+              257588,
+              257588,
+              257524,
+              257592
+            ]
+          },
+          "open_session": {
+            "wall_ms": 850.0748388469219,
+            "peak_rss_kib": 256548,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 293.171782
+              },
+              {
+                "metric": "query_ms",
+                "value": 75.005916
+              },
+              {
+                "metric": "query_ms",
+                "value": 74.977636
+              },
+              {
+                "metric": "query_ms",
+                "value": 74.91043599999999
+              },
+              {
+                "metric": "query_ms",
+                "value": 76.183644
+              },
+              {
+                "metric": "query_ms",
+                "value": 74.335672
+              }
+            ]
+          }
+        },
+        "indexed_lookup": {
+          "query": "MATCH (n:Item {key: 25000}) RETURN n.key",
+          "cli": {
+            "median_wall_ms": 520.8762269467115,
+            "max_peak_rss_kib": 268344,
+            "wall_ms_samples": [
+              524.4672894477844,
+              520.8762269467115,
+              514.7608276456594,
+              523.7655639648438,
+              514.8812271654606
+            ],
+            "peak_rss_kib_samples": [
+              268344,
+              268344,
+              268344,
+              268344,
+              268340
+            ]
+          },
+          "open_session": {
+            "wall_ms": 997.663451358676,
+            "peak_rss_kib": 267300,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 300.129465
+              },
+              {
+                "metric": "query_ms",
+                "value": 97.354818
+              },
+              {
+                "metric": "query_ms",
+                "value": 100.071075
+              },
+              {
+                "metric": "query_ms",
+                "value": 97.992942
+              },
+              {
+                "metric": "query_ms",
+                "value": 97.335218
+              },
+              {
+                "metric": "query_ms",
+                "value": 97.852222
+              }
+            ]
+          }
+        },
+        "scan_limit_10": {
+          "query": "MATCH (n:Item) RETURN n.key LIMIT 10",
+          "cli": {
+            "median_wall_ms": 544.8102578520775,
+            "max_peak_rss_kib": 292344,
+            "wall_ms_samples": [
+              549.0553248673677,
+              533.5240680724382,
+              544.8102578520775,
+              539.0776190906763,
+              545.9863059222698
+            ],
+            "peak_rss_kib_samples": [
+              292280,
+              292276,
+              292280,
+              292276,
+              292344
+            ]
+          },
+          "open_session": {
+            "wall_ms": 1065.2439203113317,
+            "peak_rss_kib": 291364,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 294.179987
+              },
+              {
+                "metric": "query_ms",
+                "value": 105.894273
+              },
+              {
+                "metric": "query_ms",
+                "value": 107.65388300000001
+              },
+              {
+                "metric": "query_ms",
+                "value": 107.92560499999999
+              },
+              {
+                "metric": "query_ms",
+                "value": 109.737297
+              },
+              {
+                "metric": "query_ms",
+                "value": 108.824451
+              }
+            ]
+          }
+        },
+        "scan_output_cap_10": {
+          "query": "MATCH (n:Item) RETURN n.key",
+          "cli": {
+            "median_wall_ms": 562.5460110604763,
+            "max_peak_rss_kib": 292340,
+            "wall_ms_samples": [
+              564.5505413413048,
+              561.0432028770447,
+              562.5460110604763,
+              553.9247952401638,
+              578.0667085200548
+            ],
+            "peak_rss_kib_samples": [
+              292276,
+              292280,
+              292276,
+              292276,
+              292340
+            ]
+          },
+          "open_session": {
+            "wall_ms": 1155.0948899239302,
+            "peak_rss_kib": 291748,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 296.761964
+              },
+              {
+                "metric": "query_ms",
+                "value": 123.856866
+              },
+              {
+                "metric": "query_ms",
+                "value": 121.79649300000001
+              },
+              {
+                "metric": "query_ms",
+                "value": 121.146448
+              },
+              {
+                "metric": "query_ms",
+                "value": 125.588677
+              },
+              {
+                "metric": "query_ms",
+                "value": 124.385349
+              }
+            ]
+          }
+        },
+        "one_hop": {
+          "query": "MATCH (n:Item {key: 25000})-[:NEXT]->(m) RETURN m.key",
+          "cli": {
+            "median_wall_ms": 517.5407230854034,
+            "max_peak_rss_kib": 268340,
+            "wall_ms_samples": [
+              514.9569474160671,
+              512.796014547348,
+              534.718994051218,
+              519.3958170711994,
+              517.5407230854034
+            ],
+            "peak_rss_kib_samples": [
+              268340,
+              268340,
+              268340,
+              268340,
+              268340
+            ]
+          },
+          "open_session": {
+            "wall_ms": 1010.7323341071606,
+            "peak_rss_kib": 267300,
+            "metrics": [
+              {
+                "metric": "open_ms",
+                "value": 303.01580299999995
+              },
+              {
+                "metric": "query_ms",
+                "value": 98.669066
+              },
+              {
+                "metric": "query_ms",
+                "value": 98.56914499999999
+              },
+              {
+                "metric": "query_ms",
+                "value": 99.652552
+              },
+              {
+                "metric": "query_ms",
+                "value": 99.78643299999999
+              },
+              {
+                "metric": "query_ms",
+                "value": 100.76164
+              }
+            ]
+          }
+        }
+      },
+      "edits": {
+        "wall_ms": 18809.95258502662,
+        "peak_rss_kib": 1122836,
+        "metrics": [
+          {
+            "metric": "open_ms",
+            "value": 304.699373
+          },
+          {
+            "metric": "commit_ms",
+            "value": 620.224656,
+            "db_bytes": 37300359
+          },
+          {
+            "metric": "commit_ms",
+            "value": 808.794371,
+            "db_bytes": 55950507
+          },
+          {
+            "metric": "commit_ms",
+            "value": 1067.9992949999998,
+            "db_bytes": 74600655
+          },
+          {
+            "metric": "commit_ms",
+            "value": 1290.373226,
+            "db_bytes": 93250803
+          },
+          {
+            "metric": "commit_ms",
+            "value": 1529.9801459999999,
+            "db_bytes": 111900951
+          },
+          {
+            "metric": "commit_ms",
+            "value": 1757.584509,
+            "db_bytes": 130551099
+          },
+          {
+            "metric": "commit_ms",
+            "value": 1997.280229,
+            "db_bytes": 149201247
+          },
+          {
+            "metric": "commit_ms",
+            "value": 2226.438481,
+            "db_bytes": 167851395
+          },
+          {
+            "metric": "commit_ms",
+            "value": 2452.383513,
+            "db_bytes": 186501543
+          },
+          {
+            "metric": "commit_ms",
+            "value": 2692.174671,
+            "db_bytes": 205151691
+          }
+        ]
+      },
+      "after_edits_db_bytes": 205151691,
+      "cli_after_edits": {
+        "median_wall_ms": 2158.0680403858423,
+        "max_peak_rss_kib": 757032,
+        "wall_ms_samples": [
+          2162.2355096042156,
+          2158.0680403858423,
+          2164.8454442620277,
+          2156.6652711480856,
+          2138.6616360396147
+        ],
+        "peak_rss_kib_samples": [
+          757032,
+          757032,
+          757032,
+          757032,
+          757032
+        ]
+      },
+      "compaction": {
+        "wall_ms": 3589.2627462744713,
+        "peak_rss_kib": 827684,
+        "metrics": [
+          {
+            "metric": "open_ms",
+            "value": 1910.547148
+          },
+          {
+            "metric": "compact_ms",
+            "value": 1575.053022,
+            "db_bytes": 18650228
+          }
+        ]
+      },
+      "compacted_db_bytes": 18650228
+    }
+  ],
+  "cli_version_startup": {
+    "median_wall_ms": 3.3455807715654373,
+    "max_peak_rss_kib": 2432,
+    "wall_ms_samples": [
+      4.1524674743413925,
+      2.8577782213687897,
+      3.260299563407898,
+      3.3455807715654373,
+      3.636140376329422
+    ],
+    "peak_rss_kib_samples": [
+      2432,
+      2432,
+      2432,
+      2432,
+      2432
+    ]
+  },
+  "generic_workflow": {
+    "passed": true,
+    "creation": "REPL with EOF",
+    "schema": {
+      "ok": true,
+      "command": "query",
+      "policy": {
+        "execution_mode": "automation_read_write",
+        "max_rows": 1000
+      },
+      "results": [
+        {
+          "columns": [
+            "kind",
+            "name",
+            "description",
+            "ddl"
+          ],
+          "row_count": 2,
+          "truncated": false,
+          "rows": [
+            {
+              "kind": "label",
+              "name": "Person",
+              "description": null,
+              "ddl": "CREATE LABEL Person"
+            },
+            {
+              "kind": "edge_type",
+              "name": "KNOWS",
+              "description": null,
+              "ddl": "CREATE EDGE TYPE KNOWS"
+            }
+          ]
+        }
+      ]
+    },
+    "updated_rows": [
+      {
+        "name": "Ada",
+        "score": 3
+      },
+      {
+        "name": "Grace",
+        "score": 2
+      }
+    ],
+    "context_nodes": 2,
+    "context_edges": 1,
+    "export": "query rows only; not lossless graph export"
+  },
+  "semantic_probes": [
+    {
+      "name": "aggregate_limit",
+      "query": "MATCH (n:Person) RETURN count(n) AS total LIMIT 1",
+      "expected": [
+        {
+          "total": 2
+        }
+      ],
+      "actual": [
+        {
+          "total": 1
+        }
+      ],
+      "matches_expected": false
+    },
+    {
+      "name": "projected_alias_order",
+      "query": "MATCH (n:Person) RETURN n.score AS score ORDER BY score",
+      "expected": [
+        {
+          "score": 2
+        },
+        {
+          "score": 3
+        }
+      ],
+      "actual": [
+        {
+          "score": 3
+        },
+        {
+          "score": 2
+        }
+      ],
+      "matches_expected": false
+    }
+  ],
+  "cli_probes": [
+    {
+      "args": [
+        "query",
+        "--db",
+        "<db>",
+        "--output",
+        "json",
+        "RETURN ("
+      ],
+      "stdin": null,
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "{\"ok\":false,\"error\":{\"code\":\"parse_unexpected_eof\",\"message\":\"parse_unexpected_eof at line 1, column 1: unexpected end of input\"}}\n"
+    },
+    {
+      "args": [
+        "query",
+        "--output",
+        "json",
+        "RETURN 1"
+      ],
+      "stdin": null,
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "expected --db <path.cupld|default> for `query` command\n"
+    },
+    {
+      "args": [
+        "schema",
+        "--db",
+        "<db>",
+        "--output",
+        "json"
+      ],
+      "stdin": null,
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "`schema` accepts only --db <path.cupld|default>\n\ncupld is a local graph database CLI and REPL.\n\nUsage:\n  cupld [<path.cupld>]\n  cupld --db <path.cupld|default> [--visualise [--query <query>]]\n  cupld <command> [options]\n  cupld -v|--version\n  cupld -h|--help|help\n\nCommands:\n  cupld                   Start an in-memory REPL session.\n  cupld <path.cupld>      Open or create a file-backed REPL session.\n  cupld --db <path|default> Open a file-backed REPL session; `default` maps to `./.cupld/default.cupld`.\n  --visualise             Open the interactive scene viewer for --db.\n  --query                 Seed the scene with one read-only RETURN query.\n  query                   Run a query against --db using inline text or stdin.\n  context                 Build compact seeded context rows for agent prompts.\n  eval memory             Run deterministic markdown memory eval fixtures.\n  --with-md               Overlay markdown documents into `query` before execution.\n  --root                  Override the markdown root for `query` or `sync markdown`.\n  --include-fs-graph      Persist markdown directory nodes and filesystem structural edges during `sync markdown`.\n  --watch                 Keep polling markdown for changes after the initial sync.\n  --poll-ms               Poll interval for `sync markdown --watch`.\n  --debounce-ms           Stable-change debounce window for `sync markdown --watch`.\n  --batch-ms              Max coalescing window before a forced watched sync.\n  --idle-ms               Exit watched sync after this long with no pending changes.\n  --max-runs              Stop watched sync after this many sync runs, including the initial run.\n  --node                  Seed `context` from a graph node id; repeatable.\n  --path                  Seed `context` from a markdown src.path; repeatable.\n  --depth                 Traversal depth for `context` seeds.\n  --direction             Traversal direction for `context`: in, out, both.\n  --edge-type             Restrict `context` traversal to an edge type; repeatable.\n  --label                 Restrict `context` nodes to a label; repeatable.\n  --max-nodes             Maximum context nodes to return.\n  --max-edges             Maximum context edges to traverse.\n  --fixtures              Fixture directory for `eval memory`; defaults to tests/fixtures/memory.\n  --case                  Restrict `eval memory` to one fixture case.\n  --ci                    Print concise PR-friendly failures for `eval memory`.\n  --update-snapshots      Update `eval memory` snapshots.\n  --output                Select output mode for query/context/memory/eval memory: table, json, ndjson.\n  --params-json           Provide named query parameters as a JSON object.\n  --params-file           Read named query parameters from a JSON file.\n  --max-rows              Hard cap result rows in non-interactive query mode.\n  schema                  Print SHOW SCHEMA for --db.\n  compact                 Rewrite --db and reset its WAL.\n  check                   Validate --db and print recovery metadata.\n  upgrade                 Back up --db, validate it, and run memory check; defaults to --db default.\n  memory check            Validate memory DB health and markdown maintenance status.\n  memory find-stale       List indexed markdown documents that differ from the filesystem.\n  memory find-orphans     List tombstoned markdown documents and directories retained in memory.\n  memory reindex          Verify existing schema indexes in the database.\n  sync markdown           Materialize markdown documents into --db and optionally watch for changes.\n  source set-root         Persist the default markdown root in --db.\n  mcp serve               Run the stdio MCP memory server for --db.\n  install                 Install the bundled cupld-md-memory SKILL.md and bootstrap local cupld memory.\n  install --mcp           Also write supported harness MCP config; use --dry-run or --print-only for previews.\n  -v, --version           Print the cupld version.\n  -h, --help, help        Show this help text.\n\nREPL:\n  Run .help inside the REPL for interactive commands.\n"
+    },
+    {
+      "args": [
+        "check",
+        "--db",
+        "<db>",
+        "--output",
+        "json"
+      ],
+      "stdin": null,
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "`check` accepts only --db <path.cupld|default>\n\ncupld is a local graph database CLI and REPL.\n\nUsage:\n  cupld [<path.cupld>]\n  cupld --db <path.cupld|default> [--visualise [--query <query>]]\n  cupld <command> [options]\n  cupld -v|--version\n  cupld -h|--help|help\n\nCommands:\n  cupld                   Start an in-memory REPL session.\n  cupld <path.cupld>      Open or create a file-backed REPL session.\n  cupld --db <path|default> Open a file-backed REPL session; `default` maps to `./.cupld/default.cupld`.\n  --visualise             Open the interactive scene viewer for --db.\n  --query                 Seed the scene with one read-only RETURN query.\n  query                   Run a query against --db using inline text or stdin.\n  context                 Build compact seeded context rows for agent prompts.\n  eval memory             Run deterministic markdown memory eval fixtures.\n  --with-md               Overlay markdown documents into `query` before execution.\n  --root                  Override the markdown root for `query` or `sync markdown`.\n  --include-fs-graph      Persist markdown directory nodes and filesystem structural edges during `sync markdown`.\n  --watch                 Keep polling markdown for changes after the initial sync.\n  --poll-ms               Poll interval for `sync markdown --watch`.\n  --debounce-ms           Stable-change debounce window for `sync markdown --watch`.\n  --batch-ms              Max coalescing window before a forced watched sync.\n  --idle-ms               Exit watched sync after this long with no pending changes.\n  --max-runs              Stop watched sync after this many sync runs, including the initial run.\n  --node                  Seed `context` from a graph node id; repeatable.\n  --path                  Seed `context` from a markdown src.path; repeatable.\n  --depth                 Traversal depth for `context` seeds.\n  --direction             Traversal direction for `context`: in, out, both.\n  --edge-type             Restrict `context` traversal to an edge type; repeatable.\n  --label                 Restrict `context` nodes to a label; repeatable.\n  --max-nodes             Maximum context nodes to return.\n  --max-edges             Maximum context edges to traverse.\n  --fixtures              Fixture directory for `eval memory`; defaults to tests/fixtures/memory.\n  --case                  Restrict `eval memory` to one fixture case.\n  --ci                    Print concise PR-friendly failures for `eval memory`.\n  --update-snapshots      Update `eval memory` snapshots.\n  --output                Select output mode for query/context/memory/eval memory: table, json, ndjson.\n  --params-json           Provide named query parameters as a JSON object.\n  --params-file           Read named query parameters from a JSON file.\n  --max-rows              Hard cap result rows in non-interactive query mode.\n  schema                  Print SHOW SCHEMA for --db.\n  compact                 Rewrite --db and reset its WAL.\n  check                   Validate --db and print recovery metadata.\n  upgrade                 Back up --db, validate it, and run memory check; defaults to --db default.\n  memory check            Validate memory DB health and markdown maintenance status.\n  memory find-stale       List indexed markdown documents that differ from the filesystem.\n  memory find-orphans     List tombstoned markdown documents and directories retained in memory.\n  memory reindex          Verify existing schema indexes in the database.\n  sync markdown           Materialize markdown documents into --db and optionally watch for changes.\n  source set-root         Persist the default markdown root in --db.\n  mcp serve               Run the stdio MCP memory server for --db.\n  install                 Install the bundled cupld-md-memory SKILL.md and bootstrap local cupld memory.\n  install --mcp           Also write supported harness MCP config; use --dry-run or --print-only for previews.\n  -v, --version           Print the cupld version.\n  -h, --help, help        Show this help text.\n\nREPL:\n  Run .help inside the REPL for interactive commands.\n"
+    },
+    {
+      "args": [
+        "<db>"
+      ],
+      "stdin": "RETURN (\n",
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "parse_unexpected_eof: parse_unexpected_eof at line 1, column 1: unexpected end of input\n"
+    }
+  ]
+}

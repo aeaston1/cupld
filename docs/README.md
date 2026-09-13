@@ -14,6 +14,7 @@ cupld is an in-process graph database with a CLI for people and their existing a
 - [Markdown memory](memory.md): supported memory setup, sync, MCP, and maintenance
 - [Viewer](agents/visualise.md): interactive graph exploration
 - [Core audit](core-audit.md): current capabilities, gaps, and database roadmap
+- [Supplemental query audit](benchmarks/2026-09-09-query-audit.md): original query defects, CLI gaps, and historical chain-graph measurements
 - [Core benchmarks](core-benchmarks.md): reproducible performance and resource measurements
 - [Development roadmap](backlog.md): prioritized core milestones, retained memory work, and resolved reliability issues
 
