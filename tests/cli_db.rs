@@ -203,7 +203,7 @@ fn write_fake_curl(dir: &Path, body: &str, exit_code: i32) -> PathBuf {
     fs::write(
         &path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' '{}'\nexit {exit_code}\n",
+            "#!/bin/sh\nif [ -n \"$CUPLD_TEST_CURL_MARKER\" ]; then printf called > \"$CUPLD_TEST_CURL_MARKER\"; fi\nprintf '%s\\n' '{}'\nexit {exit_code}\n",
             body.replace('\'', "'\\''")
         ),
     )
@@ -2978,10 +2978,12 @@ fn cli_upgrade_backs_up_default_db_and_runs_checks() {
 
 #[cfg(unix)]
 #[test]
-fn cli_db_command_warns_when_latest_release_is_newer() {
+fn scripted_database_commands_never_check_releases_or_write_a_release_cache() {
     let workspace = TempDir::new("cli_upgrade_hint_workspace");
     seed_workspace_default_db(workspace.path());
     let curl_dir = TempDir::new("cli_upgrade_hint_curl");
+    let config = TempDir::new("cli_upgrade_hint_config");
+    let marker = curl_dir.path().join("called");
     write_fake_curl(
         curl_dir.path(),
         r#"{"tag_name":"v99.0.0","html_url":"https://github.com/aeaston1/cupld/releases/tag/v99.0.0"}"#,
@@ -2989,46 +2991,48 @@ fn cli_db_command_warns_when_latest_release_is_newer() {
     );
     let path = curl_dir.path().to_str().unwrap();
 
-    let output = run_cli_with_env_in_dir(
-        &["schema", "--db", "default"],
-        "",
-        Some(workspace.path()),
-        &[("CUPLD_NO_UPGRADE_CHECK", "0"), ("PATH", path)],
-    );
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("A newer cupld release is available: v99.0.0"));
-    assert!(stderr.contains("cupld upgrade --db"));
-}
-
-#[cfg(unix)]
-#[test]
-fn cli_db_command_stays_silent_when_latest_release_check_fails() {
-    let workspace = TempDir::new("cli_upgrade_hint_failure_workspace");
-    seed_workspace_default_db(workspace.path());
-    let curl_dir = TempDir::new("cli_upgrade_hint_failure_curl");
-    write_fake_curl(curl_dir.path(), "unavailable", 22);
-    let path = curl_dir.path().to_str().unwrap();
-
-    let output = run_cli_with_env_in_dir(
-        &["schema", "--db", "default"],
-        "",
-        Some(workspace.path()),
-        &[("CUPLD_NO_UPGRADE_CHECK", "0"), ("PATH", path)],
-    );
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stderr.contains("A newer cupld release is available"));
+    for args in [
+        vec!["schema", "--db", "default"],
+        vec![
+            "query",
+            "--db",
+            "default",
+            "--output",
+            "json",
+            "MATCH (n) RETURN count(n)",
+        ],
+        vec!["context", "--db", "default", "--node", "1"],
+        vec!["check", "--db", "default"],
+        vec!["compact", "--db", "default"],
+        vec!["--db", "default"],
+    ] {
+        let output = run_cli_with_env_in_dir(
+            &args,
+            ".quit\n",
+            Some(workspace.path()),
+            &[
+                ("CUPLD_NO_UPGRADE_CHECK", "0"),
+                ("PATH", path),
+                ("CUPLD_TEST_CURL_MARKER", marker.to_str().unwrap()),
+                ("XDG_CONFIG_HOME", config.path().to_str().unwrap()),
+                ("APPDATA", config.path().to_str().unwrap()),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("A newer cupld release"));
+        assert!(!marker.exists(), "{args:?} invoked curl");
+        assert!(
+            !config
+                .path()
+                .join(".cupld/release-check-cache.json")
+                .exists(),
+            "{args:?} wrote a release cache"
+        );
+    }
 }
 
 #[cfg(unix)]

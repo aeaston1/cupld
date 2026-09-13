@@ -1,18 +1,18 @@
 # cupld
 
-`cupld` is a local graph database CLI and REPL with first-class support for markdown-backed memory workflows.
+`cupld` is a lightweight, in-process graph database for people and their agents. Query and update local graphs through the CLI, explore them in the REPL, or embed the Rust library in your application.
 
-It provides MCP-first local memory tools for agents, plus interactive exploration, one-shot queries, compact context output, markdown sync, and a visual graph viewer over file-backed `.cupld` stores. It is built in Rust as a single binary with no external runtime dependencies.
+The core is built in Rust with zero third-party crate dependencies and runs without a database server. Your existing agent can inspect the schema, execute parameterized graph queries, and consume structured results. Markdown-backed agent memory remains a supported specialized workflow.
 
 ## Highlights
 
-- Local-first graph database with file-backed `.cupld` stores
-- Pure Rust binary with no external runtime dependencies
-- MCP memory server with `memory_health`, `memory_doctor`, `memory_search`, `memory_get`, `memory_context`, `memory_add`, and `memory_sync`
-- Interactive REPL plus scriptable `query`, `context`, `schema`, and `check` commands
-- Stable JSON and NDJSON envelopes for `query` and `context` automation
-- Markdown sync, optional watch mode, and bundled `cupld-md-memory` skill bootstrap
-- Visual graph viewer for inspecting a database
+- Local graph storage in `.cupld` files, plus in-memory sessions
+- Nodes, typed edges, properties, schema, constraints, and transactions
+- CLI queries with named parameters and JSON/NDJSON output
+- Seeded graph context with traversal and response budgets
+- Interactive REPL, graph viewer, integrity checks, and compaction
+- Embedded Rust `Session` and `CupldEngine` APIs
+- Bundled markdown sync and MCP memory tools
 
 ## Install
 
@@ -48,148 +48,75 @@ cargo install --path .
 
 ## Quickstart
 
-For agent harnesses, start with MCP-backed memory:
+Create a small graph using the existing REPL with stdin. Start with a new `graph.cupld` path; rerunning this example adds more nodes.
 
 ```bash
-cupld install --mcp --target codex --scope cwd --dry-run --db default
-cupld mcp serve --db default
+export CUPLD_NO_INSTALL_PROMPT=1
+export CUPLD_NO_UPGRADE_CHECK=1
+cupld graph.cupld <<'EOF'
+CREATE (:Person {name: 'Ada'})-[:KNOWS]->(:Person {name: 'Grace'})
+.quit
+EOF
 ```
 
-Then call `memory_health` and `memory_doctor`, use `memory_search`/`memory_get` for routine reads, `memory_context` to expand a search result into bounded graph context, `memory_add` when the user asks you to remember something, and `memory_sync` after direct markdown edits. MCP reads are DB-backed only: read tools never scan markdown files or run hidden syncs, so direct markdown edits remain invisible until `memory_sync` updates the DB. Harnesses should treat the `uri` returned by `memory_search` as the durable identity for follow-up `memory_get` and `memory_context` calls.
+The environment settings suppress optional setup prompts and release checks. `cupld graph.cupld` opens or creates the file; `cupld` alone opens an in-memory REPL. One-shot `query` requires an existing database.
 
-Start an in-memory REPL for human exploration:
+Inspect the schema, then query the graph with your agent:
 
 ```bash
-cupld
+cupld query --db graph.cupld --output json 'SHOW SCHEMA'
+cupld query --db graph.cupld --output json --params-json '{"name":"Ada"}' \
+  'MATCH (a:Person {name: $name})-[:KNOWS]->(b:Person) RETURN id(a) AS node_id, a.name AS person, b.name AS knows ORDER BY b.name LIMIT 10'
 ```
 
-Open or create a file-backed database:
+The result identifies Ada's node and the connection to Grace. Pass a returned `node_id` to `context`; on this newly created graph, Ada's ID is `1`:
 
 ```bash
-cupld mydb.cupld
+cupld context --db graph.cupld --node 1 --depth 1 --max-nodes 10 --max-edges 10 --output json
+cupld check --db graph.cupld
+cupld compact --db graph.cupld
 ```
 
-Run a one-shot query:
+Queries allow reads and writes by default. Use `BEGIN`/`COMMIT` for multi-statement batches; there is no generic CLI `--read-only` flag. `query` and `context` provide machine output, while `schema` and `check` currently print table/text output. See the [agent guide](docs/agents/README.md) for update examples, output contracts, and error handling.
+
+Open the graph viewer from an interactive terminal:
 
 ```bash
-cupld query --db default 'MATCH (n) RETURN n LIMIT 10'
+cupld --db graph.cupld --visualise
 ```
 
-Run the same query with the machine envelope:
+## Embed in Rust
 
-```bash
-cupld query --db default --output json 'MATCH (n) RETURN n LIMIT 10'
+With `cupld` as a dependency in your Rust application:
+
+```rust
+use std::collections::BTreeMap;
+use cupld::{Session, Value};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut db = Session::new_in_memory();
+    let params = BTreeMap::from([("name".to_owned(), Value::String("Ada".to_owned()))]);
+    db.execute_script("CREATE (:Person {name: $name})", &params)?;
+    let results = db.execute_script(
+        "MATCH (p:Person) RETURN p.name AS name ORDER BY p.name",
+        &BTreeMap::new(),
+    )?;
+    println!("{:?}", results[0].rows);
+    Ok(())
+}
 ```
 
-Build compact context rows from explicit seeds when MCP is unavailable or you need a CLI export:
+Use `Session::open(path)` for an existing file or `Session::save_as(path)` to persist a new in-memory database.
 
-```bash
-cupld context --db default --path notes/example.md --depth 2 --max-nodes 25 --output table
-cupld context --db default --node 42 --depth 1 --output table
-cupld context --db default --path notes/example.md --depth 2 --output json
-```
+## Current Boundaries
 
-`context` is seeded: pass one or more `--node <id>` or `--path <src.path>` seeds to get a bounded neighborhood around explicit graph nodes or synced markdown source paths. Use `--depth <n>`, `--direction <in|out|both>`, repeated `--edge-type <type>`, repeated `--label <label>`, `--max-nodes <n>`, and `--max-edges <n>` to control traversal. Table output is human-facing and contains `row`, `depth`, `id`, `labels/type`, `display`, `source`, and `target` columns. JSON and NDJSON remain the stable machine contracts for automation; JSON is the default output mode.
+Graphs and query results currently reside in memory. Output limits bound returned data; they do not provide a working-memory cap or larger-than-RAM execution. Generic bulk import/export and machine-readable capability discovery are not shipped commands. The [core audit](docs/core-audit.md) separates current behavior from the roadmap, and the [core benchmarks](docs/core-benchmarks.md) define reproducible measurements.
 
-Use `cupld query` for advanced graph inspection, global node listings, and ad hoc graph reads:
-
-```bash
-cupld query --db default 'MATCH (n) RETURN id(n), labels(n), n.name, n.`src.path` ORDER BY id(n) LIMIT 25'
-```
-
-Inspect, validate, and compact a database:
-
-```bash
-cupld schema --db default
-cupld check --db default
-cupld compact --db default
-```
-
-Beta note: opening or checking a `.cupld` created by an older `cupld` release upgrades it in place to the current on-disk format. Treat `.cupld` files as forward-only during beta if you may need rollback.
-
-Database writes sync a temporary file beside the database and atomically replace the destination. Cooperating writers use a persistent `<database>.lock` sidecar; leave that file in place. A stale session must reopen before saving, and `SAVE AS` refuses to overwrite a different existing database. See the [persistence contract](docs/agents/README.md#database-persistence) for recovery errors and platform durability limits.
-
-Open the viewer:
-
-```bash
-cupld --db default --visualise
-```
+Opening or checking an older `.cupld` file may upgrade its format in place. Database writes use atomic replacement and a persistent `<database>.lock` sidecar; stale sessions must reopen before saving. Keep that sidecar in place. See the [persistence contract](docs/agents/README.md#database-persistence) for recovery errors and platform durability limits.
 
 ## Markdown Memory
 
-Bootstrap the bundled `cupld-md-memory` skill and a local `.cupld` memory DB:
-
-```bash
-cupld install
-```
-
-By default, `install` uses `.cupld/default.cupld` for the database file and `.cupld/data` for the markdown root. `--db default` is a shortcut for that database path.
-
-Sync markdown into a database and override the root:
-
-```bash
-cupld sync markdown --db default --root notes
-cupld source set-root --db default notes
-```
-
-Opt in to persisted filesystem structure when directory traversal matters:
-
-```bash
-cupld sync markdown --db default --include-fs-graph
-```
-
-Watch markdown after the initial persisted sync:
-
-```bash
-cupld sync markdown --db default --root notes --watch --idle-ms 500 --max-runs 2
-```
-
-Use `cupld query --with-md` for transient overlay reads and `cupld sync markdown` when you want later plain queries to see persisted markdown state. By default sync persists markdown documents and authored `MD_LINKS_TO` compatibility edges. Body links and generic frontmatter `link` / `links` relationships create only `MD_LINKS_TO`; typed frontmatter relationships also add authored signal edges: `up` / `parent` as `MD_UP`, `related` as `MD_RELATED`, `next` as `MD_NEXT`, and `previous` as `MD_PREVIOUS`. `--include-fs-graph` also persists `MarkdownDirectory` nodes plus `MD_IN_DIRECTORY` and `MD_PARENT_DIRECTORY` edges; it does not create `MD_SIBLING_OF` pairwise sibling edges. MCP `memory_search` can consume the persisted filesystem `md.edge_weight` values as weak deterministic tie-break signals after lexical ranking; authored link evidence remains separate.
-
-MCP `memory_search` defaults to deterministic local lexical retrieval. Semantic or vector retrieval is opt-in with `retrieval_mode: "semantic"` or `"vector"` and currently requires an explicitly configured local vector backend. When that backend is not configured, cupld returns a stable `unconfigured` result with no items and `network_used: false`; it does not generate embeddings, contact model providers, download models, call external services, or silently fall back to lexical search for explicit semantic requests.
-
-Maintain markdown-derived memory state:
-
-```bash
-cupld memory check --db default
-cupld memory check --db default --strict --output json
-cupld memory find-stale --db default --root notes --output table
-cupld memory find-orphans --db default --output ndjson
-cupld memory reindex --db default --output json
-```
-
-Use `cupld check --db default` for storage integrity before relying on a database. Use `cupld memory check` for markdown-derived memory diagnostics: it reports markdown freshness, metadata, duplicate markdown paths and edges, schema index readiness, stale items, orphans, and ambiguous markdown aliases. `memory find-stale` lists markdown documents whose persisted state no longer matches the filesystem, `memory find-orphans` lists current markdown documents without markdown or native graph connectivity, and `memory reindex` inspects existing schema index definitions and reports their status. These memory commands are diagnostic: use `cupld sync markdown --db default` or `cupld sync markdown --db default --root notes` to refresh markdown-derived DB state after editing notes.
-
-For large MarkdownDocument sets, operators can explicitly add optional search indexes with existing query syntax:
-
-```bash
-cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.body\`) KIND FULLTEXT"
-cupld query --db default "CREATE INDEX ON :MarkdownDocument(\`md.tags\`) KIND LIST"
-cupld query --db default "SHOW INDEXES ON :MarkdownDocument"
-cupld query --db default "EXPLAIN MATCH (d:MarkdownDocument) WHERE d.\`md.body\` CONTAINS 'term' RETURN d.\`src.path\`"
-```
-
-Markdown root resolution for commands that accept `--root` is: explicit `--root`, `.cupld/config.toml`, the DB root saved by `cupld source set-root`, then `./.cupld/data`. Relative roots are resolved against the workspace package root. `memory find-orphans` and `memory reindex` do not need a markdown root and report `root: null` in machine output.
-
-Maintenance reports use stable statuses: `pass` means no problem was found, `warn` means the command found stale or suspicious state but completed successfully, and `fail` is reserved for hard failures. `memory check --strict` keeps warning details in the report but exits with code 2 when the aggregate status is `warn`; without `--strict`, warnings exit successfully. Table output is the default. `--output json` emits one report envelope with `ok`, `command`, `status`, `db_path`, `root`, `summary`, `checks`, and `items`; `--output ndjson` emits one `memory_meta` line followed by `memory_check` and `memory_item` lines.
-
-`cupld memory repair` and `cupld memory citation-audit` are intentionally deferred in this implementation round.
-
-Install into a provider-specific skills directory or a custom path:
-
-```bash
-cupld install --target codex --scope home --db default
-cupld install --target claude --scope cwd --db default --root notes
-cupld install --target opencode --scope home --db default
-cupld install --path /custom/skills --db default --yes
-```
-
-The interactive installer asks for a skill location, DB path, and markdown root. Interactive REPL launches can offer the same bootstrap flow when no install is tracked, and can prompt to refresh when the bundled skill becomes stale.
-
-`install` records each skill path with its DB path, markdown root, bundle revision, and skill signature in the user config `install-state.toml`. That state lets REPL startup reuse saved paths for refresh prompts. If the state file is corrupt or points at the wrong install, rerun `cupld install ...` with the desired target/path, DB, and root to rewrite it.
-
-Repo-local package settings live in `.cupld/config.toml`. `install` and markdown-aware commands use it as the workspace default for DB path and markdown root.
-Use `[markdown] include_fs_graph = true` to enable filesystem graph sync for `cupld sync markdown` and MCP `memory_sync` by default.
+The bundled markdown connector, MCP memory tools, maintenance commands, and `cupld-md-memory` skill remain supported. Use the [memory guide](docs/memory.md) for setup, sync, search, and harness configuration. Memory is a specialized workflow on the database; a separate first-party extension is a future packaging step.
 
 ## Development
 
@@ -215,12 +142,10 @@ cargo run --locked -- eval memory --case search_relevance --output table
 cargo run --locked -- eval memory --case search_large_vault --output table
 ```
 
-The large-vault fixture generates 1,000 synthetic Markdown documents inside the eval sandbox, plus targeted search documents. On the development workspace used for this change, both search fixtures completed in under 2 seconds total, below the 30 second added-runtime budget.
-
 ## Documentation
 
-- Docs index: [`docs/README.md`](./docs/README.md)
-- Agent guide: [`docs/agents/README.md`](./docs/agents/README.md) for the full current CLI and automation contract
-- Viewer notes: [`docs/agents/visualise.md`](./docs/agents/visualise.md)
-- Security policy: [`SECURITY.md`](./SECURITY.md)
-- Code of conduct: [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
+- [Docs index](docs/README.md)
+- [Agent CLI guide](docs/agents/README.md)
+- [Markdown memory](docs/memory.md)
+- [Viewer notes](docs/agents/visualise.md)
+- [Security policy](SECURITY.md) and [code of conduct](CODE_OF_CONDUCT.md)

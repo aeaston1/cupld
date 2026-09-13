@@ -1753,7 +1753,8 @@ fn maybe_suggest_release_upgrade(command: &CliCommand) {
     if release_upgrade_check_disabled() {
         return;
     }
-    let Some(db_path) = command.db_path_for_upgrade_hint() else {
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let Some(db_path) = command.db_path_for_upgrade_hint(interactive) else {
         return;
     };
     let Some(latest) = latest_release_for_startup_hint() else {
@@ -1772,37 +1773,12 @@ fn maybe_suggest_release_upgrade(command: &CliCommand) {
 }
 
 impl CliCommand {
-    fn db_path_for_upgrade_hint(&self) -> Option<&Path> {
+    fn db_path_for_upgrade_hint(&self, interactive: bool) -> Option<&Path> {
+        // Scripted commands must not fetch releases or write a startup cache.
+        // Keep the optional hint on the interactive, file-backed REPL only.
         match self {
-            Self::ReplWithDb(path)
-            | Self::Visualise { db_path: path, .. }
-            | Self::Query { db_path: path, .. }
-            | Self::Schema { db_path: path }
-            | Self::Compact { db_path: path }
-            | Self::Check { db_path: path }
-            | Self::Upgrade { db_path: path }
-            | Self::SyncMarkdown { db_path: path, .. }
-            | Self::SourceSetRoot { db_path: path, .. } => Some(path),
-            Self::McpServe { .. } => None,
-            Self::Context { request, .. } => Some(&request.db_path),
-            Self::Memory(command) => command.db_path_for_upgrade_hint(),
-            Self::Help
-            | Self::Version
-            | Self::ReplMemory
-            | Self::EvalMemory(_)
-            | Self::Install(_) => None,
-        }
-    }
-}
-
-impl MemoryCommand {
-    fn db_path_for_upgrade_hint(&self) -> Option<&Path> {
-        match self {
-            Self::Check { db_path, .. }
-            | Self::FindStale { db_path, .. }
-            | Self::FindOrphans { db_path, .. }
-            | Self::Reindex { db_path, .. } => Some(db_path),
-            Self::Deferred { .. } => None,
+            Self::ReplWithDb(path) if interactive => Some(path),
+            _ => None,
         }
     }
 }
@@ -2853,6 +2829,27 @@ mod tests {
             std::process::id(),
             timestamp
         ))
+    }
+
+    #[test]
+    fn upgrade_hints_are_limited_to_interactive_file_backed_repls() {
+        let repl = CliCommand::ReplWithDb(PathBuf::from("graph.cupld"));
+        assert_eq!(
+            repl.db_path_for_upgrade_hint(true),
+            Some(std::path::Path::new("graph.cupld"))
+        );
+        assert_eq!(repl.db_path_for_upgrade_hint(false), None);
+        for args in [
+            vec!["schema", "--db", "graph.cupld"],
+            vec!["query", "--db", "graph.cupld", "RETURN 1"],
+            vec!["--visualise", "--db", "graph.cupld"],
+            vec!["mcp", "serve", "--db", "graph.cupld"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let command = parse_cli_command(&args).unwrap();
+            assert_eq!(command.db_path_for_upgrade_hint(true), None);
+            assert_eq!(command.db_path_for_upgrade_hint(false), None);
+        }
     }
 
     #[test]

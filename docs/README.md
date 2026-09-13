@@ -1,24 +1,24 @@
 # cupld Docs
 
-This directory contains the public documentation for `cupld`.
+cupld is an in-process graph database with a CLI for people and their existing agents, plus an embedded Rust API. It has zero third-party crate dependencies. Markdown-backed agent memory is a supported specialized workflow.
 
 ## Start Here
 
-- Agents should start with [`agents/README.md`](./agents/README.md).
-- [`agents/README.md`](./agents/README.md) is also the canonical automation-contract reference for machine output and agent workflows.
-- Use this file as the public docs map.
-- The repo root [`README.md`](../README.md) is the short project overview.
-- Treat `internal/` docs as historical planning and status material, not as the current CLI contract.
+1. Follow the [project quickstart](../README.md#quickstart) to create and query a graph. The [Rust example](../README.md#embed-in-rust) uses the same database library in process.
+2. Use the [agent CLI guide](agents/README.md) for schema discovery, queries, writes, transactions, bounded context, and machine output.
+3. Read the [persistence contract](agents/README.md#database-persistence) before relying on concurrent writes or format migration.
 
-## Structure
+## Reference And Workflows
 
-- [`agents/`](./agents/): CLI and viewer usage docs
+- [Agent CLI guide](agents/README.md): canonical contract for shipped CLI and automation behavior
+- [Markdown memory](memory.md): supported memory setup, sync, MCP, and maintenance
+- [Viewer](agents/visualise.md): interactive graph exploration
+- [Core audit](core-audit.md): current capabilities, gaps, and database roadmap
+- [Core benchmarks](core-benchmarks.md): reproducible performance and resource measurements
+- [Development roadmap](backlog.md): prioritized core milestones, retained memory work, and resolved reliability issues
 
-## Reading Order
-
-1. [`agents/README.md`](./agents/README.md)
-2. [`agents/visualise.md`](./agents/visualise.md)
+The resource goal is bounded RAM and eventual larger-than-RAM graph operation. The current engine loads its graph into memory; response budgets are not an execution-memory guarantee. Treat `internal/` notes as historical planning material and use the public references for current behavior.
 
 ## Authoring Rule
 
-Keep public user-facing documentation under this tree. The root README should stay brief and point here.
+Keep public user-facing documentation under this tree. The root README should stay brief and point here. Label planned capabilities explicitly, and keep the general database contract separate from specialized memory semantics.

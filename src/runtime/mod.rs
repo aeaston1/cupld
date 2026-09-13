@@ -341,7 +341,8 @@ impl Session {
         statement: &Statement,
         params: &BTreeMap<String, Value>,
     ) -> Result<QueryResult, ExecutionError> {
-        if statement.is_mutating() || statement.is_transaction_control() {
+        let is_mutating = statement.is_mutating();
+        if is_mutating || statement.is_transaction_control() {
             self.require_certain_persistence()?;
         }
         if self.failed_transaction && !statement.allowed_in_failed_transaction() {
@@ -360,12 +361,21 @@ impl Session {
             Statement::ReleaseSavepoint(name) => self.release_savepoint(name),
             Statement::Explain(inner) => self.explain(inner),
             Statement::Show(kind) => self.show(kind),
+            Statement::Query(query) if !is_mutating => {
+                // Read evaluation only borrows the session, so a rollback copy of
+                // the graph is unnecessary even when evaluation fails.
+                let result = self.execute_read_query(query, params);
+                if result.is_err() && self.transaction_base.is_some() {
+                    self.failed_transaction = true;
+                }
+                result
+            }
             _ => {
                 let snapshot = self.engine.clone();
                 let was_dirty = self.dirty;
                 let result = self.execute_data_statement(statement, params);
                 match (self.transaction_base.is_some(), result) {
-                    (_, Ok(result)) if statement.is_mutating() => {
+                    (_, Ok(result)) if is_mutating => {
                         if self.transaction_base.is_some() {
                             self.dirty = true;
                             Ok(result)
@@ -685,20 +695,7 @@ impl Session {
         query: &Query,
         params: &BTreeMap<String, Value>,
     ) -> Result<QueryResult, ExecutionError> {
-        let match_plan = self.plan_match(query, params)?;
-        let mut rows = if let Some(pattern) = &query.match_clause {
-            self.match_pattern_rows(vec![Row::default()], pattern, params, match_plan.as_ref())?
-        } else {
-            vec![Row::default()]
-        };
-
-        if let Some(predicate) = &query.where_clause {
-            rows = self.filter_rows(rows, predicate, params)?;
-        }
-
-        for with_clause in &query.with_clauses {
-            rows = self.apply_with_clause_rows(rows, with_clause, params)?;
-        }
+        let mut rows = self.query_input_rows(query, params)?;
 
         if let Some(pattern) = &query.merge_clause {
             rows = self.merge_pattern_rows(rows, pattern, params)?;
@@ -717,7 +714,48 @@ impl Session {
             self.apply_delete_clause(&rows, &query.delete_clause)?;
         }
 
-        rows = self.apply_order_and_limit(rows, &query.order_by, query.limit, params);
+        self.query_result_rows(rows, query, params)
+    }
+
+    fn execute_read_query(
+        &self,
+        query: &Query,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<QueryResult, ExecutionError> {
+        let rows = self.query_input_rows(query, params)?;
+        self.query_result_rows(rows, query, params)
+    }
+
+    fn query_input_rows(
+        &self,
+        query: &Query,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Row>, ExecutionError> {
+        let match_plan = self.plan_match(query, params)?;
+        let mut rows = if let Some(pattern) = &query.match_clause {
+            self.match_pattern_rows(vec![Row::default()], pattern, params, match_plan.as_ref())?
+        } else {
+            vec![Row::default()]
+        };
+
+        if let Some(predicate) = &query.where_clause {
+            rows = self.filter_rows(rows, predicate, params)?;
+        }
+
+        for with_clause in &query.with_clauses {
+            rows = self.apply_with_clause_rows(rows, with_clause, params)?;
+        }
+
+        Ok(rows)
+    }
+
+    fn query_result_rows(
+        &self,
+        rows: Vec<Row>,
+        query: &Query,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<QueryResult, ExecutionError> {
+        let rows = self.apply_order_and_limit(rows, &query.order_by, query.limit, params);
 
         if query.return_all {
             return self.return_all_rows(rows);
@@ -2596,7 +2634,14 @@ impl Statement {
                     || !query.remove_clause.is_empty()
                     || !query.delete_clause.is_empty()
             }
-            _ => false,
+            Self::Begin
+            | Self::Commit
+            | Self::Rollback
+            | Self::Savepoint(_)
+            | Self::RollbackToSavepoint(_)
+            | Self::ReleaseSavepoint(_)
+            | Self::Show(_)
+            | Self::Explain(_) => false,
         }
     }
 }

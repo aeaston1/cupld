@@ -34,6 +34,13 @@ jobs:
           CARGO_NET_OFFLINE: "true"
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Core graph benchmark correctness
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          cargo test --locked --example core_bench
+          python3 scripts/benchmark_core.py --smoke --output "$RUNNER_TEMP/cupld-core-smoke.json"
+
       - name: Default memory evals
         env:
           CARGO_NET_OFFLINE: "true"

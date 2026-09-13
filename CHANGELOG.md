@@ -2,6 +2,14 @@
 
 All notable changes to `cupld` will be documented in this file.
 
+## [Unreleased]
+
+- Read queries avoid a redundant graph copy while preserving transaction failure and rollback behavior.
+- Scripted database commands skip release checks and release-cache writes; optional hints remain in interactive file-backed REPL sessions.
+- Generic graph CLI and embedded Rust workflows lead onboarding, with existing markdown memory workflows retained.
+- Added reproducible graph resource benchmarks, recorded baseline comparisons, and a CI correctness smoke check.
+- Documented current core capabilities and the staged roadmap for CLI completeness, graph interchange, bounded-RAM execution, and future memory extensions.
+
 ## [0.4.0] - 2026-05-13
 
 - Seeded `cupld context`: path/node seeds, BFS traversal, budgets, and table/JSON/NDJSON output. (`c9a48f0`, 2026-05-13; `3282c5e`, 2026-05-13; `455f657`, 2026-05-13; `5d4260f`, 2026-05-13; `c2d4cd3`, 2026-05-13; `f864016`, 2026-05-13)
