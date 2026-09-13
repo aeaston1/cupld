@@ -92,6 +92,115 @@ fn run_cli_in_dir(args: &[&str], dir: &Path) -> std::process::Output {
     run_cli_with_input_in_dir(args, "", Some(dir))
 }
 
+fn assert_structured_query_result(
+    output: std::process::Output,
+    format: &str,
+    max_rows: i64,
+    expected_result: &str,
+) {
+    assert!(
+        output.status.success(),
+        "{format} query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let events = stdout
+        .lines()
+        .map(|line| json::parse(line).unwrap())
+        .collect::<Vec<_>>();
+    let meta = &events[0];
+    assert_eq!(
+        meta.get("ok").and_then(json::JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        meta.get("command").and_then(json::JsonValue::as_str),
+        Some("query")
+    );
+    let policy = meta.get("policy").unwrap();
+    assert_eq!(
+        policy
+            .get("execution_mode")
+            .and_then(json::JsonValue::as_str),
+        Some("automation_read_write")
+    );
+    assert_eq!(
+        policy.get("max_rows").and_then(json::JsonValue::as_i64),
+        Some(max_rows)
+    );
+
+    let (result, rows) = match format {
+        "json" => {
+            assert_eq!(events.len(), 1);
+            let results = meta
+                .get("results")
+                .and_then(json::JsonValue::as_array)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            let result = &results[0];
+            let rows = result
+                .get("rows")
+                .and_then(json::JsonValue::as_array)
+                .unwrap()
+                .to_vec();
+            (result, rows)
+        }
+        "ndjson" => {
+            assert_eq!(
+                meta.get("kind").and_then(json::JsonValue::as_str),
+                Some("query_meta")
+            );
+            assert_eq!(
+                meta.get("result_count").and_then(json::JsonValue::as_i64),
+                Some(1)
+            );
+            let result = &events[1];
+            assert_eq!(
+                result.get("kind").and_then(json::JsonValue::as_str),
+                Some("query_result")
+            );
+            assert_eq!(
+                result.get("result_index").and_then(json::JsonValue::as_i64),
+                Some(0)
+            );
+            let rows = events[2..]
+                .iter()
+                .enumerate()
+                .map(|(index, event)| {
+                    assert_eq!(
+                        event.get("kind").and_then(json::JsonValue::as_str),
+                        Some("query_row")
+                    );
+                    assert_eq!(
+                        event.get("result_index").and_then(json::JsonValue::as_i64),
+                        Some(0)
+                    );
+                    assert_eq!(
+                        event.get("row_index").and_then(json::JsonValue::as_i64),
+                        Some(index as i64)
+                    );
+                    event.get("row").unwrap().clone()
+                })
+                .collect::<Vec<_>>();
+            (result, rows)
+        }
+        other => panic!("unsupported test output format: {other}"),
+    };
+    let expected = json::parse(expected_result).unwrap();
+    for field in ["columns", "row_count", "truncated"] {
+        assert_eq!(result.get(field), expected.get(field), "{format} {field}");
+    }
+    assert_eq!(
+        rows.as_slice(),
+        expected
+            .get("rows")
+            .and_then(json::JsonValue::as_array)
+            .unwrap(),
+        "{format} rows"
+    );
+}
+
 fn write_memory_eval_fixture(root: &Path, name: &str, spec: &str) {
     let fixture = root.join(name);
     fs::create_dir_all(fixture.join("markdown")).unwrap();
@@ -378,6 +487,130 @@ fn cli_query_json_outputs_machine_envelope() {
         rows[1].get("col_1").and_then(json::JsonValue::as_str),
         Some("Alan")
     );
+}
+
+#[test]
+fn cli_query_structured_aggregate_limit_and_projected_alias_ordering() {
+    let db = TestDb::new("cli_query_projection_order");
+    let mut session = db.open();
+    run(&mut session, "CREATE (:Score {score: 2})");
+    run(&mut session, "CREATE (:Score {score: 1})");
+    drop(session);
+
+    let cases = [
+        (
+            "MATCH (n:Score) RETURN count(n) AS total LIMIT 1",
+            r#"{"columns":["total"],"row_count":1,"truncated":false,"rows":[{"total":2}]}"#,
+        ),
+        (
+            "MATCH (n:Score) RETURN n.score AS score ORDER BY score",
+            r#"{"columns":["score"],"row_count":2,"truncated":false,"rows":[{"score":1},{"score":2}]}"#,
+        ),
+    ];
+    for format in ["json", "ndjson"] {
+        for (query, expected) in cases {
+            let output = run_cli(&[
+                "query",
+                "--db",
+                db.path().to_str().unwrap(),
+                "--output",
+                format,
+                "--max-rows",
+                "10",
+                query,
+            ]);
+            assert_structured_query_result(output, format, 10, expected);
+        }
+    }
+}
+
+#[test]
+fn cli_query_structured_max_rows_caps_completed_query_results() {
+    let db = TestDb::new("cli_query_post_execution_cap");
+    let mut session = db.open();
+    run(&mut session, "CREATE (:Score {score: 2})");
+    run(&mut session, "CREATE (:Score {score: 1})");
+    run(&mut session, "CREATE (:Score {score: 2})");
+    drop(session);
+
+    let cases = [
+        (
+            "MATCH (n:Score) RETURN count(n) AS total LIMIT 1",
+            r#"{"columns":["total"],"row_count":1,"truncated":false,"rows":[{"total":3}]}"#,
+        ),
+        (
+            "MATCH (n:Score) RETURN n.score AS score ORDER BY score",
+            r#"{"columns":["score"],"row_count":1,"truncated":true,"rows":[{"score":1}]}"#,
+        ),
+        (
+            "MATCH (n:Score) RETURN n.score AS score ORDER BY score LIMIT 1",
+            r#"{"columns":["score"],"row_count":1,"truncated":false,"rows":[{"score":1}]}"#,
+        ),
+        (
+            "MATCH (n:Score) RETURN n.score AS score, count(n) AS total ORDER BY total DESC",
+            r#"{"columns":["score","total"],"row_count":1,"truncated":true,"rows":[{"score":2,"total":2}]}"#,
+        ),
+    ];
+    for format in ["json", "ndjson"] {
+        for (query, expected) in cases {
+            let output = run_cli(&[
+                "query",
+                "--db",
+                db.path().to_str().unwrap(),
+                "--output",
+                format,
+                "--max-rows",
+                "1",
+                query,
+            ]);
+            assert_structured_query_result(output, format, 1, expected);
+        }
+    }
+}
+
+#[test]
+fn cli_query_structured_invalid_ordering_uses_error_envelope() {
+    let db = TestDb::new("cli_query_invalid_ordering");
+    let mut session = db.open();
+    run(&mut session, "CREATE (:Score {score: 2})");
+    run(&mut session, "CREATE (:Score {score: 1})");
+    drop(session);
+
+    for format in ["json", "ndjson"] {
+        for query in [
+            "MATCH (n:Score) RETURN n.score AS score ORDER BY missing",
+            "MATCH (n:Score {score: 1}) RETURN n.score AS score ORDER BY missing",
+            "MATCH (n:Score) WITH n.score AS score ORDER BY missing RETURN score",
+            "MATCH (n:Score {score: 1}) WITH n.score AS score ORDER BY missing RETURN score",
+        ] {
+            let output = run_cli(&[
+                "query",
+                "--db",
+                db.path().to_str().unwrap(),
+                "--output",
+                format,
+                query,
+            ]);
+            assert!(!output.status.success(), "{format}: {query}");
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(stderr.lines().count(), 1);
+            let parsed = json::parse(&stderr).unwrap();
+            assert_eq!(
+                parsed.get("ok").and_then(json::JsonValue::as_bool),
+                Some(false)
+            );
+            let error = parsed.get("error").unwrap();
+            assert_eq!(
+                error.get("code").and_then(json::JsonValue::as_str),
+                Some("unknown_variable")
+            );
+            assert_eq!(
+                error.get("message").and_then(json::JsonValue::as_str),
+                Some("unknown variable missing")
+            );
+        }
+    }
 }
 
 #[test]

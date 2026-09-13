@@ -344,6 +344,12 @@ Current behavior notes:
 - `CONTAINS` supports strings, list membership, and map-key checks.
 - Variable-length traversal must be bounded.
 - `LIMIT` accepts a positive integer literal or parameter.
+- Final `RETURN` projection and aggregation run before `ORDER BY` and `LIMIT`. Aggregates consume every input row; the final limit restricts output rows.
+- Ordinary `RETURN` ordering can use source expressions such as `n.age` and explicit output aliases. Aliases shadow same-named source variables during ordering, after all return expressions have evaluated against the input row.
+- Aggregate ordering uses output aliases or repeated projected grouping/aggregate expressions, including inside larger expressions. A repeated projected expression refers to its computed value as a whole; a direct alias reference takes precedence over a same-named grouping variable. Other source variables are unavailable after grouping, and unprojected aggregate expressions are rejected.
+- Generated `col_N` labels are output column names, not implicit `RETURN` aliases. Use an explicit `AS` alias for ordering by a projected value. `WITH` retains its existing projected scope and column naming.
+- Sort keys are evaluated before limiting, including for a single output row. Invalid sort expressions return execution errors rather than silently leaving rows unsorted. A projection or sort failure after a write rolls back that statement; in an explicit transaction it marks the transaction failed until rollback/savepoint recovery.
+- A final `RETURN ... LIMIT` does not restrict preceding writes. Use an earlier `WITH ... LIMIT` to restrict which input rows reach a write.
 - Parser and runtime failures return stable machine-readable error codes. Invalid regex patterns return `regex_compile_error`.
 
 ## Schema And Index Surface

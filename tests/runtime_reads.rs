@@ -51,6 +51,10 @@ fn reads_preserve_graph_dirty_state_and_persistence() {
                 "unknown_variable",
             ),
             ("MATCH (n) RETURN 1 / 0", "division_by_zero"),
+            (
+                "MATCH (n) RETURN n.name ORDER BY missing",
+                "unknown_variable",
+            ),
         ] {
             let error = session.execute_script(query, &BTreeMap::new()).unwrap_err();
             assert_eq!(error.code(), code);
@@ -72,68 +76,73 @@ fn reads_preserve_graph_dirty_state_and_persistence() {
 
 #[test]
 fn failed_transactional_read_preserves_pending_writes_and_savepoint_recovery() {
-    let db = TestDb::new("read_failure_savepoint");
-    let mut session = db.open();
-    run(&mut session, "CREATE (n:Person {name: 'Ada'})");
-    let snapshot = session.engine().snapshot();
-    let bytes_before = fs::read(db.path()).unwrap();
+    for failing_query in [
+        "MATCH (n) RETURN 1 / 0",
+        "MATCH (n) RETURN n.name ORDER BY n.name, 1 / 0",
+    ] {
+        let db = TestDb::new("read_failure_savepoint");
+        let mut session = db.open();
+        run(&mut session, "CREATE (n:Person {name: 'Ada'})");
+        let snapshot = session.engine().snapshot();
+        let bytes_before = fs::read(db.path()).unwrap();
 
-    run(&mut session, "BEGIN");
-    run(&mut session, "CREATE (n:Person {name: 'Grace'})");
-    run(&mut session, "SAVEPOINT after_create");
-    run(
-        &mut session,
-        "MATCH (n:Person {name: 'Ada'}) SET n.name = 'Changed'",
-    );
-    let pending = session.engine().nodes().cloned().collect::<Vec<_>>();
-    let stats = session.engine().stats();
-    assert_eq!(run(&mut session, "MATCH (n) RETURN n").rows.len(), 2);
-
-    let error = session
-        .execute_script("MATCH (n) RETURN 1 / 0", &BTreeMap::new())
-        .unwrap_err();
-    assert_eq!(error.code(), "division_by_zero");
-    assert_eq!(
-        session.engine().nodes().cloned().collect::<Vec<_>>(),
-        pending
-    );
-    assert_eq!(session.engine().stats(), stats);
-    assert!(session.is_dirty());
-    let info = session.transaction_info();
-    assert!(info.active);
-    assert!(info.failed);
-    assert_eq!(info.savepoints, 1);
-    assert_eq!(info.last_tx_id, snapshot.tx_id().get());
-    assert_eq!(fs::read(db.path()).unwrap(), bytes_before);
-
-    for query in ["MATCH (n) RETURN n", "CREATE (n)", "COMMIT"] {
-        assert_eq!(
-            session
-                .execute_script(query, &BTreeMap::new())
-                .unwrap_err()
-                .code(),
-            "transaction_failed"
+        run(&mut session, "BEGIN");
+        run(&mut session, "CREATE (n:Person {name: 'Grace'})");
+        run(&mut session, "SAVEPOINT after_create");
+        run(
+            &mut session,
+            "MATCH (n:Person {name: 'Ada'}) SET n.name = 'Changed'",
         );
+        let pending = session.engine().nodes().cloned().collect::<Vec<_>>();
+        let stats = session.engine().stats();
+        assert_eq!(run(&mut session, "MATCH (n) RETURN n").rows.len(), 2);
+
+        let error = session
+            .execute_script(failing_query, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code(), "division_by_zero");
+        assert_eq!(
+            session.engine().nodes().cloned().collect::<Vec<_>>(),
+            pending
+        );
+        assert_eq!(session.engine().stats(), stats);
+        assert!(session.is_dirty());
+        let info = session.transaction_info();
+        assert!(info.active);
+        assert!(info.failed);
+        assert_eq!(info.savepoints, 1);
+        assert_eq!(info.last_tx_id, snapshot.tx_id().get());
+        assert_eq!(fs::read(db.path()).unwrap(), bytes_before);
+
+        for query in ["MATCH (n) RETURN n", "CREATE (n)", "COMMIT"] {
+            assert_eq!(
+                session
+                    .execute_script(query, &BTreeMap::new())
+                    .unwrap_err()
+                    .code(),
+                "transaction_failed"
+            );
+        }
+        run(&mut session, "ROLLBACK TO SAVEPOINT after_create");
+        assert!(!session.transaction_info().failed);
+        assert!(session.is_dirty());
+        assert_eq!(
+            run(&mut session, "MATCH (n) RETURN n.name ORDER BY n.name").rows,
+            vec![
+                vec![RuntimeValue::String("Ada".to_owned())],
+                vec![RuntimeValue::String("Grace".to_owned())],
+            ]
+        );
+        run(&mut session, "COMMIT");
+        assert!(!session.is_dirty());
+        assert!(!session.transaction_info().active);
+        assert_eq!(
+            session.transaction_info().last_tx_id,
+            snapshot.tx_id().get() + 1
+        );
+        assert_eq!(snapshot.nodes().count(), 1);
+        assert_eq!(run(&mut db.open(), "MATCH (n) RETURN n").rows.len(), 2);
     }
-    run(&mut session, "ROLLBACK TO SAVEPOINT after_create");
-    assert!(!session.transaction_info().failed);
-    assert!(session.is_dirty());
-    assert_eq!(
-        run(&mut session, "MATCH (n) RETURN n.name ORDER BY n.name").rows,
-        vec![
-            vec![RuntimeValue::String("Ada".to_owned())],
-            vec![RuntimeValue::String("Grace".to_owned())],
-        ]
-    );
-    run(&mut session, "COMMIT");
-    assert!(!session.is_dirty());
-    assert!(!session.transaction_info().active);
-    assert_eq!(
-        session.transaction_info().last_tx_id,
-        snapshot.tx_id().get() + 1
-    );
-    assert_eq!(snapshot.nodes().count(), 1);
-    assert_eq!(run(&mut db.open(), "MATCH (n) RETURN n").rows.len(), 2);
 }
 
 #[test]
