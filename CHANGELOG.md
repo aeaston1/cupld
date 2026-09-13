@@ -4,6 +4,9 @@ All notable changes to `cupld` will be documented in this file.
 
 ## [Unreleased]
 
+- Apply final query LIMIT after projection and aggregation so aggregate values include all input rows.
+- Sort RETURN results by explicit aliases and projected aggregate/grouping expressions while preserving ordinary source-expression ordering.
+- Return execution errors for invalid ORDER BY expressions, including single-row results, with existing statement rollback and transaction recovery behavior.
 - Read queries avoid a redundant graph copy while preserving transaction failure and rollback behavior.
 - Scripted database commands skip release checks and release-cache writes; optional hints remain in interactive file-backed REPL sessions.
 - Generic graph CLI and embedded Rust workflows lead onboarding, with existing markdown memory workflows retained.

@@ -554,6 +554,582 @@ fn with_and_aggregates_share_the_projection_pipeline() {
 }
 
 #[test]
+fn query_projection_global_aggregates_consume_all_rows_before_limit() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let result = run(
+        &mut session,
+        "MATCH (n:Person)
+         RETURN count(*) AS rows, count(n) AS nodes, count(n.email) AS emails,
+                sum(n.age) AS sum, avg(n.age) AS average,
+                min(n.age) AS youngest, max(n.age) AS oldest, collect(n.name) AS names
+         LIMIT 1",
+    );
+    assert_eq!(
+        result.columns,
+        vec![
+            "rows", "nodes", "emails", "sum", "average", "youngest", "oldest", "names"
+        ]
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::Int(4),
+            RuntimeValue::Int(4),
+            RuntimeValue::Int(3),
+            RuntimeValue::Int(143),
+            RuntimeValue::Float(35.75),
+            RuntimeValue::Int(29),
+            RuntimeValue::Int(41),
+            RuntimeValue::List(
+                ["Ada", "Grace", "Alan", "Bob"]
+                    .into_iter()
+                    .map(|name| RuntimeValue::String(name.to_owned()))
+                    .collect()
+            ),
+        ]]
+    );
+}
+
+#[test]
+fn query_projection_alias_order_precedes_limit() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let result = run(
+        &mut session,
+        "MATCH (n:Person) RETURN n.age AS age ORDER BY age LIMIT 2",
+    );
+    assert_eq!(result.columns, vec!["age"]);
+    assert_eq!(
+        result.rows,
+        vec![vec![RuntimeValue::Int(29)], vec![RuntimeValue::Int(36)]]
+    );
+}
+
+#[test]
+fn query_projection_grouped_aggregates_are_sorted_and_limited_after_grouping() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let result = run(
+        &mut session,
+        "MATCH (n:Person)
+         RETURN n.age >= 36 AS older, count(*) AS total, sum(n.age) AS ages
+         ORDER BY total DESC, older ASC LIMIT 1",
+    );
+    assert_eq!(result.columns, vec!["older", "total", "ages"]);
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::Bool(true),
+            RuntimeValue::Int(3),
+            RuntimeValue::Int(114),
+        ]]
+    );
+}
+
+#[test]
+fn query_projection_empty_aggregates_retain_existing_values_with_limit() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let result = run(
+        &mut session,
+        "MATCH (n:Person) WHERE n.age < 0
+         RETURN count(*) AS rows, count(n) AS nodes, count(n.age) AS ages,
+                sum(n.age) AS sum, avg(n.age) AS average,
+                min(n.age) AS youngest, max(n.age) AS oldest, collect(n.name) AS names
+         ORDER BY rows LIMIT 1",
+    );
+    assert_eq!(
+        result.rows,
+        vec![vec![
+            RuntimeValue::Int(0),
+            RuntimeValue::Int(0),
+            RuntimeValue::Int(0),
+            RuntimeValue::Null,
+            RuntimeValue::Null,
+            RuntimeValue::Null,
+            RuntimeValue::Null,
+            RuntimeValue::List(Vec::new()),
+        ]]
+    );
+    let grouped = run(
+        &mut session,
+        "MATCH (n:Person) WHERE n.age < 0
+         RETURN n.name AS name, count(*) AS total ORDER BY total LIMIT 1",
+    );
+    assert_eq!(grouped.columns, vec!["name", "total"]);
+    assert!(grouped.rows.is_empty());
+    let scalar = run(
+        &mut session,
+        "MATCH (n:Person) WHERE n.age < 0 RETURN n.name AS name ORDER BY name LIMIT 1",
+    );
+    assert_eq!(scalar.columns, vec!["name"]);
+    assert!(scalar.rows.is_empty());
+}
+
+#[test]
+fn query_projection_alias_sort_preserves_direction_ties_nulls_and_multiple_keys() {
+    let mut session = Session::new_in_memory();
+    for query in [
+        "CREATE (:Item {value: 3, tag: 'third'})",
+        "CREATE (:Item {value: 2, tag: 'second'})",
+        "CREATE (:Item {value: 2, tag: 'equal'})",
+        "CREATE (:Item {value: 1, tag: 'first'})",
+        "CREATE (:Item {tag: 'missing'})",
+    ] {
+        run(&mut session, query);
+    }
+
+    for (order, expected) in [
+        (
+            "value ASC",
+            vec!["first", "second", "equal", "third", "missing"],
+        ),
+        (
+            "value DESC",
+            vec!["missing", "third", "second", "equal", "first"],
+        ),
+        (
+            "value ASC, tag ASC",
+            vec!["first", "equal", "second", "third", "missing"],
+        ),
+    ] {
+        let result = run(
+            &mut session,
+            &format!("MATCH (n:Item) RETURN n.value AS value, n.tag AS tag ORDER BY {order}"),
+        );
+        let tags = result
+            .rows
+            .iter()
+            .map(|row| row[1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tags,
+            expected
+                .into_iter()
+                .map(|tag| RuntimeValue::String(tag.to_owned()))
+                .collect::<Vec<_>>(),
+            "ORDER BY {order}"
+        );
+    }
+}
+
+#[test]
+fn query_projection_source_expressions_remain_available_to_scalar_ordering() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let mixed = run(
+        &mut session,
+        "MATCH (n:Person) RETURN n.name, n.age AS age ORDER BY n.age DESC LIMIT 2",
+    );
+    assert_eq!(mixed.columns, vec!["col_1", "age"]);
+    assert_eq!(
+        mixed.rows,
+        vec![
+            vec![
+                RuntimeValue::String("Alan".to_owned()),
+                RuntimeValue::Int(41)
+            ],
+            vec![
+                RuntimeValue::String("Grace".to_owned()),
+                RuntimeValue::Int(37)
+            ],
+        ]
+    );
+    let hidden_sort_key = run(
+        &mut session,
+        "MATCH (n:Person) RETURN n.name AS name ORDER BY n.age LIMIT 2",
+    );
+    assert_eq!(
+        hidden_sort_key.rows,
+        vec![
+            vec![RuntimeValue::String("Bob".to_owned())],
+            vec![RuntimeValue::String("Ada".to_owned())],
+        ]
+    );
+}
+
+#[test]
+fn query_projection_aliases_shadow_input_only_during_ordering() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let result = run(
+        &mut session,
+        "MATCH (n:Person) RETURN -n.age AS n, n.name AS name ORDER BY n LIMIT 2",
+    );
+    assert_eq!(result.columns, vec!["n", "name"]);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                RuntimeValue::Int(-41),
+                RuntimeValue::String("Alan".to_owned())
+            ],
+            vec![
+                RuntimeValue::Int(-37),
+                RuntimeValue::String("Grace".to_owned())
+            ],
+        ]
+    );
+}
+
+#[test]
+fn query_projection_return_star_keeps_source_columns_and_ordering() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let result = run(
+        &mut session,
+        "MATCH (n:Person) WITH n.name AS name, n.age AS age
+         RETURN * ORDER BY age DESC LIMIT 2",
+    );
+    assert_eq!(result.columns, vec!["age", "name"]);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![
+                RuntimeValue::Int(41),
+                RuntimeValue::String("Alan".to_owned())
+            ],
+            vec![
+                RuntimeValue::Int(37),
+                RuntimeValue::String("Grace".to_owned())
+            ],
+        ]
+    );
+}
+
+#[test]
+fn query_projection_with_limits_filtering_and_scope_remain_staged() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    let limited_input = run(
+        &mut session,
+        "MATCH (n:Person) WITH n ORDER BY n.age LIMIT 2 RETURN count(*) AS total LIMIT 1",
+    );
+    assert_eq!(limited_input.rows, vec![vec![RuntimeValue::Int(2)]]);
+
+    let grouped = run(
+        &mut session,
+        "MATCH (n:Person)
+         WITH n.age >= 36 AS older, count(*) AS total
+         WHERE total > 1 ORDER BY total DESC LIMIT 1
+         RETURN older, total LIMIT 1",
+    );
+    assert_eq!(grouped.columns, vec!["col_1", "col_2"]);
+    assert_eq!(
+        grouped.rows,
+        vec![vec![RuntimeValue::Bool(true), RuntimeValue::Int(3)]]
+    );
+
+    let star = run(
+        &mut session,
+        "MATCH (n:Person) WITH * WHERE n.age >= 36 ORDER BY n.age DESC LIMIT 2
+         RETURN n.name ORDER BY n.age DESC",
+    );
+    assert_eq!(
+        star.rows,
+        vec![
+            vec![RuntimeValue::String("Alan".to_owned())],
+            vec![RuntimeValue::String("Grace".to_owned())],
+        ]
+    );
+
+    for query in [
+        "MATCH (n:Person) WITH n.age AS age ORDER BY n.age RETURN age",
+        "MATCH (n:Person) WITH n.age AS age RETURN n",
+    ] {
+        let error = session.execute_script(query, &BTreeMap::new()).unwrap_err();
+        assert_eq!(error.code(), "unknown_variable", "{query}");
+    }
+}
+
+#[test]
+fn query_projection_aggregate_ordering_resolves_projected_expressions_recursively() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    for order in [
+        "count(*) DESC, n.age >= 36",
+        "-(count(*) + 1), NOT (n.age >= 36)",
+        "[n.age >= 36, count(*)][1] DESC, [n.age >= 36][0] DESC",
+        "({older: n.age >= 36, total: count(*)}).total DESC, ({older: n.age >= 36}).older DESC",
+        "contains([count(*)], 3) DESC, contains([n.age >= 36], true) DESC",
+    ] {
+        let result = run(
+            &mut session,
+            &format!("MATCH (n:Person) RETURN n.age >= 36, count(*) ORDER BY {order} LIMIT 1"),
+        );
+        assert_eq!(result.columns, vec!["col_1", "col_2"]);
+        assert_eq!(
+            result.rows,
+            vec![vec![RuntimeValue::Bool(true), RuntimeValue::Int(3)]],
+            "ORDER BY {order}"
+        );
+    }
+
+    let by_grouping_expression = run(
+        &mut session,
+        "MATCH (n:Person) RETURN n.age >= 36 AS older, count(*) AS total
+         ORDER BY NOT (n.age >= 36) LIMIT 1",
+    );
+    assert_eq!(
+        by_grouping_expression.rows,
+        vec![vec![RuntimeValue::Bool(true), RuntimeValue::Int(3)]]
+    );
+
+    let invalid = session
+        .execute_script(
+            "MATCH (n:Person) RETURN n.age >= 36 AS older, count(*) AS total ORDER BY n.age",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+    assert_eq!(invalid.code(), "unknown_variable");
+
+    let unprojected_aggregate = session
+        .execute_script(
+            "MATCH (n:Person) RETURN n.age >= 36 AS older, count(*) AS total
+             ORDER BY sum(n.age)",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+    assert_eq!(unprojected_aggregate.code(), "function_error");
+
+    let alias_shadows_grouping_variable = run(
+        &mut session,
+        "MATCH (n:Person) WITH n.age < 36 AS older
+         RETURN older AS original, count(*) AS older ORDER BY older DESC",
+    );
+    assert_eq!(
+        alias_shadows_grouping_variable.columns,
+        vec!["original", "older"]
+    );
+    assert_eq!(
+        alias_shadows_grouping_variable.rows,
+        vec![
+            vec![RuntimeValue::Bool(false), RuntimeValue::Int(3)],
+            vec![RuntimeValue::Bool(true), RuntimeValue::Int(1)],
+        ]
+    );
+}
+
+#[test]
+fn query_projection_generated_column_labels_are_not_ordering_aliases() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    for query in [
+        "MATCH (n:Person) RETURN n.age ORDER BY col_1",
+        "MATCH (n:Person) RETURN count(*) ORDER BY col_1",
+    ] {
+        let error = session.execute_script(query, &BTreeMap::new()).unwrap_err();
+        assert_eq!(error.code(), "unknown_variable", "{query}");
+    }
+
+    let explicit_alias = run(
+        &mut session,
+        "MATCH (n:Person) RETURN n.age AS col_1 ORDER BY col_1 LIMIT 1",
+    );
+    assert_eq!(explicit_alias.columns, vec!["col_1"]);
+    assert_eq!(explicit_alias.rows, vec![vec![RuntimeValue::Int(29)]]);
+
+    let source_variable = run(
+        &mut session,
+        "MATCH (col_1:Person) RETURN col_1.age ORDER BY col_1.age LIMIT 1",
+    );
+    assert_eq!(source_variable.columns, vec!["col_1"]);
+    assert_eq!(source_variable.rows, vec![vec![RuntimeValue::Int(29)]]);
+}
+
+#[test]
+fn query_projection_invalid_sort_keys_fail_for_one_or_multiple_rows() {
+    let mut session = Session::new_in_memory();
+    seed_person_graph(&mut session);
+
+    for predicate in ["n.age = 36", "n.age >= 0"] {
+        for tail in [
+            "RETURN n.age AS age ORDER BY missing",
+            "RETURN * ORDER BY missing",
+            "WITH n.age AS age ORDER BY missing RETURN age",
+            "WITH * ORDER BY missing RETURN n.age",
+            "RETURN n.age AS age ORDER BY age, missing",
+        ] {
+            let query = format!("MATCH (n:Person) WHERE {predicate} {tail}");
+            let error = session
+                .execute_script(&query, &BTreeMap::new())
+                .unwrap_err();
+            assert_eq!(error.code(), "unknown_variable", "{query}");
+        }
+        let query = format!(
+            "MATCH (n:Person) WHERE {predicate} RETURN n.age AS age ORDER BY age / 0 LIMIT 1"
+        );
+        let error = session
+            .execute_script(&query, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code(), "division_by_zero", "{query}");
+    }
+}
+
+#[test]
+fn query_projection_final_limit_does_not_limit_writes_but_with_limit_does() {
+    let db = TestDb::new("projection_mutation_limits");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+
+    let all_updated = run(
+        &mut session,
+        "MATCH (n:Person) SET n.updated = true RETURN count(*) AS total LIMIT 1",
+    );
+    assert_eq!(all_updated.rows, vec![vec![RuntimeValue::Int(4)]]);
+    let one_selected = run(
+        &mut session,
+        "MATCH (n:Person) WITH n ORDER BY n.age LIMIT 1
+         SET n.selected = true RETURN n.name AS name LIMIT 1",
+    );
+    assert_eq!(
+        one_selected.rows,
+        vec![vec![RuntimeValue::String("Bob".to_owned())]]
+    );
+    drop(session);
+
+    let mut reopened = db.open();
+    assert_eq!(
+        run(
+            &mut reopened,
+            "MATCH (n:Person) WHERE n.updated = true RETURN count(*)"
+        )
+        .rows,
+        vec![vec![RuntimeValue::Int(4)]]
+    );
+    assert_eq!(
+        run(
+            &mut reopened,
+            "MATCH (n:Person) WHERE n.selected = true RETURN n.name"
+        )
+        .rows,
+        vec![vec![RuntimeValue::String("Bob".to_owned())]]
+    );
+}
+
+#[test]
+fn query_projection_late_projection_and_sort_errors_rollback_autocommit_writes() {
+    let db = TestDb::new("projection_autocommit_failure");
+    let mut session = db.open();
+    seed_person_graph(&mut session);
+
+    for (tail, expected_error) in [
+        ("RETURN 1 / (n.age - 37) LIMIT 1", "division_by_zero"),
+        (
+            "RETURN n.age AS age ORDER BY missing LIMIT 1",
+            "unknown_variable",
+        ),
+    ] {
+        let query = format!("MATCH (n:Person) SET n.changed = true {tail}");
+        let error = session
+            .execute_script(&query, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code(), expected_error);
+        assert_eq!(
+            run(
+                &mut session,
+                "MATCH (n:Person) WHERE n.changed = true RETURN count(*)"
+            )
+            .rows,
+            vec![vec![RuntimeValue::Int(0)]]
+        );
+        let mut reopened = db.open();
+        assert_eq!(
+            run(
+                &mut reopened,
+                "MATCH (n:Person) WHERE n.changed = true RETURN count(*)"
+            )
+            .rows,
+            vec![vec![RuntimeValue::Int(0)]]
+        );
+    }
+}
+
+#[test]
+fn query_projection_errors_fail_transactions_and_savepoints_recover() {
+    for (tail, expected_error) in [
+        ("RETURN 1 / (n.age - 37) LIMIT 1", "division_by_zero"),
+        (
+            "RETURN n.age AS age ORDER BY missing LIMIT 1",
+            "unknown_variable",
+        ),
+    ] {
+        let db = TestDb::new("projection_transaction_failure");
+        let mut session = db.open();
+        seed_person_graph(&mut session);
+        run(&mut session, "BEGIN");
+        run(&mut session, "MATCH (n:Person) SET n.status = 'before'");
+        run(&mut session, "SAVEPOINT before_failure");
+
+        let query = format!("MATCH (n:Person) SET n.status = 'after' {tail}");
+        let error = session
+            .execute_script(&query, &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(error.code(), expected_error);
+        let transactions = run(&mut session, "SHOW TRANSACTIONS");
+        assert_eq!(transactions.rows[0][0], RuntimeValue::Bool(true));
+        assert_eq!(transactions.rows[0][1], RuntimeValue::Bool(true));
+        let blocked = session
+            .execute_script("RETURN 1", &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(blocked.code(), "transaction_failed");
+
+        run(&mut session, "ROLLBACK TO SAVEPOINT before_failure");
+        assert_eq!(
+            run(
+                &mut session,
+                "MATCH (n:Person) WHERE n.status = 'before' RETURN count(*)"
+            )
+            .rows,
+            vec![vec![RuntimeValue::Int(4)]]
+        );
+        run(&mut session, "COMMIT");
+        drop(session);
+        let mut reopened = db.open();
+        assert_eq!(
+            run(
+                &mut reopened,
+                "MATCH (n:Person) WHERE n.status = 'before' RETURN count(*)"
+            )
+            .rows,
+            vec![vec![RuntimeValue::Int(4)]]
+        );
+    }
+}
+
+#[test]
+fn query_projection_explain_lists_projection_before_order_and_limit() {
+    let mut session = Session::new_in_memory();
+    let result = run(
+        &mut session,
+        "EXPLAIN MATCH (n) RETURN count(*) AS total ORDER BY total LIMIT 1",
+    );
+    let operators = result
+        .rows
+        .iter()
+        .map(|row| row[2].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operators,
+        ["Query", "NodeScan", "Project", "Order", "Limit"]
+            .into_iter()
+            .map(|operator| RuntimeValue::String(operator.to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn merge_path_results_and_return_star_use_the_staged_executor() {
     let db = TestDb::new("merge_wave4");
     let mut session = db.open();

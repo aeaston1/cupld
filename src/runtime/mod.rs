@@ -755,17 +755,17 @@ impl Session {
         query: &Query,
         params: &BTreeMap<String, Value>,
     ) -> Result<QueryResult, ExecutionError> {
-        let rows = self.apply_order_and_limit(rows, &query.order_by, query.limit, params);
-
         if query.return_all {
+            let rows = self.apply_order_and_limit(rows, &query.order_by, query.limit, params)?;
             return self.return_all_rows(rows);
         }
 
         if query.return_clause.is_empty() {
+            self.apply_order_and_limit(rows, &query.order_by, query.limit, params)?;
             return Ok(empty_result());
         }
 
-        self.project_result_rows(rows, &query.return_clause, params)
+        self.project_result_rows(rows, query, params)
     }
 
     fn plan_match(
@@ -1163,12 +1163,12 @@ impl Session {
             if let Some(predicate) = &with_clause.where_clause {
                 rows = self.filter_rows(rows, predicate, params)?;
             }
-            return Ok(self.apply_order_and_limit(
+            return self.apply_order_and_limit(
                 rows,
                 &with_clause.order_by,
                 with_clause.limit,
                 params,
-            ));
+            );
         }
 
         let projection =
@@ -1177,30 +1177,41 @@ impl Session {
         if let Some(predicate) = &with_clause.where_clause {
             projected_rows = self.filter_rows(projected_rows, predicate, params)?;
         }
-        Ok(self.apply_order_and_limit(
+        self.apply_order_and_limit(
             projected_rows,
             &with_clause.order_by,
             with_clause.limit,
             params,
-        ))
+        )
     }
 
     fn apply_order_and_limit(
         &self,
-        mut rows: Vec<Row>,
+        rows: Vec<Row>,
         order_by: &[OrderItem],
         limit: Option<usize>,
         params: &BTreeMap<String, Value>,
-    ) -> Vec<Row> {
-        if !order_by.is_empty() {
-            rows.sort_by(|left, right| self.compare_rows(left, right, order_by, params));
-        }
-        if let Some(limit) = limit
-            && rows.len() > limit
-        {
-            rows.truncate(limit);
-        }
-        rows
+    ) -> Result<Vec<Row>, ExecutionError> {
+        let keyed_rows = rows
+            .into_iter()
+            .map(|row| {
+                let keys = self.eval_order_keys(&row, order_by, params)?;
+                Ok((row, keys))
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        Ok(sort_and_limit_rows(keyed_rows, order_by, limit))
+    }
+
+    fn eval_order_keys(
+        &self,
+        row: &Row,
+        order_by: &[OrderItem],
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Vec<RuntimeValue>, ExecutionError> {
+        order_by
+            .iter()
+            .map(|item| self.eval_expr(&item.expr, row, params))
+            .collect()
     }
 
     fn return_all_rows(&self, rows: Vec<Row>) -> Result<QueryResult, ExecutionError> {
@@ -1231,24 +1242,87 @@ impl Session {
     fn project_result_rows(
         &self,
         rows: Vec<Row>,
-        items: &[ReturnItem],
+        query: &Query,
         params: &BTreeMap<String, Value>,
     ) -> Result<QueryResult, ExecutionError> {
-        let (columns, projected_rows) =
-            self.project_rows(rows, items, params, projection_name_for_return)?;
-        let output_columns = columns.clone();
-        Ok(QueryResult {
-            columns,
-            rows: projected_rows
+        let items = &query.return_clause;
+        if query.order_by.is_empty() {
+            let (columns, mut projected_rows) =
+                self.project_rows(rows, items, params, projection_name_for_return)?;
+            if let Some(limit) = query.limit {
+                projected_rows.truncate(limit);
+            }
+            return Ok(projection_result(columns, projected_rows));
+        }
+
+        let (columns, keyed_rows) = if items.iter().any(|item| expr_contains_aggregate(&item.expr))
+        {
+            // Aggregate before evaluating sort keys or applying the final LIMIT.
+            // Only aliases and computed projection expressions are in scope:
+            // there is no representative source row for a group.
+            let (columns, projected_rows) =
+                self.project_rows(rows, items, params, projection_name_for_return)?;
+            let keyed_rows = projected_rows
                 .into_iter()
                 .map(|row| {
-                    output_columns
+                    let aliases = projection_aliases(items, &columns, &row);
+                    let projected_values = items
                         .iter()
-                        .map(|column| row.get(column).cloned().unwrap_or(RuntimeValue::Null))
-                        .collect()
+                        .zip(&columns)
+                        .map(|(item, column)| (&item.expr, &row[column]))
+                        .collect::<Vec<_>>();
+                    let keys = query
+                        .order_by
+                        .iter()
+                        .map(|item| {
+                            self.eval_projected_expr(
+                                &item.expr,
+                                &aliases,
+                                params,
+                                &projected_values,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((row, keys))
                 })
-                .collect(),
-        })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            (columns, keyed_rows)
+        } else {
+            let columns = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| projection_name_for_return(index, item))
+                .collect::<Vec<_>>();
+            let keyed_rows = rows
+                .into_iter()
+                .map(|mut source| {
+                    let projected = self.project_row(&source, items, &columns, params)?;
+                    // Keep source bindings for ORDER BY n.property, but let
+                    // explicit aliases shadow them. Generated col_N labels do
+                    // not introduce names into the expression scope.
+                    source.extend(projection_aliases(items, &columns, &projected));
+                    let keys = self.eval_order_keys(&source, &query.order_by, params)?;
+                    Ok((projected, keys))
+                })
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            (columns, keyed_rows)
+        };
+        let projected_rows = sort_and_limit_rows(keyed_rows, &query.order_by, query.limit);
+        Ok(projection_result(columns, projected_rows))
+    }
+
+    fn project_row(
+        &self,
+        row: &Row,
+        items: &[ReturnItem],
+        columns: &[String],
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Row, ExecutionError> {
+        let mut projected = Row::default();
+        for (item, column) in items.iter().zip(columns) {
+            projected.insert(column.clone(), self.eval_expr(&item.expr, row, params)?);
+        }
+        Ok(projected)
     }
 
     fn project_rows(
@@ -1281,16 +1355,7 @@ impl Session {
         }
         let output_rows = rows
             .into_iter()
-            .map(|row| {
-                let mut projected = Row::default();
-                for (index, item) in items.iter().enumerate() {
-                    projected.insert(
-                        columns[index].clone(),
-                        self.eval_expr(&item.expr, &row, params)?,
-                    );
-                }
-                Ok(projected)
-            })
+            .map(|row| self.project_row(&row, items, &columns, params))
             .collect::<Result<Vec<_>, ExecutionError>>()?;
         Ok((columns, output_rows))
     }
@@ -1998,31 +2063,6 @@ impl Session {
         Ok(())
     }
 
-    fn compare_rows(
-        &self,
-        left: &Row,
-        right: &Row,
-        order_by: &[OrderItem],
-        params: &BTreeMap<String, Value>,
-    ) -> Ordering {
-        for item in order_by {
-            let left_value = self.eval_expr(&item.expr, left, params);
-            let right_value = self.eval_expr(&item.expr, right, params);
-            let ordering = match (left_value, right_value) {
-                (Ok(left), Ok(right)) => compare_runtime_values(&left, &right),
-                _ => Ordering::Equal,
-            };
-            if ordering != Ordering::Equal {
-                return if item.descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                };
-            }
-        }
-        Ordering::Equal
-    }
-
     fn persist_after_commit(&mut self) -> Result<(), ExecutionError> {
         self.require_certain_persistence()?;
         if let Some(path) = self.path.clone() {
@@ -2142,6 +2182,34 @@ impl Session {
         row: &Row,
         params: &BTreeMap<String, Value>,
     ) -> Result<RuntimeValue, ExecutionError> {
+        self.eval_projected_expr(expr, row, params, &[])
+    }
+
+    fn eval_projected_expr(
+        &self,
+        expr: &Expr,
+        row: &Row,
+        params: &BTreeMap<String, Value>,
+        projected_values: &[(&Expr, &RuntimeValue)],
+    ) -> Result<RuntimeValue, ExecutionError> {
+        // Explicit aliases win over an identically named grouping expression.
+        if let Expr::Variable(name) = expr
+            && let Some(value) = row.get(name)
+        {
+            return Ok(value.clone());
+        }
+        if let Some((_, value)) = projected_values.iter().find(|(item, _)| *item == expr) {
+            return Ok((*value).clone());
+        }
+        if !projected_values.is_empty()
+            && let Expr::FunctionCall { name, .. } = expr
+            && is_aggregate_function(name)
+        {
+            return Err(ExecutionError::new(
+                "function_error",
+                "ORDER BY aggregate expressions must appear in RETURN",
+            ));
+        }
         match expr {
             Expr::Null => Ok(RuntimeValue::Null),
             Expr::Bool(value) => Ok(RuntimeValue::Bool(*value)),
@@ -2162,26 +2230,31 @@ impl Session {
                 ExecutionError::new("unknown_variable", format!("unknown variable {name}"))
             }),
             Expr::Property(base, property) => {
-                let value = self.eval_expr(base, row, params)?;
+                let value = self.eval_projected_expr(base, row, params, projected_values)?;
                 self.lookup_property(&value, property)
             }
             Expr::Index { target, index } => {
-                let target = self.eval_expr(target, row, params)?;
-                let index = self.eval_expr(index, row, params)?;
+                let target = self.eval_projected_expr(target, row, params, projected_values)?;
+                let index = self.eval_projected_expr(index, row, params, projected_values)?;
                 self.lookup_index(target, index)
             }
             Expr::List(values) => values
                 .iter()
-                .map(|value| self.eval_expr(value, row, params))
+                .map(|value| self.eval_projected_expr(value, row, params, projected_values))
                 .collect::<Result<Vec<_>, _>>()
                 .map(RuntimeValue::List),
             Expr::Map(entries) => entries
                 .iter()
-                .map(|(key, value)| Ok((key.clone(), self.eval_expr(value, row, params)?)))
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        self.eval_projected_expr(value, row, params, projected_values)?,
+                    ))
+                })
                 .collect::<Result<Vec<_>, ExecutionError>>()
                 .map(RuntimeValue::Map),
             Expr::Unary { op, expr } => {
-                let value = self.eval_expr(expr, row, params)?;
+                let value = self.eval_projected_expr(expr, row, params, projected_values)?;
                 match (op, value) {
                     (UnaryOp::Not, RuntimeValue::Bool(value)) => Ok(RuntimeValue::Bool(!value)),
                     (UnaryOp::Not, RuntimeValue::Null) => Ok(RuntimeValue::Null),
@@ -2196,18 +2269,24 @@ impl Session {
                 }
             }
             Expr::Binary { left, op, right } => {
-                let left = self.eval_expr(left, row, params)?;
+                let left = self.eval_projected_expr(left, row, params, projected_values)?;
                 if *op == BinaryOp::Or {
-                    return short_circuit_or(|| self.eval_expr(right, row, params), left);
+                    return short_circuit_or(
+                        || self.eval_projected_expr(right, row, params, projected_values),
+                        left,
+                    );
                 }
                 if *op == BinaryOp::And {
-                    return short_circuit_and(|| self.eval_expr(right, row, params), left);
+                    return short_circuit_and(
+                        || self.eval_projected_expr(right, row, params, projected_values),
+                        left,
+                    );
                 }
-                let right = self.eval_expr(right, row, params)?;
+                let right = self.eval_projected_expr(right, row, params, projected_values)?;
                 self.eval_binary(op, left, right)
             }
             Expr::IsNull { expr, negated } => {
-                let value = self.eval_expr(expr, row, params)?;
+                let value = self.eval_projected_expr(expr, row, params, projected_values)?;
                 Ok(RuntimeValue::Bool(if *negated {
                     value != RuntimeValue::Null
                 } else {
@@ -2217,7 +2296,7 @@ impl Session {
             Expr::FunctionCall { name, args } => {
                 let args = args
                     .iter()
-                    .map(|arg| self.eval_expr(arg, row, params))
+                    .map(|arg| self.eval_projected_expr(arg, row, params, projected_values))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.eval_function(name, args)
             }
@@ -2927,6 +3006,59 @@ impl RuntimeValue {
 }
 
 type Row = BTreeMap<String, RuntimeValue>;
+
+fn projection_result(columns: Vec<String>, rows: Vec<Row>) -> QueryResult {
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| row.get(column).cloned().unwrap_or(RuntimeValue::Null))
+                .collect()
+        })
+        .collect();
+    QueryResult { columns, rows }
+}
+
+fn projection_aliases(items: &[ReturnItem], columns: &[String], projected: &Row) -> Row {
+    items
+        .iter()
+        .zip(columns)
+        .filter_map(|(item, column)| {
+            item.alias
+                .as_ref()
+                .map(|alias| (alias.clone(), projected[column].clone()))
+        })
+        .collect()
+}
+
+/// Keys have already been evaluated fallibly, once per row. The comparator
+/// cannot hide expression errors or skip validation on a single-row result.
+fn sort_and_limit_rows(
+    mut keyed_rows: Vec<(Row, Vec<RuntimeValue>)>,
+    order_by: &[OrderItem],
+    limit: Option<usize>,
+) -> Vec<Row> {
+    if !order_by.is_empty() {
+        keyed_rows.sort_by(|(_, left), (_, right)| {
+            for ((left, right), item) in left.iter().zip(right).zip(order_by) {
+                let ordering = compare_runtime_values(left, right);
+                if ordering != Ordering::Equal {
+                    return if item.descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+            }
+            Ordering::Equal
+        });
+    }
+    if let Some(limit) = limit {
+        keyed_rows.truncate(limit);
+    }
+    keyed_rows.into_iter().map(|(row, _)| row).collect()
+}
 
 fn empty_result() -> QueryResult {
     query_result(&[], Vec::<Vec<RuntimeValue>>::new())

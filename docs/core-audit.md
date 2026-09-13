@@ -48,6 +48,22 @@ primary agent interface is the CLI; queries remain read/write by default.
 | Local startup | Scripted commands skip release fetching and release-cache writes after this milestone's startup fix. The optional hint remains on interactive file-backed REPL startup. | Interactive REPL hints may invoke `curl`; `CUPLD_NO_UPGRADE_CHECK=1` disables them. |
 | Memory application | Markdown synchronization, maintenance, MCP memory tools, retrieval, installation, and evals remain supported. | Separate application-specific behavior gradually; keep compatibility until a replacement exists. Generic graph benchmarks do not measure memory retrieval quality. |
 
+## Query correctness follow-up
+
+The final RETURN pipeline now projects or aggregates before sorting and limiting.
+A two-node `RETURN count(n) AS total LIMIT 1` returns `total: 2`, and sorting by
+an explicit output alias uses the projected value. Ordinary source-expression
+sorts still work. Invalid sort expressions now return execution errors, including
+single-row results; writes retain rollback and transaction recovery behavior.
+This composes with the immutable read path above, without restoring read snapshots.
+
+The [supplemental audit](benchmarks/2026-09-09-query-audit.md) records the original
+failures, additional CLI gaps, and a separate 1k/10k/50k chain-graph baseline.
+Its [raw artifact](benchmarks/2026-09-09-query-audit.json) predates the read-copy
+optimization and is historical evidence, not a measurement of this combined branch.
+It retains its own reproducible driver because its fixture and phases differ from
+the main benchmark. Use a new output path when rerunning; do not overwrite history.
+
 ## Resource findings
 
 The [engine](../src/engine/graph.rs), [runtime](../src/runtime/mod.rs), and
